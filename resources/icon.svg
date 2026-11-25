@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="arc" x1="321" y1="730" x2="730" y2="311" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#4338CA"/>
+      <stop offset="46%" stop-color="#6366F1"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <filter id="lift" x="-120%" y="-120%" width="340%" height="340%">
+      <feDropShadow dx="0" dy="10.5" stdDeviation="8.4" flood-color="#5C564C" flood-opacity="0.18"/>
+    </filter>
+    <clipPath id="tile">
+      <rect x="84" y="84" width="856" height="856" rx="191"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect x="84" y="84" width="856" height="856" rx="191" fill="#F6F3EC"/>
+    <g filter="url(#lift)">
+      <path d="M297.3 651.9 A222.3 222.3 0 1 1 726.7 651.9" stroke="url(#arc)" stroke-width="184.6" stroke-linecap="round"/>
+    </g>
+    <path d="M393.1 339.4 A281.3 281.3 0 0 1 630.9 339.4" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="14.7" stroke-linecap="round"/>
+  </g>
+</svg>

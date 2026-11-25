@@ -1,0 +1,528 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "PingFang SC", "Hiragino Sans GB", sans-serif;
+  }
+
+  html, body, #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+}
+
+.app-drag {
+  -webkit-app-region: drag;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Subtle custom scrollbars matching Dia Calm UI */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 120, 130, 0.22);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 120, 130, 0.4);
+}
+
+:root {
+  --arc-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --arc-spring-bouncy: cubic-bezier(0.22, 1.12, 0.36, 1);
+  --arc-glide: cubic-bezier(0.22, 1, 0.36, 1);
+  --arc-exit: cubic-bezier(0.32, 0, 0.67, 0);
+}
+
+/* Top loading progress shimmer line */
+@keyframes diaLoadingSlide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+
+/* Arc Space Switch directional viewport glide & HUD pill */
+@keyframes diaSlideInFromRight {
+  0% { opacity: 0.76; transform: translate3d(16px, 0, 0) scale(0.995); }
+  100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+
+@keyframes diaSlideInFromLeft {
+  0% { opacity: 0.76; transform: translate3d(-16px, 0, 0) scale(0.995); }
+  100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+
+@keyframes diaSpaceHudPop {
+  0% { opacity: 0; transform: translate3d(-50%, 10px, 0) scale(0.92); filter: blur(3px); }
+  100% { opacity: 1; transform: translate3d(-50%, 0, 0) scale(1); filter: blur(0); }
+}
+
+@keyframes diaSpaceHudOut {
+  0% { opacity: 1; transform: translate3d(-50%, 0, 0) scale(1); filter: blur(0); }
+  100% { opacity: 0; transform: translate3d(-50%, 6px, 0) scale(0.95); filter: blur(2px); }
+}
+
+/* Arc Backdrop Fade */
+@keyframes arcBackdropIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes arcBackdropOut {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* Arc Command Bar (⌘T / ⌘L) Spring Pop */
+@keyframes arcOmniboxIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -10px, 0) scale(0.955);
+    filter: blur(2px);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes arcOmniboxOut {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, -6px, 0) scale(0.975);
+  }
+}
+
+/* Arc Centered Modal Spring Scale */
+@keyframes arcModalIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0) scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes arcModalOut {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, 6px, 0) scale(0.975);
+  }
+}
+
+/* Arc Anchored Popover / Context Menu Spring */
+@keyframes arcPopoverIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.93) translate3d(0, -4px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+}
+
+@keyframes arcPopoverOut {
+  0% {
+    opacity: 1;
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.95) translate3d(0, -3px, 0);
+  }
+}
+
+@keyframes arcPopoverUpIn {
+  0% {
+    opacity: 0;
+    transform: scale(0.93) translate3d(0, 6px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translate3d(0, 0, 0);
+  }
+}
+
+/* Arc Toast Pill */
+@keyframes arcToastIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(-50%, 12px, 0) scale(0.93);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(-50%, 0, 0) scale(1);
+  }
+}
+
+@keyframes arcToastOut {
+  0% {
+    opacity: 1;
+    transform: translate3d(-50%, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(-50%, 8px, 0) scale(0.95);
+  }
+}
+
+/* Smooth Top Find Bar Slide */
+@keyframes arcBarSlideDown {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -8px, 0) scale(0.99);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.dia-space-slide-right {
+  animation: diaSlideInFromRight 260ms var(--arc-spring) both;
+}
+
+.dia-space-slide-left {
+  animation: diaSlideInFromLeft 260ms var(--arc-spring) both;
+}
+
+.dia-space-hud {
+  animation: diaSpaceHudPop 220ms var(--arc-spring) both;
+}
+
+.dia-space-hud-out {
+  animation: diaSpaceHudOut 160ms var(--arc-exit) both;
+}
+
+.arc-backdrop-enter {
+  animation: arcBackdropIn 180ms var(--arc-glide) both;
+}
+
+.arc-backdrop-exit {
+  animation: arcBackdropOut 135ms var(--arc-exit) both;
+}
+
+.arc-omnibox-enter {
+  animation: arcOmniboxIn 210ms var(--arc-spring) both;
+}
+
+.arc-omnibox-exit {
+  animation: arcOmniboxOut 130ms var(--arc-exit) both;
+}
+
+.arc-modal-enter {
+  animation: arcModalIn 230ms var(--arc-spring) both;
+}
+
+.arc-modal-exit {
+  animation: arcModalOut 135ms var(--arc-exit) both;
+}
+
+.arc-popover-enter {
+  animation: arcPopoverIn 185ms var(--arc-spring) both;
+}
+
+.arc-popover-exit {
+  animation: arcPopoverOut 120ms var(--arc-exit) both;
+}
+
+.arc-popover-up-enter {
+  animation: arcPopoverUpIn 190ms var(--arc-spring) both;
+}
+
+.arc-toast-enter {
+  animation: arcToastIn 220ms var(--arc-spring) both;
+}
+
+.arc-toast-exit {
+  animation: arcToastOut 150ms var(--arc-exit) both;
+}
+
+.arc-bar-enter {
+  animation: arcBarSlideDown 190ms var(--arc-spring) both;
+}
+
+/* Smooth collapsible folder children using CSS grid 0fr -> 1fr */
+.arc-collapse-grid {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 220ms var(--arc-spring),
+    opacity 170ms ease;
+}
+
+.arc-collapse-grid[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.arc-collapse-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* Tactile Arc press micro-interactions */
+.arc-pressable {
+  transition:
+    transform 140ms var(--arc-spring),
+    background-color 140ms ease,
+    box-shadow 160ms ease,
+    opacity 140ms ease,
+    color 140ms ease;
+}
+
+.arc-pressable:active {
+  transform: scale(0.98);
+}
+
+.arc-fav-pressable {
+  transition:
+    transform 160ms var(--arc-spring),
+    background-color 150ms ease,
+    box-shadow 170ms ease;
+}
+
+.arc-fav-pressable:hover {
+  transform: translateY(-0.5px);
+}
+
+.arc-fav-pressable:active {
+  transform: scale(0.94);
+}
+
+.dia-loading-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1.5px;
+  overflow: hidden;
+  background: rgba(161, 161, 170, 0.12);
+  pointer-events: none;
+}
+
+.dia-loading-bar::after {
+  content: "";
+  display: block;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(212, 212, 216, 0.85), transparent);
+  animation: diaLoadingSlide 1.15s ease-in-out infinite;
+}
+
+/* Markdown prose inside Dia AI Sidebar & Chat Tabs */
+.dia-prose {
+  font-size: 13.5px;
+  line-height: 1.68;
+  word-break: break-word;
+  user-select: text;
+}
+
+.dia-prose p {
+  margin: 0.55em 0;
+}
+
+.dia-prose p:first-child {
+  margin-top: 0;
+}
+
+.dia-prose p:last-child {
+  margin-bottom: 0;
+}
+
+.dia-prose h1, .dia-prose h2, .dia-prose h3, .dia-prose h4 {
+  font-weight: 600;
+  margin: 0.95em 0 0.4em;
+  line-height: 1.35;
+}
+
+.dia-prose h1 { font-size: 1.2em; }
+.dia-prose h2 { font-size: 1.1em; }
+.dia-prose h3 { font-size: 1.02em; }
+
+.dia-prose ul, .dia-prose ol {
+  margin: 0.5em 0;
+  padding-left: 1.35em;
+}
+
+.dia-prose ul { list-style-type: disc; }
+.dia-prose ol { list-style-type: decimal; }
+.dia-prose li { margin: 0.25em 0; }
+
+.dia-prose code {
+  font-family: "SF Mono", "JetBrains Mono", Menlo, monospace;
+  font-size: 0.88em;
+  padding: 0.15em 0.4em;
+  border-radius: 5px;
+  background: rgba(127, 127, 140, 0.14);
+}
+
+.dia-code-wrap {
+  margin: 0.75em 0;
+  border-radius: 11px;
+  overflow: hidden;
+  background: #18181d;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.dia-code-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  background: #202028;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  color: #a1a1aa;
+  user-select: none;
+}
+
+.dia-code-lang {
+  font-family: "SF Mono", Menlo, monospace;
+  text-transform: lowercase;
+  opacity: 0.8;
+}
+
+.dia-copy-code-btn {
+  appearance: none;
+  border: 0;
+  background: rgba(255, 255, 255, 0.08);
+  color: #e4e4e7;
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.dia-copy-code-btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+}
+
+.dia-prose pre {
+  margin: 0;
+  padding: 0.75em 0.9em;
+  background: #18181b;
+  color: #f4f4f5;
+  overflow-x: auto;
+}
+
+.dia-prose > pre {
+  margin: 0.7em 0;
+  border-radius: 10px;
+}
+
+.dia-prose pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: 12px;
+}
+
+/* Interactive [@Page Title] source citation badge */
+.dia-cite-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin: 0 2px;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  border: 1px solid rgba(113, 113, 122, 0.28);
+  background: rgba(113, 113, 122, 0.1);
+  color: #3f3f46;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+  cursor: pointer;
+  vertical-align: baseline;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.dark .dia-cite-pill {
+  color: #d4d4d8;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.dia-cite-pill:hover {
+  background: #27272a;
+  color: #ffffff;
+}
+
+.dark .dia-cite-pill:hover {
+  background: #e4e4e7;
+  color: #18181b;
+}
+
+.dia-prose blockquote {
+  border-left: 2px solid rgba(161, 161, 170, 0.45);
+  padding-left: 0.8em;
+  margin: 0.6em 0;
+  opacity: 0.85;
+}
+
+.dia-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75em 0;
+  font-size: 12.5px;
+}
+
+.dia-prose th, .dia-prose td {
+  border: 1px solid rgba(127, 127, 140, 0.22);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.dia-prose th {
+  background: rgba(127, 127, 140, 0.08);
+  font-weight: 600;
+}
+
+.dia-prose a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(161, 161, 170, 0.6);
+  text-underline-offset: 2.5px;
+}
+
+.dark .dia-prose a {
+  color: #f4f4f5;
+}

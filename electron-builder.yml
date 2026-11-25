@@ -1,0 +1,72 @@
+appId: com.mistbreak.arko
+productName: Arko
+copyright: Copyright © 2026 MistBreak
+asar: true
+
+directories:
+  buildResources: resources
+  output: dist
+
+files:
+  - "!**/.vscode/*"
+  - "!src/*"
+  - "!electron.vite.config.{js,ts,mjs,cjs}"
+  - "!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,CHANGELOG.md,README.md,README.zh-CN.md,CONTEXT_HANDOFF.md}"
+  - "!tsconfig*.json"
+  - "!*.tsbuildinfo"
+
+protocols:
+  - name: Arko Browser Protocol
+    schemes:
+      - arko
+
+publish:
+  - provider: github
+    owner: MistBreak
+    repo: arko
+    releaseType: release
+
+mac:
+  category: public.app-category.productivity
+  icon: resources/icon.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    - target: zip
+      arch:
+        - arm64
+        - x64
+  artifactName: Arko-${version}-${arch}-mac.${ext}
+
+dmg:
+  artifactName: Arko-${version}-${arch}.${ext}
+
+win:
+  icon: resources/icon.png
+  target:
+    - target: nsis
+      arch:
+        - x64
+        - arm64
+  artifactName: Arko-Setup-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  shortcutName: Arko
+
+linux:
+  icon: resources/icon.png
+  category: Network;WebBrowser
+  maintainer: MistBreak <https://github.com/MistBreak>
+  target:
+    - target: AppImage
+      arch:
+        - x64
+        - arm64
+  artifactName: Arko-${version}-${arch}.${ext}
