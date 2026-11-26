@@ -244,6 +244,36 @@
   animation: arcOmniboxOut 130ms var(--arc-exit) both;
 }
 
+@keyframes diaSmartBarIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -3px, 0) scale(0.985);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes diaSmartBarOut {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, -2px, 0) scale(0.99);
+  }
+}
+
+.dia-smartbar-enter {
+  animation: diaSmartBarIn 155ms var(--arc-spring) both;
+}
+
+.dia-smartbar-exit {
+  animation: diaSmartBarOut 115ms var(--arc-exit) both;
+}
+
 .arc-modal-enter {
   animation: arcModalIn 230ms var(--arc-spring) both;
 }

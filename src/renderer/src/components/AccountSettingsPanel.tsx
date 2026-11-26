@@ -420,9 +420,9 @@ export const AccountSettingsPanel: React.FC<Props> = ({
     })
   }
 
-  const inputCls = `w-full h-9 px-3 rounded-xl border outline-none transition ${
+  const inputCls = `w-full h-9.5 px-3.5 rounded-[10px] border text-[13px] outline-none transition ${
     isDark
-      ? 'bg-[#16161C] border-white/10 focus:border-indigo-400 text-zinc-100'
+      ? 'bg-[#151519] border-white/10 focus:border-indigo-400 text-zinc-100'
       : 'bg-white border-black/12 focus:border-indigo-500 text-zinc-900'
   }`
 
@@ -440,7 +440,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
       .toUpperCase()
 
     return (
-      <div className="flex-1 overflow-y-auto p-6 space-y-5 text-xs">
+      <div className="flex-1 overflow-y-auto px-8 py-6 space-y-5 text-[13px]">
         {/* Account Identity Hero Card */}
         <div
           className={`p-4 rounded-2xl border flex items-center justify-between gap-4 ${
@@ -638,18 +638,18 @@ export const AccountSettingsPanel: React.FC<Props> = ({
   }
 
   return (
-    <div className="flex-1 overflow-y-auto p-6 text-xs">
-      <div className="max-w-md mx-auto space-y-5">
+    <div className="flex-1 overflow-y-auto px-8 py-7 text-[13px]">
+      <div className="max-w-[480px] mx-auto space-y-5">
         {/* Brand Header */}
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center shadow-md shrink-0">
-            <Sparkles size={18} />
+        <div className="flex items-center gap-3.5">
+          <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center shadow-md shrink-0">
+            <Sparkles size={19} />
           </div>
           <div>
-            <div className="font-semibold text-sm">
+            <div className="font-semibold text-[15px] tracking-[-0.01em]">
               {tr(lang, 'Arko Account & Cloud AI', 'Arko 账号与内置云端 AI')}
             </div>
-            <div className="opacity-60 mt-0.5">
+            <div className="text-[12.5px] leading-relaxed opacity-60 mt-0.5">
               {tr(
                 lang,
                 'Sign in with email to unlock Gemini, GPT & Claude models with zero API key setup.',
@@ -662,7 +662,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
         {/* Mode Segmented Switcher */}
         <div
           className={`grid grid-cols-2 p-1 rounded-xl border ${
-            isDark ? 'bg-[#15151B] border-white/8' : 'bg-zinc-100 border-black/6'
+            isDark ? 'bg-[#15151B] border-white/8' : 'bg-zinc-100/90 border-black/6'
           }`}
         >
           <button
@@ -672,7 +672,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
               setTwoFactorToken(null)
               setFeedback(null)
             }}
-            className={`h-8 rounded-lg font-medium inline-flex items-center justify-center gap-1.5 transition ${
+            className={`h-8.5 rounded-[9px] font-medium inline-flex items-center justify-center gap-1.5 transition ${
               mode === 'login'
                 ? isDark
                   ? 'bg-[#252530] text-white shadow-xs'
@@ -680,7 +680,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
                 : 'opacity-65 hover:opacity-100'
             }`}
           >
-            <LogIn size={13} />
+            <LogIn size={14} />
             <span>{tr(lang, 'Sign In', '邮箱 / 账号登录')}</span>
           </button>
 
@@ -691,7 +691,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
               setTwoFactorToken(null)
               setFeedback(null)
             }}
-            className={`h-8 rounded-lg font-medium inline-flex items-center justify-center gap-1.5 transition ${
+            className={`h-8.5 rounded-[9px] font-medium inline-flex items-center justify-center gap-1.5 transition ${
               mode === 'register'
                 ? isDark
                   ? 'bg-[#252530] text-white shadow-xs'
@@ -699,7 +699,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
                 : 'opacity-65 hover:opacity-100'
             }`}
           >
-            <UserPlus size={13} />
+            <UserPlus size={14} />
             <span>{tr(lang, 'Create Account', '邮箱注册新账号')}</span>
           </button>
         </div>

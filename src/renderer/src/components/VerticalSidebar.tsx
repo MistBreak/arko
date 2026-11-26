@@ -1,12 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowDownCircle,
-  Bookmark,
-  BookOpen,
-  Check,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Columns2,
   Download,
@@ -14,7 +9,6 @@ import {
   FolderKanban,
   Link2,
   Loader2,
-  Lock,
   MoreHorizontal,
   PanelLeft,
   PanelTop,
@@ -23,18 +17,14 @@ import {
   PinOff,
   Plus,
   RotateCcw,
-  RotateCw,
-  Search,
   Settings,
-  ShieldAlert,
-  Sparkles,
   Star,
   UserRound,
   Volume2,
   VolumeX,
   X
 } from 'lucide-react'
-import { isChatTabUrl, isInternalArkoUrl, NEW_TAB_URL } from '@shared/constants'
+import { isInternalArkoUrl, NEW_TAB_URL } from '@shared/constants'
 import { tr } from '@shared/i18n'
 import { getArcSpaceTheme, interpolateSpaceHex } from '@shared/space-theme'
 import type {
@@ -130,6 +120,30 @@ const DEFAULT_SIDEBAR_WIDTH = 232
 const MIN_SIDEBAR_WIDTH = 188
 const MAX_SIDEBAR_WIDTH = 420
 
+// Deliberate low-frequency Space swipe tuning
+const SWIPE_DEADZONE_PX = 16
+const SWIPE_AXIS_RATIO = 1.9
+const SWIPE_VERTICAL_LOCK_PX = 8
+const SWIPE_TRACKING_GAIN = 0.6
+const SWIPE_SNAP_RATIO = 0.38
+const SWIPE_PASS_COMMIT_RATIO = 0.65
+const SWIPE_FLICK_MIN_PEAK = 30
+const SWIPE_FLICK_MIN_OFFSET_RATIO = 0.28
+const SWIPE_MAX_REF_WIDTH = 260
+
+// Taut boundary rubber-band resistance (< 26px asymptotic ceiling)
+const BOUNDARY_RUBBER_MAX_PX = 26
+const BOUNDARY_RUBBER_STIFFNESS = 0.24
+
+function computeBoundaryRubberBand(rawOverscrollPx: number): number {
+  const abs = Math.abs(rawOverscrollPx)
+  if (abs <= 0) return 0
+  const damped =
+    (BOUNDARY_RUBBER_MAX_PX * BOUNDARY_RUBBER_STIFFNESS * abs) /
+    (BOUNDARY_RUBBER_MAX_PX + BOUNDARY_RUBBER_STIFFNESS * abs)
+  return Math.sign(rawOverscrollPx) * damped
+}
+
 function getFavColCount(itemCount: number, sidebarWidth: number): number {
   if (itemCount <= 1) return 1
   if (itemCount === 2) return 2
@@ -188,30 +202,34 @@ function formatPreviewDomainLabel(url?: string, title?: string, fallback?: strin
   return fallback || 'Link'
 }
 
-function formatArcSidebarUrlLabel(tab: TabState | undefined, lang?: AppLanguage): string {
-  if (!tab || !tab.url || tab.url === NEW_TAB_URL) {
-    return tr(lang, 'Search or Enter URL…', '搜索或输入网址…')
-  }
-  if (isChatTabUrl(tab.url)) {
-    return tab.title || tr(lang, 'Arko Chat', 'Arko 对话')
-  }
-  try {
-    const parsed = new URL(tab.url)
-    return parsed.hostname.replace(/^www\./, '') || tab.title || tab.url
-  } catch {
-    return tab.title || tab.url
-  }
-}
-
 interface WheelGestureState {
   lockedAxis: 'none' | 'horizontal' | 'vertical'
+  intentX: number
+  intentAbsY: number
   rawOffset: number
   peakAbsDeltaX: number
+  decayFrames: number
   committed: boolean
   committedDir: 1 | -1 | 0
+  coastingReleased: boolean
+  coastingDir: 1 | -1 | 0
   lastEventAt: number
   lastAbsDeltaX: number
   endTimer: number | null
+}
+
+function resetWheelGestureState(g: WheelGestureState): void {
+  g.lockedAxis = 'none'
+  g.intentX = 0
+  g.intentAbsY = 0
+  g.rawOffset = 0
+  g.peakAbsDeltaX = 0
+  g.decayFrames = 0
+  g.committed = false
+  g.committedDir = 0
+  g.coastingReleased = false
+  g.coastingDir = 0
+  g.lastAbsDeltaX = 0
 }
 
 export const VerticalSidebar: React.FC<Props> = ({
@@ -230,9 +248,7 @@ export const VerticalSidebar: React.FC<Props> = ({
   allTabGroups,
   activeTabByProfile,
   splitByProfile,
-  activeTab,
   splitView,
-  bookmarks,
   downloads,
   newTabPromptOpen,
   organizingTabs,
@@ -260,12 +276,6 @@ export const VerticalSidebar: React.FC<Props> = ({
   onOrganizeTabs,
   onNewTab,
   onOpenTabInSplit,
-  onOpenReader,
-  onBack,
-  onForward,
-  onReload,
-  onOpenOmnibox,
-  onToggleBookmark,
   onOpenLibrary,
   onOpenDownloads,
   onOpenSettings,
@@ -275,9 +285,9 @@ export const VerticalSidebar: React.FC<Props> = ({
   const [optimisticProfileId, setOptimisticProfileId] = useState<string>(activeProfile.id)
   const [dragOffsetPx, setDragOffsetPx] = useState(0)
   const [isSwiping, setIsSwiping] = useState(false)
+  const [snapMode, setSnapMode] = useState<'switch' | 'rebound' | 'boundary'>('switch')
   const [isResizing, setIsResizing] = useState(false)
   const [footerMenuOpen, setFooterMenuOpen] = useState(false)
-  const [copiedUrl, setCopiedUrl] = useState(false)
   const [renamingSpaceId, setRenamingSpaceId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
 
@@ -296,16 +306,22 @@ export const VerticalSidebar: React.FC<Props> = ({
 
   const wheelGestureRef = useRef<WheelGestureState>({
     lockedAxis: 'none',
+    intentX: 0,
+    intentAbsY: 0,
     rawOffset: 0,
     peakAbsDeltaX: 0,
+    decayFrames: 0,
     committed: false,
     committedDir: 0,
+    coastingReleased: false,
+    coastingDir: 0,
     lastEventAt: 0,
     lastAbsDeltaX: 0,
     endTimer: null
   })
 
   useEffect(() => {
+    setSnapMode('switch')
     setOptimisticProfileId(activeProfile.id)
   }, [activeProfile.id])
 
@@ -370,7 +386,9 @@ export const VerticalSidebar: React.FC<Props> = ({
   }, [swipeNeighborProfile, dragOffsetPx, width])
 
   const headerPreviewProfile =
-    swipeNeighborProfile && swipeProgress >= 0.48 ? swipeNeighborProfile : visualProfile
+    swipeNeighborProfile && swipeProgress >= SWIPE_SNAP_RATIO
+      ? swipeNeighborProfile
+      : visualProfile
 
   const liveAccentHex = useMemo(() => {
     if (!swipeNeighborProfile || swipeProgress <= 0) {
@@ -420,6 +438,7 @@ export const VerticalSidebar: React.FC<Props> = ({
       const resolvedDir =
         direction ?? (nextIdx > prevIdx ? 'right' : nextIdx < prevIdx ? 'left' : undefined)
 
+      setSnapMode('switch')
       setOptimisticProfileId(targetProfileId)
       setIsSwiping(false)
       setDragOffsetPx(0)
@@ -431,23 +450,18 @@ export const VerticalSidebar: React.FC<Props> = ({
     [profiles, optimisticProfileId, activeProfile.id, onSwitchProfile]
   )
 
-  // Native-feeling macOS two-finger swipe with momentum decay detection & crisp release snap
+  // Weighted, low-sensitivity macOS two-finger swipe with taut boundary rubber-band & spring settle
   const handleWheelSwipe = useCallback(
     (e: React.WheelEvent<HTMLElement>) => {
-      if (draggingTabId || isResizing || renamingSpaceId || profiles.length <= 1) return
+      if (draggingTabId || isResizing || renamingSpaceId || profiles.length === 0) return
 
       const g = wheelGestureRef.current
       const now = performance.now()
       const gap = now - g.lastEventAt
       g.lastEventAt = now
 
-      if (gap > 120) {
-        g.lockedAxis = 'none'
-        g.rawOffset = 0
-        g.peakAbsDeltaX = 0
-        g.committed = false
-        g.committedDir = 0
-        g.lastAbsDeltaX = 0
+      if (gap > 130) {
+        resetWheelGestureState(g)
       }
 
       const absX = Math.abs(e.deltaX)
@@ -455,66 +469,134 @@ export const VerticalSidebar: React.FC<Props> = ({
 
       if (g.committed) {
         const reversed =
-          (e.deltaX > 3.5 && g.committedDir === -1) ||
-          (e.deltaX < -3.5 && g.committedDir === 1)
-        const freshFlick = absX > g.lastAbsDeltaX + 10 && absX > 18
+          (e.deltaX > 8 && g.committedDir === -1) ||
+          (e.deltaX < -8 && g.committedDir === 1)
+        const freshStrongSwipe = absX > g.lastAbsDeltaX + 18 && absX > 32
         g.lastAbsDeltaX = absX
 
-        if (reversed || freshFlick) {
-          g.committed = false
-          g.committedDir = 0
-          g.rawOffset = 0
+        if (reversed || freshStrongSwipe) {
+          resetWheelGestureState(g)
           g.peakAbsDeltaX = absX
+          g.lastAbsDeltaX = absX
           g.lockedAxis = 'horizontal'
         } else {
           if (g.endTimer !== null) window.clearTimeout(g.endTimer)
           g.endTimer = window.setTimeout(() => {
-            g.lockedAxis = 'none'
-            g.rawOffset = 0
-            g.peakAbsDeltaX = 0
-            g.committed = false
-            g.committedDir = 0
-          }, 110)
+            resetWheelGestureState(g)
+          }, 120)
           return
         }
       }
 
-      if (g.lockedAxis === 'none') {
-        if (absY > absX * 1.12 && absY > 2) {
-          g.lockedAxis = 'vertical'
-          return
-        }
-        if (absX > absY * 1.12 && absX > 1.2) {
+      if (g.coastingReleased) {
+        const reversed =
+          (e.deltaX > 5 && g.coastingDir === -1) ||
+          (e.deltaX < -5 && g.coastingDir === 1)
+        const freshPush = absX > g.lastAbsDeltaX + 8 && absX > 15
+        g.lastAbsDeltaX = absX
+
+        if (reversed || freshPush) {
+          resetWheelGestureState(g)
+          g.peakAbsDeltaX = absX
+          g.lastAbsDeltaX = absX
           g.lockedAxis = 'horizontal'
         } else {
+          if (g.endTimer !== null) window.clearTimeout(g.endTimer)
+          g.endTimer = window.setTimeout(() => {
+            resetWheelGestureState(g)
+          }, 110)
           return
         }
       }
 
       if (g.lockedAxis === 'vertical') return
 
-      g.lastAbsDeltaX = absX
-      if (absX > g.peakAbsDeltaX) g.peakAbsDeltaX = absX
-      g.rawOffset -= e.deltaX
+      if (g.lockedAxis === 'none') {
+        g.intentX -= e.deltaX
+        g.intentAbsY += absY
+
+        if ((absY > absX * 0.9 && absY > 1.5) || g.intentAbsY >= SWIPE_VERTICAL_LOCK_PX) {
+          g.lockedAxis = 'vertical'
+          return
+        }
+
+        if (
+          Math.abs(g.intentX) >= SWIPE_DEADZONE_PX &&
+          Math.abs(g.intentX) >= g.intentAbsY * SWIPE_AXIS_RATIO
+        ) {
+          g.lockedAxis = 'horizontal'
+          const excess = Math.sign(g.intentX) * (Math.abs(g.intentX) - SWIPE_DEADZONE_PX)
+          g.rawOffset = excess * SWIPE_TRACKING_GAIN
+          g.peakAbsDeltaX = absX
+          g.lastAbsDeltaX = absX
+          g.decayFrames = 0
+        } else {
+          return
+        }
+      } else {
+        if (absX > 0 && absX < g.lastAbsDeltaX * 0.96) {
+          g.decayFrames += 1
+        } else if (absX > g.lastAbsDeltaX * 1.04) {
+          g.decayFrames = 0
+        }
+        g.lastAbsDeltaX = absX
+        if (absX > g.peakAbsDeltaX) g.peakAbsDeltaX = absX
+        g.rawOffset -= e.deltaX * SWIPE_TRACKING_GAIN
+      }
 
       const atStart = currentProfileIndex === 0 && g.rawOffset > 0
       const atEnd = currentProfileIndex === profiles.length - 1 && g.rawOffset < 0
+      const isBoundary = atStart || atEnd
+      const gestureWidth = Math.min(width, SWIPE_MAX_REF_WIDTH)
 
-      // Rubber-band resistance at outer Space boundaries
-      const effectiveOffset =
-        atStart || atEnd
-          ? Math.sign(g.rawOffset) * Math.pow(Math.abs(g.rawOffset), 0.72) * 1.6
-          : Math.max(-width, Math.min(width, g.rawOffset))
+      // Detect finger lift into macOS trackpad inertial coasting so tail events don't over-pull or false-switch
+      const enteredInertialCoasting =
+        g.peakAbsDeltaX >= 16 &&
+        g.decayFrames >= 3 &&
+        absX < g.peakAbsDeltaX * 0.6
 
-      // Commit immediately when finger lifts into momentum decay after a flick OR passes 48% width
-      const momentumReleased =
-        g.peakAbsDeltaX >= 15 &&
-        absX < g.peakAbsDeltaX * 0.58 &&
-        Math.abs(g.rawOffset) >= width * 0.16
-      const passedHalfway = Math.abs(g.rawOffset) >= width * 0.48
-      const decisiveFlick = absX >= 34 && Math.abs(g.rawOffset) >= width * 0.22
+      if (isBoundary) {
+        if (enteredInertialCoasting) {
+          g.coastingReleased = true
+          g.coastingDir = g.rawOffset < 0 ? 1 : -1
+          g.rawOffset = 0
+          setSnapMode('boundary')
+          setIsSwiping(false)
+          setDragOffsetPx(0)
 
-      if (!atStart && !atEnd && (momentumReleased || passedHalfway || decisiveFlick)) {
+          if (g.endTimer !== null) window.clearTimeout(g.endTimer)
+          g.endTimer = window.setTimeout(() => {
+            resetWheelGestureState(g)
+          }, 110)
+          return
+        }
+
+        const rawOverscroll = g.rawOffset / SWIPE_TRACKING_GAIN
+        const effectiveOffset = computeBoundaryRubberBand(rawOverscroll)
+        setIsSwiping(true)
+        setDragOffsetPx(effectiveOffset)
+
+        const settleDelay = absX < 3 ? 52 : 82
+        if (g.endTimer !== null) window.clearTimeout(g.endTimer)
+        g.endTimer = window.setTimeout(() => {
+          if (!g.committed && !g.coastingReleased) {
+            setSnapMode('boundary')
+            setIsSwiping(false)
+            setDragOffsetPx(0)
+          }
+          resetWheelGestureState(g)
+        }, settleDelay)
+        return
+      }
+
+      // Non-boundary Space transition: require deliberate pull or strong purposeful flick
+      const earnedFlickSwitch =
+        g.peakAbsDeltaX >= SWIPE_FLICK_MIN_PEAK &&
+        Math.abs(g.rawOffset) >= gestureWidth * SWIPE_FLICK_MIN_OFFSET_RATIO
+      const earnedDistanceSwitch = Math.abs(g.rawOffset) >= gestureWidth * SWIPE_SNAP_RATIO
+      const passedAutoCommit = Math.abs(g.rawOffset) >= gestureWidth * SWIPE_PASS_COMMIT_RATIO
+
+      if (passedAutoCommit || (enteredInertialCoasting && (earnedFlickSwitch || earnedDistanceSwitch))) {
         const step: 1 | -1 = g.rawOffset < 0 ? 1 : -1
         const nextIdx = currentProfileIndex + step
         if (nextIdx >= 0 && nextIdx < profiles.length) {
@@ -526,24 +608,37 @@ export const VerticalSidebar: React.FC<Props> = ({
 
           if (g.endTimer !== null) window.clearTimeout(g.endTimer)
           g.endTimer = window.setTimeout(() => {
-            g.lockedAxis = 'none'
-            g.rawOffset = 0
-            g.peakAbsDeltaX = 0
-            g.committed = false
-            g.committedDir = 0
+            resetWheelGestureState(g)
           }, 125)
           return
         }
       }
 
+      if (enteredInertialCoasting) {
+        // Finger lifted before reaching switch threshold — rebound immediately instead of coasting further
+        g.coastingReleased = true
+        g.coastingDir = g.rawOffset < 0 ? 1 : -1
+        g.rawOffset = 0
+        setSnapMode('rebound')
+        setIsSwiping(false)
+        setDragOffsetPx(0)
+
+        if (g.endTimer !== null) window.clearTimeout(g.endTimer)
+        g.endTimer = window.setTimeout(() => {
+          resetWheelGestureState(g)
+        }, 110)
+        return
+      }
+
+      const effectiveOffset = Math.max(-width, Math.min(width, g.rawOffset))
       setIsSwiping(true)
       setDragOffsetPx(effectiveOffset)
 
-      const settleDelay = absX < 3 ? 48 : 85
+      const settleDelay = absX < 3 ? 52 : 88
       if (g.endTimer !== null) window.clearTimeout(g.endTimer)
       g.endTimer = window.setTimeout(() => {
-        if (!g.committed) {
-          const snapThreshold = width * 0.2
+        if (!g.committed && !g.coastingReleased) {
+          const snapThreshold = gestureWidth * SWIPE_SNAP_RATIO
           const nextStep: 1 | -1 = g.rawOffset < 0 ? 1 : -1
           const candidateIdx = currentProfileIndex + nextStep
           if (
@@ -553,15 +648,12 @@ export const VerticalSidebar: React.FC<Props> = ({
           ) {
             commitProfileSwitch(profiles[candidateIdx].id, nextStep === 1 ? 'right' : 'left')
           } else {
+            setSnapMode('rebound')
             setIsSwiping(false)
             setDragOffsetPx(0)
           }
         }
-        g.lockedAxis = 'none'
-        g.rawOffset = 0
-        g.peakAbsDeltaX = 0
-        g.committed = false
-        g.committedDir = 0
+        resetWheelGestureState(g)
       }, settleDelay)
     },
     [
@@ -576,7 +668,7 @@ export const VerticalSidebar: React.FC<Props> = ({
   )
 
   const handleMouseSwipeStart = (e: React.MouseEvent<HTMLElement>): void => {
-    if (e.button !== 0 || draggingTabId || isResizing || renamingSpaceId || profiles.length <= 1) {
+    if (e.button !== 0 || draggingTabId || isResizing || renamingSpaceId || profiles.length === 0) {
       return
     }
     const target = e.target as HTMLElement | null
@@ -592,19 +684,20 @@ export const VerticalSidebar: React.FC<Props> = ({
     const startX = e.clientX
     const startY = e.clientY
     let axis: 'none' | 'horizontal' | 'vertical' = 'none'
-    let latestRawDx = 0
+    let latestEffectiveDx = 0
+    let endedAtBoundary = false
 
     const onMove = (moveEvt: MouseEvent): void => {
       const dx = moveEvt.clientX - startX
       const dy = moveEvt.clientY - startY
 
       if (axis === 'none') {
-        if (Math.abs(dy) > 8 && Math.abs(dy) > Math.abs(dx)) {
+        if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx) * 0.8) {
           axis = 'vertical'
           cleanup()
           return
         }
-        if (Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy) * 1.15) {
+        if (Math.abs(dx) > SWIPE_DEADZONE_PX && Math.abs(dx) > Math.abs(dy) * 1.8) {
           axis = 'horizontal'
           setIsSwiping(true)
         } else {
@@ -613,11 +706,18 @@ export const VerticalSidebar: React.FC<Props> = ({
       }
 
       if (axis === 'horizontal') {
-        latestRawDx = dx
-        const atStart = currentProfileIndex === 0 && dx > 0
-        const atEnd = currentProfileIndex === profiles.length - 1 && dx < 0
-        const clamped =
-          atStart || atEnd ? dx * 0.24 : Math.max(-width, Math.min(width, dx))
+        const rawPastDeadzone =
+          Math.sign(dx) * Math.max(0, Math.abs(dx) - SWIPE_DEADZONE_PX)
+        const dampedDx = rawPastDeadzone * 0.72
+        latestEffectiveDx = dampedDx
+
+        const atStart = currentProfileIndex === 0 && rawPastDeadzone > 0
+        const atEnd = currentProfileIndex === profiles.length - 1 && rawPastDeadzone < 0
+        endedAtBoundary = atStart || atEnd
+
+        const clamped = endedAtBoundary
+          ? computeBoundaryRubberBand(rawPastDeadzone)
+          : Math.max(-width, Math.min(width, dampedDx))
         setDragOffsetPx(clamped)
       }
     }
@@ -625,12 +725,20 @@ export const VerticalSidebar: React.FC<Props> = ({
     const onUp = (): void => {
       cleanup()
       if (axis !== 'horizontal') return
-      const threshold = width * 0.22
-      const step: 1 | -1 = latestRawDx < 0 ? 1 : -1
+      if (endedAtBoundary) {
+        setSnapMode('boundary')
+        setIsSwiping(false)
+        setDragOffsetPx(0)
+        return
+      }
+      const gestureWidth = Math.min(width, SWIPE_MAX_REF_WIDTH)
+      const threshold = gestureWidth * SWIPE_SNAP_RATIO
+      const step: 1 | -1 = latestEffectiveDx < 0 ? 1 : -1
       const nextIdx = currentProfileIndex + step
-      if (Math.abs(latestRawDx) >= threshold && nextIdx >= 0 && nextIdx < profiles.length) {
+      if (Math.abs(latestEffectiveDx) >= threshold && nextIdx >= 0 && nextIdx < profiles.length) {
         commitProfileSwitch(profiles[nextIdx].id, step === 1 ? 'right' : 'left')
       } else {
+        setSnapMode('rebound')
         setIsSwiping(false)
         setDragOffsetPx(0)
       }
@@ -725,13 +833,20 @@ export const VerticalSidebar: React.FC<Props> = ({
     }
   }
 
-  const isCurrentBookmarked =
-    Boolean(activeTab?.url) &&
-    !isInternalArkoUrl(activeTab!.url) &&
-    bookmarks.some((b) => b.url === activeTab!.url)
-  const isUrlBarBlank = !activeTab || activeTab.url === NEW_TAB_URL
-  const urlBarLabel = formatArcSidebarUrlLabel(activeTab, lang)
   const activeDownloads = downloads.filter((d) => d.state === 'progressing').length
+  const ungroupedActiveSpaceWebCount = useMemo(
+    () =>
+      allTabs.filter(
+        (t) =>
+          t.profileId === headerPreviewProfile.id &&
+          !t.isFavorite &&
+          !t.isPinned &&
+          t.url !== NEW_TAB_URL &&
+          !t.groupId &&
+          !isInternalArkoUrl(t.url)
+      ).length,
+    [allTabs, headerPreviewProfile.id]
+  )
 
   const renderProfileSlide = (profile: BrowserProfile): React.ReactNode => {
     const isVisualSlide = profile.id === visualProfile.id
@@ -746,9 +861,6 @@ export const VerticalSidebar: React.FC<Props> = ({
     const todayTabs = pTabs.filter(
       (t) => !t.isFavorite && !t.isPinned && t.url !== NEW_TAB_URL
     )
-    const ungroupedSlideWebCount = todayTabs.filter(
-      (t) => !t.groupId && !isInternalArkoUrl(t.url)
-    ).length
     const pActiveTab = pTabs.find((t) => t.id === pActiveTabId) || pTabs[0]
     const isNewTabPromptOnSlide = Boolean(newTabPromptOpen && profile.id === activeProfile.id)
     const isNewTabRowActive =
@@ -1225,7 +1337,6 @@ export const VerticalSidebar: React.FC<Props> = ({
 
     const pinnedNodes = buildPinnedRows(basePinnedTabs)
     const todayNodes = buildTodayRows(todayTabs)
-    const isRenamingThisSpace = renamingSpaceId === profile.id
 
     return (
       <div
@@ -1239,7 +1350,7 @@ export const VerticalSidebar: React.FC<Props> = ({
               }
             : undefined
         }
-        className="w-full shrink-0 basis-full h-full flex flex-col min-w-0 min-h-0"
+        className="w-full shrink-0 basis-full h-full flex flex-col min-w-0 min-h-0 pt-0.5"
       >
         {/* ==================== Zone 1: Top Favorites / Pin Bar ==================== */}
         <div
@@ -1491,114 +1602,6 @@ export const VerticalSidebar: React.FC<Props> = ({
           ) : null}
         </div>
 
-        {/* ==================== Arc-Authentic Space Header Row (Glides with Space!) ==================== */}
-        <div className="group/spacehdr px-3 pt-1 pb-1 flex items-center justify-between gap-1 shrink-0">
-          {isRenamingThisSpace ? (
-            <div className="flex items-center gap-1.5 flex-1 min-w-0">
-              <span className="text-[13px] leading-none shrink-0">{profile.emoji}</span>
-              <input
-                ref={renameInputRef}
-                value={renameDraft}
-                onChange={(e) => setRenameDraft(e.target.value)}
-                onBlur={() => commitInlineRename(profile)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    commitInlineRename(profile)
-                  } else if (e.key === 'Escape') {
-                    e.preventDefault()
-                    setRenamingSpaceId(null)
-                  }
-                }}
-                className={`flex-1 min-w-0 h-6 px-1.5 rounded-md text-[12px] font-semibold outline-none border ${
-                  isDark
-                    ? 'bg-black/30 border-white/20 text-white'
-                    : 'bg-white/90 border-black/20 text-zinc-900'
-                }`}
-              />
-            </div>
-          ) : (
-            <div className="flex items-center gap-1 min-w-0 flex-1">
-              <button
-                type="button"
-                onClick={(e) => triggerEditSpace(profile, e.currentTarget, 'right-top')}
-                title={tr(
-                  lang,
-                  'Customize Space theme & icon',
-                  '点击更换空间氛围色与图标'
-                )}
-                className={`arc-pressable w-6 h-6 -ml-1 rounded-md flex items-center justify-center text-[13px] leading-none shrink-0 ${
-                  isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
-                }`}
-              >
-                {profile.emoji}
-              </button>
-              <button
-                type="button"
-                onClick={(e) => triggerEditSpace(profile, e.currentTarget, 'right-top')}
-                onDoubleClick={(e) => {
-                  e.stopPropagation()
-                  setRenameDraft(profile.name)
-                  setRenamingSpaceId(profile.id)
-                }}
-                title={tr(
-                  lang,
-                  `${profile.name} — Click for Space theme · Double-click to rename`,
-                  `${profile.name} — 点击调整空间主题 · 双击直接重命名`
-                )}
-                className={`px-1 py-0.5 rounded-md text-[12px] font-semibold tracking-tight truncate opacity-80 hover:opacity-100 transition ${
-                  isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-black/[0.045]'
-                }`}
-              >
-                {profile.name}
-              </button>
-            </div>
-          )}
-
-          <div className="flex items-center gap-0.5 opacity-0 group-hover/spacehdr:opacity-100 transition-opacity duration-150 shrink-0">
-            {ungroupedSlideWebCount >= 3 && (
-              <button
-                type="button"
-                onClick={onOrganizeTabs}
-                disabled={organizingTabs}
-                title={tr(lang, 'Tidy tabs into folders (/organize)', 'AI 智能整理分组 (/organize)')}
-                className={`arc-pressable p-1 rounded-md opacity-65 hover:opacity-100 ${
-                  isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
-                }`}
-              >
-                {organizingTabs ? (
-                  <Loader2 size={11.5} className="animate-spin" />
-                ) : (
-                  <FolderKanban size={11.5} />
-                )}
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => {
-                setRenameDraft(profile.name)
-                setRenamingSpaceId(profile.id)
-              }}
-              title={tr(lang, 'Rename Space', '重命名空间')}
-              className={`arc-pressable p-1 rounded-md opacity-60 hover:opacity-100 ${
-                isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
-              }`}
-            >
-              <Pencil size={11} />
-            </button>
-            <button
-              type="button"
-              onClick={(e) => triggerEditSpace(profile, e.currentTarget, 'right-top')}
-              title={tr(lang, 'Space theme, icon & options', '空间主题、图标与设置')}
-              className={`arc-pressable p-1 rounded-md opacity-65 hover:opacity-100 ${
-                isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
-              }`}
-            >
-              <MoreHorizontal size={13} />
-            </button>
-          </div>
-        </div>
-
         {/* ==================== Zone 2: Pinned Tabs + Hairline Divider + Today Tabs ==================== */}
         <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-0.5 min-h-0">
           {(pinnedNodes.length > 0 || hasAnyIncomingDrag) && (
@@ -1845,146 +1848,132 @@ export const VerticalSidebar: React.FC<Props> = ({
         />
       )}
 
-      {/* Row 1: Arc Top-Left Window Controls ([Sidebar Toggle] ... [< > ↻]) */}
+      {/* Row 1: Dia Top-Left Space Header beside macOS Traffic Lights */}
       <div
-        className={`relative z-10 ${isPeekOverlay ? '' : 'app-drag'} h-[38px] flex items-center justify-between gap-1 shrink-0 ${
-          platform === 'darwin' && !isPeekOverlay ? 'pl-[76px] pr-2.5' : 'pl-2.5 pr-2.5'
+        className={`group/spacehdr relative z-10 ${isPeekOverlay ? '' : 'app-drag'} h-[40px] flex items-center justify-between gap-1 shrink-0 ${
+          platform === 'darwin' && !isPeekOverlay ? 'pl-[76px] pr-2.5' : 'pl-3 pr-2.5'
         }`}
       >
-        <button
-          type="button"
-          onClick={onCollapseSidebar}
-          title={
-            isPeekOverlay
-              ? tr(lang, 'Pin Sidebar Open (⇧⌘S)', '固定展开侧边栏 (⇧⌘S)')
-              : tr(lang, 'Hide Sidebar (⇧⌘S)', '收起侧边栏 (⇧⌘S)')
-          }
-          className="app-no-drag arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-        >
-          <PanelLeft size={14.5} />
-        </button>
+        {renamingSpaceId === headerPreviewProfile.id ? (
+          <div className="app-no-drag flex items-center gap-1.5 flex-1 min-w-0">
+            <span className="text-[13px] leading-none shrink-0">{headerPreviewProfile.emoji}</span>
+            <input
+              ref={renameInputRef}
+              value={renameDraft}
+              onChange={(e) => setRenameDraft(e.target.value)}
+              onBlur={() => commitInlineRename(headerPreviewProfile)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  commitInlineRename(headerPreviewProfile)
+                } else if (e.key === 'Escape') {
+                  e.preventDefault()
+                  setRenamingSpaceId(null)
+                }
+              }}
+              className={`flex-1 min-w-0 h-6 px-1.5 rounded-md text-[12px] font-semibold outline-none border ${
+                isDark
+                  ? 'bg-black/30 border-white/20 text-white'
+                  : 'bg-white/90 border-black/20 text-zinc-900'
+              }`}
+            />
+          </div>
+        ) : (
+          <div className="app-no-drag flex items-center gap-1 min-w-0 flex-1">
+            <button
+              type="button"
+              onClick={(e) => triggerEditSpace(headerPreviewProfile, e.currentTarget, 'right-top')}
+              onDoubleClick={(e) => {
+                e.stopPropagation()
+                setRenameDraft(headerPreviewProfile.name)
+                setRenamingSpaceId(headerPreviewProfile.id)
+              }}
+              title={tr(
+                lang,
+                `${headerPreviewProfile.name} — Click for Space theme · Double-click to rename`,
+                `${headerPreviewProfile.name} — 点击调整空间主题 · 双击直接重命名`
+              )}
+              className={`arc-pressable px-1.5 py-1 -ml-1 rounded-lg flex items-center gap-1.5 min-w-0 text-[12.5px] font-semibold tracking-tight opacity-85 hover:opacity-100 transition ${
+                isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-black/[0.045]'
+              }`}
+            >
+              <span className="text-[12.5px] leading-none shrink-0">
+                {headerPreviewProfile.emoji}
+              </span>
+              <span className="truncate">{headerPreviewProfile.name}</span>
+            </button>
+          </div>
+        )}
 
         <div className="app-no-drag flex items-center gap-0.5 shrink-0">
-          <button
-            type="button"
-            onClick={onBack}
-            disabled={!activeTab?.canGoBack}
-            title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
-            className="arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-          >
-            <ChevronLeft size={15} />
-          </button>
-          <button
-            type="button"
-            onClick={onForward}
-            disabled={!activeTab?.canGoForward}
-            title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
-            className="arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-          >
-            <ChevronRight size={15} />
-          </button>
-          <button
-            type="button"
-            onClick={onReload}
-            disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
-            title={tr(lang, 'Reload (⌘R)', '刷新页面 (⌘R)')}
-            className="arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-          >
-            <RotateCw size={13} className={activeTab?.isLoading ? 'animate-spin' : ''} />
-          </button>
-        </div>
-      </div>
-
-      {/* Row 2: Arc's Signature Frosted Sidebar URL / Command Bar */}
-      <div className="relative z-10 px-2.5 pb-2 shrink-0">
-        <div
-          onClick={onOpenOmnibox}
-          style={{
-            backgroundColor: isDark ? 'rgba(255, 255, 255, 0.075)' : 'rgba(0, 0, 0, 0.048)',
-            boxShadow: isDark
-              ? 'inset 0 0 0 1px rgba(255, 255, 255, 0.06)'
-              : 'inset 0 0 0 1px rgba(0, 0, 0, 0.045)'
-          }}
-          className={`app-no-drag arc-pressable group/url relative h-[32px] px-2.5 rounded-[10px] flex items-center gap-2 text-[12.5px] cursor-text overflow-hidden ${
-            isDark ? 'hover:!bg-white/[0.115]' : 'hover:!bg-black/[0.075]'
-          }`}
-        >
-          {activeTab?.isSensitive ? (
-            <ShieldAlert size={12.5} className="text-amber-500 shrink-0" />
-          ) : activeTab && isChatTabUrl(activeTab.url) ? (
-            <Sparkles size={12.5} className="opacity-65 shrink-0" />
-          ) : !isUrlBarBlank && !isInternalArkoUrl(activeTab?.url) ? (
-            <Lock size={11.5} className="opacity-40 shrink-0" />
-          ) : (
-            <Search size={12.5} className="opacity-45 shrink-0" />
-          )}
-
-          <span
-            className={`truncate flex-1 font-medium transition-opacity ${
-              isUrlBarBlank
-                ? 'opacity-50 group-hover/url:opacity-80'
-                : 'opacity-80 group-hover/url:opacity-100'
-            }`}
-          >
-            {urlBarLabel}
-          </span>
-
-          {activeTab && !isInternalArkoUrl(activeTab.url) ? (
-            <div
-              onClick={(e) => e.stopPropagation()}
-              className="hidden group-hover/url:flex items-center gap-0.5 shrink-0"
-            >
+          <div className="flex items-center gap-0.5 opacity-0 group-hover/spacehdr:opacity-100 transition-opacity duration-150">
+            {ungroupedActiveSpaceWebCount >= 3 && (
               <button
                 type="button"
-                onClick={() => {
-                  void navigator.clipboard.writeText(activeTab.url)
-                  setCopiedUrl(true)
-                  window.setTimeout(() => setCopiedUrl(false), 1400)
-                }}
-                title={tr(lang, 'Copy page link', '复制当前网页链接')}
-                className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/12 transition"
-              >
-                {copiedUrl ? (
-                  <Check size={11.5} className="text-emerald-500" />
-                ) : (
-                  <Link2 size={11.5} />
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={onOpenReader}
-                title={tr(lang, 'Reader View (⇧⌘R)', '沉浸阅读视图 (⇧⌘R)')}
-                className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/12 transition"
-              >
-                <BookOpen size={11.5} />
-              </button>
-              <button
-                type="button"
-                onClick={onToggleBookmark}
-                title={tr(lang, 'Bookmark page (⌘D)', '收藏当前网页 (⌘D)')}
-                className={`p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/12 transition ${
-                  isCurrentBookmarked ? 'opacity-100' : 'opacity-65 hover:opacity-100'
+                onClick={onOrganizeTabs}
+                disabled={organizingTabs}
+                title={tr(lang, 'Tidy tabs into folders (/organize)', 'AI 智能整理分组 (/organize)')}
+                className={`arc-pressable p-1 rounded-md opacity-65 hover:opacity-100 ${
+                  isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
                 }`}
               >
-                <Bookmark size={11.5} fill={isCurrentBookmarked ? 'currentColor' : 'none'} />
+                {organizingTabs ? (
+                  <Loader2 size={11.5} className="animate-spin" />
+                ) : (
+                  <FolderKanban size={11.5} />
+                )}
               </button>
-            </div>
-          ) : (
-            <span className="text-[10.5px] font-mono opacity-40 shrink-0">⌘L</span>
-          )}
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setRenameDraft(headerPreviewProfile.name)
+                setRenamingSpaceId(headerPreviewProfile.id)
+              }}
+              title={tr(lang, 'Rename Space', '重命名空间')}
+              className={`arc-pressable p-1 rounded-md opacity-60 hover:opacity-100 ${
+                isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
+              }`}
+            >
+              <Pencil size={11} />
+            </button>
+            <button
+              type="button"
+              onClick={(e) => triggerEditSpace(headerPreviewProfile, e.currentTarget, 'right-top')}
+              title={tr(lang, 'Space theme, icon & options', '空间主题、图标与设置')}
+              className={`arc-pressable p-1 rounded-md opacity-65 hover:opacity-100 ${
+                isDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
+              }`}
+            >
+              <MoreHorizontal size={13} />
+            </button>
+          </div>
 
-          {activeTab?.isLoading && <div className="dia-loading-bar" />}
+          {isPeekOverlay && (
+            <button
+              type="button"
+              onClick={onCollapseSidebar}
+              title={tr(lang, 'Pin Sidebar Open (⇧⌘S)', '固定展开侧边栏 (⇧⌘S)')}
+              className="arc-pressable p-1.5 rounded-lg opacity-65 hover:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+            >
+              <PanelLeft size={14} />
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Row 3: Horizontal Space / Profile Carousel Viewport */}
+      {/* Row 2: Horizontal Space / Profile Carousel Viewport */}
       <div className="relative z-10 flex-1 min-h-0 overflow-hidden">
         <div
           style={{
             transform: `translate3d(calc(${-currentProfileIndex * 100}% + ${dragOffsetPx}px), 0, 0)`,
             transition: isSwiping
               ? 'none'
-              : 'transform 310ms cubic-bezier(0.16, 1, 0.3, 1)'
+              : snapMode === 'boundary'
+                ? 'transform 420ms cubic-bezier(0.24, 1.56, 0.38, 1)'
+                : snapMode === 'rebound'
+                  ? 'transform 360ms cubic-bezier(0.22, 1.22, 0.36, 1)'
+                  : 'transform 320ms cubic-bezier(0.16, 1, 0.3, 1)'
           }}
           className="flex w-full h-full will-change-transform"
         >

@@ -67,6 +67,7 @@ interface Props {
   bookmarks: BookmarkItem[]
   downloads: DownloadItemState[]
   aiSidebarOpen: boolean
+  omniboxOpen?: boolean
   newTabPromptOpen?: boolean
   organizingTabs?: boolean
   draggingTabId?: string | null
@@ -175,6 +176,7 @@ export const HorizontalChrome: React.FC<Props> = ({
   bookmarks,
   downloads,
   aiSidebarOpen,
+  omniboxOpen,
   newTabPromptOpen,
   organizingTabs,
   draggingTabId,
@@ -540,8 +542,11 @@ export const HorizontalChrome: React.FC<Props> = ({
 
         {compactTopBar && (
           <button
+            data-arko-urlbar-anchor="true"
             onClick={onOpenOmnibox}
             className={`app-no-drag w-56 sm:w-72 h-[28px] px-2.5 rounded-full flex items-center gap-1.5 text-xs border transition shrink-0 ${
+              omniboxOpen ? 'opacity-0 pointer-events-none' : ''
+            } ${
               isDark
                 ? 'bg-[#22222A] border-white/10 hover:border-white/20 text-zinc-200'
                 : 'bg-white/90 border-black/8 hover:bg-white text-zinc-800 shadow-2xs'
@@ -889,8 +894,11 @@ export const HorizontalChrome: React.FC<Props> = ({
           </div>
 
           <div
+            data-arko-urlbar-anchor="true"
             onClick={onOpenOmnibox}
             className={`group relative flex-1 max-w-3xl mx-auto h-[30px] px-3 rounded-full flex items-center gap-2 text-xs cursor-text transition-all border overflow-hidden ${
+              omniboxOpen ? 'opacity-0 pointer-events-none' : ''
+            } ${
               isDark
                 ? 'bg-[#222229] border-white/8 hover:border-white/18 text-zinc-200'
                 : 'bg-white/88 border-black/7 hover:bg-white hover:border-black/15 text-zinc-800 shadow-2xs'

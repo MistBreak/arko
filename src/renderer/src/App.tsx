@@ -3,16 +3,19 @@ import {
   ArrowLeftRight,
   Bookmark,
   BookOpen,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
   Columns2,
+  Copy,
   GripVertical,
   Lock,
+  MessageSquare,
   PanelLeft,
-  PanelRight,
   PenLine,
+  Plug,
   RotateCw,
   Search,
   ShieldAlert,
@@ -62,7 +65,7 @@ import { ReaderModal } from './components/ReaderModal'
 import { TabContextMenu } from './components/TabContextMenu'
 import { InlineWriteOverlay } from './components/InlineWriteOverlay'
 import { FaviconIcon } from './components/FaviconIcon'
-import { ConnectToolsModal } from './components/ConnectToolsModal'
+import { ConnectToolsModal, ToolBrandIcon } from './components/ConnectToolsModal'
 import { SpaceEditorPopover, type SpacePopoverRequest } from './components/SpaceEditorPopover'
 
 /**
@@ -198,6 +201,7 @@ export const App: React.FC = () => {
   const [findText, setFindText] = useState('')
   const [findMatchInfo, setFindMatchInfo] = useState<FindInPageResultPayload | null>(null)
   const findInputRef = useRef<HTMLInputElement>(null)
+  const [copiedTopUrl, setCopiedTopUrl] = useState(false)
 
   const singleViewportRef = useRef<HTMLDivElement>(null)
   const splitContainerRef = useRef<HTMLDivElement>(null)
@@ -621,6 +625,9 @@ export const App: React.FC = () => {
     : undefined
 
   const enabledMemoryCount = state.memories.filter((m) => m.enabled).length
+  const connectedChromeTools = (state.connectedTools || []).filter(
+    (t) => t.status !== 'disconnected'
+  )
   const currentUpdateState = updateState ?? state.updateState
 
   const isVertical = state.settings.layoutMode === 'vertical'
@@ -679,10 +686,15 @@ export const App: React.FC = () => {
     })
   }
 
-  const handleAskAIFromBar = async (prompt: string, includeAllTabs = false): Promise<void> => {
-    const mentions: ChatMention[] = includeAllTabs
-      ? [{ type: 'all-tabs', title: tr(lang, 'All Open Tabs', '全部打开标签页') }]
-      : []
+  const handleAskAIFromBar = async (
+    prompt: string,
+    includeAllTabs = false,
+    extraMentions: ChatMention[] = []
+  ): Promise<void> => {
+    const mentions: ChatMention[] = [...extraMentions]
+    if (includeAllTabs && !mentions.some((m) => m.type === 'all-tabs')) {
+      mentions.push({ type: 'all-tabs', title: tr(lang, 'All Open Tabs', '全部打开标签页') })
+    }
 
     if (activeTab && activeTab.url === NEW_TAB_URL) {
       await handleAskAIFromNewTab(prompt, mentions, activeTab.id)
@@ -875,9 +887,13 @@ export const App: React.FC = () => {
     }
   }
 
-  const handleAskAIFromOmnibox = async (prompt: string, openInNewTab = false): Promise<void> => {
+  const handleAskAIFromOmnibox = async (
+    prompt: string,
+    openInNewTab = false,
+    extraMentions: ChatMention[] = []
+  ): Promise<void> => {
     const trimmed = prompt.trim()
-    if (!trimmed) return
+    if (!trimmed && extraMentions.length === 0) return
 
     if (trimmed === '/organize') {
       await handleOrganizeTabs()
@@ -889,30 +905,33 @@ export const App: React.FC = () => {
       trimmed === '/screenshot' ||
       trimmed.startsWith('/screenshot ')
     ) {
-      await handleAskAIFromBar(trimmed)
+      await handleAskAIFromBar(trimmed, false, extraMentions)
       return
     }
 
     if (!openInNewTab) {
-      await handleAskAIFromBar(trimmed)
+      await handleAskAIFromBar(trimmed, false, extraMentions)
       return
     }
 
-    const mentions: ChatMention[] = []
+    const mentions: ChatMention[] = [...extraMentions]
     if (trimmed.startsWith('/')) {
       const cmdToken = trimmed.split(/\s+/)[0].toLowerCase()
       const matchedSkill = getAllSlashSkills(state.settings.customSkills, lang).find(
         (s) => s.command.toLowerCase() === cmdToken
       )
       if (matchedSkill?.includeAllTabs || matchedSkill?.contextScope === 'all-tabs') {
-        mentions.push({
-          type: 'all-tabs',
-          title: tr(lang, 'All Open Tabs', '全部打开标签页')
-        })
+        if (!mentions.some((m) => m.type === 'all-tabs')) {
+          mentions.push({
+            type: 'all-tabs',
+            title: tr(lang, 'All Open Tabs', '全部打开标签页')
+          })
+        }
       } else if (
         matchedSkill?.contextScope === 'active' &&
         activeTab &&
-        !isInternalArkoUrl(activeTab.url)
+        !isInternalArkoUrl(activeTab.url) &&
+        !mentions.some((m) => m.type === 'tab' && m.tabId === activeTab.id)
       ) {
         mentions.push({
           type: 'tab',
@@ -1278,6 +1297,7 @@ export const App: React.FC = () => {
           bookmarks={state.bookmarks}
           downloads={state.downloads}
           aiSidebarOpen={state.aiSidebarOpen}
+          omniboxOpen={omniboxAnim.mounted}
           newTabPromptOpen={omniboxOpen && omniboxMode === 'new-tab'}
           organizingTabs={organizingTabs}
           draggingTabId={draggingTabId}
@@ -1441,10 +1461,10 @@ export const App: React.FC = () => {
               : 'px-[6px] pb-[6px] pt-[5px]'
           }`}
         >
-          {/* Quiet Minimalist Top Strip in Vertical Mode */}
+          {/* Dia-Style Unified Top Bar in Vertical Mode */}
           {isVertical && (
             <div
-              className={`relative app-drag h-[38px] flex items-center justify-between gap-2 shrink-0 ${
+              className={`relative app-drag h-[40px] flex items-center justify-between gap-2.5 shrink-0 ${
                 state.platform === 'darwin' && isSidebarCollapsed
                   ? 'pl-[76px] pr-2'
                   : state.platform !== 'darwin' && !state.aiSidebarOpen
@@ -1452,17 +1472,24 @@ export const App: React.FC = () => {
                     : 'pl-2 pr-2'
               }`}
             >
-              {/* Left Controls: Shown ONLY when Sidebar is Collapsed (avoiding duplicate nav buttons!) */}
-              {isSidebarCollapsed ? (
-                <div className="app-no-drag flex items-center gap-0.5 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => void handleUpdateSettings({ sidebarCollapsed: false })}
-                    title={tr(lang, 'Show Sidebar (⇧⌘S)', '展开侧边栏 (⇧⌘S)')}
-                    className="arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                  >
-                    <PanelLeft size={14.5} />
-                  </button>
+              {/* Left Navigation Cluster: [Sidebar Toggle] (Space Pill when collapsed) [<] [>] [↻] */}
+              <div className="app-no-drag flex items-center gap-0.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() =>
+                    void handleUpdateSettings({ sidebarCollapsed: !isSidebarCollapsed })
+                  }
+                  title={
+                    isSidebarCollapsed
+                      ? tr(lang, 'Show Sidebar (⇧⌘S)', '展开侧边栏 (⇧⌘S)')
+                      : tr(lang, 'Hide Sidebar (⇧⌘S)', '收起侧边栏 (⇧⌘S)')
+                  }
+                  className="arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                >
+                  <PanelLeft size={14.5} />
+                </button>
+
+                {isSidebarCollapsed && (
                   <button
                     type="button"
                     onClick={(e) => {
@@ -1488,7 +1515,7 @@ export const App: React.FC = () => {
                       backgroundColor: activeSpaceTheme.spaceBadgeBg,
                       borderColor: activeSpaceTheme.spaceBadgeBorder
                     }}
-                    className="arc-pressable mr-1 px-2 py-0.5 rounded-full border flex items-center gap-1.5 text-[11.5px] font-semibold hover:brightness-105"
+                    className="arc-pressable mx-0.5 px-2 py-0.5 rounded-full border flex items-center gap-1.5 text-[11.5px] font-semibold hover:brightness-105"
                   >
                     <span className="text-xs leading-none">{activeProfile.emoji}</span>
                     <span className="max-w-[72px] truncate">{activeProfile.name}</span>
@@ -1497,106 +1524,176 @@ export const App: React.FC = () => {
                       className="w-1.5 h-1.5 rounded-full shrink-0"
                     />
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => void window.arko.goBack()}
-                    disabled={!activeTab?.canGoBack}
-                    title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
-                    className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                  >
-                    <ChevronLeft size={15} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void window.arko.goForward()}
-                    disabled={!activeTab?.canGoForward}
-                    title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
-                    className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                  >
-                    <ChevronRight size={15} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void window.arko.reload()}
-                    disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
-                    title={tr(lang, 'Reload (⌘R)', '刷新页面 (⌘R)')}
-                    className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-                  >
-                    <RotateCw size={13} className={activeTab?.isLoading ? 'animate-spin' : ''} />
-                  </button>
-                </div>
-              ) : (
-                <div className="w-16 shrink-0" />
-              )}
+                )}
 
-              {/* Center Quiet Page Title / Quick Command Trigger */}
-              {activeTab && activeTab.url !== NEW_TAB_URL ? (
-                <div
-                  onClick={handleOpenOmniboxCurrentTab}
-                  className="app-no-drag arc-pressable group max-w-[440px] flex-1 h-[26px] px-2.5 rounded-lg flex items-center justify-center gap-1.5 text-[12px] cursor-text hover:bg-black/[0.05] dark:hover:bg-white/[0.07] overflow-hidden"
+                <button
+                  type="button"
+                  onClick={() => void window.arko.goBack()}
+                  disabled={!activeTab?.canGoBack}
+                  title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
+                  className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
                 >
-                  {activeTab.isSensitive ? (
-                    <ShieldAlert size={12} className="text-amber-500 shrink-0" />
-                  ) : !isInternalArkoUrl(activeTab.url) ? (
-                    <Lock size={11} className="opacity-35 shrink-0" />
-                  ) : null}
-                  <span className="truncate opacity-60 group-hover:opacity-95 font-medium transition">
-                    {activeTab.title || activeTab.url}
+                  <ChevronLeft size={15} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void window.arko.goForward()}
+                  disabled={!activeTab?.canGoForward}
+                  title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
+                  className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                >
+                  <ChevronRight size={15} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void window.arko.reload()}
+                  disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
+                  title={tr(lang, 'Reload (⌘R)', '刷新页面 (⌘R)')}
+                  className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                >
+                  <RotateCw size={13} className={activeTab?.isLoading ? 'animate-spin' : ''} />
+                </button>
+              </div>
+
+              {/* Center Dia Smart URL Bar (Expands In-Place on Click / ⌘L) */}
+              <div
+                data-arko-urlbar-anchor="true"
+                onClick={handleOpenOmniboxCurrentTab}
+                className={`app-no-drag arc-pressable group relative max-w-[600px] flex-1 mx-auto h-[29px] px-3 rounded-[10px] border flex items-center gap-2 text-[12.5px] cursor-text overflow-hidden transition-all ${
+                  omniboxAnim.mounted ? 'opacity-0 pointer-events-none' : ''
+                } ${
+                  isDark
+                    ? 'bg-white/[0.055] hover:bg-white/[0.085] border-white/[0.07] hover:border-white/[0.13] text-zinc-200'
+                    : 'bg-black/[0.038] hover:bg-white/90 border-black/[0.06] hover:border-black/[0.12] text-zinc-800'
+                }`}
+              >
+                {activeTab?.isSensitive ? (
+                  <ShieldAlert size={12.5} className="text-amber-500 shrink-0" />
+                ) : activeTab && isChatTabUrl(activeTab.url) ? (
+                  <Sparkles size={12.5} className="opacity-65 shrink-0" />
+                ) : activeTab && !isInternalArkoUrl(activeTab.url) ? (
+                  <Lock size={11.5} className="opacity-40 shrink-0" />
+                ) : (
+                  <Search size={12.5} className="opacity-45 shrink-0" />
+                )}
+
+                {activeTab && activeTab.url !== NEW_TAB_URL ? (
+                  <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                    <span className="truncate opacity-85 group-hover:hidden font-medium">
+                      {activeTab.title || activeTab.url}
+                    </span>
+                    <span className="hidden group-hover:inline truncate opacity-90 font-normal">
+                      {activeTab.url.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '')}
+                    </span>
+                  </div>
+                ) : (
+                  <span className="truncate flex-1 opacity-45 group-hover:opacity-75">
+                    {tr(
+                      lang,
+                      'Search, enter a URL, or ask anything…',
+                      '搜索网页、输入网址，或直接提问…'
+                    )}
                   </span>
-                  {!isInternalArkoUrl(activeTab.url) && (
-                    <div
-                      onClick={(e) => e.stopPropagation()}
-                      className="hidden group-hover:flex items-center gap-0.5 pl-1 shrink-0"
+                )}
+
+                {activeTab && !isInternalArkoUrl(activeTab.url) ? (
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className="hidden group-hover:flex items-center gap-0.5 pl-1 shrink-0"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void navigator.clipboard.writeText(activeTab.url)
+                        setCopiedTopUrl(true)
+                        window.setTimeout(() => setCopiedTopUrl(false), 1300)
+                      }}
+                      title={tr(lang, 'Copy URL', '复制网址')}
+                      className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/10"
                     >
-                      <button
-                        type="button"
-                        onClick={() => void handleOpenReader()}
-                        title={tr(lang, 'Reader View (⇧⌘R)', '沉浸阅读视图 (⇧⌘R)')}
-                        className="p-0.5 rounded opacity-60 hover:opacity-100"
-                      >
-                        <BookOpen size={11.5} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleOpenInlineWrite()}
-                        title={tr(lang, 'Inline Write (⌘J)', '网页内联帮写 (⌘J)')}
-                        className="p-0.5 rounded opacity-60 hover:opacity-100"
-                      >
-                        <PenLine size={11.5} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleToggleBookmarkCurrent}
-                        title={tr(lang, 'Bookmark (⌘D)', '收藏网页 (⌘D)')}
-                        className={`p-0.5 rounded ${
-                          isCurrentBookmarked ? 'opacity-100' : 'opacity-60 hover:opacity-100'
-                        }`}
-                      >
-                        <Bookmark
-                          size={11.5}
-                          fill={isCurrentBookmarked ? 'currentColor' : 'none'}
-                        />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ) : isSidebarCollapsed ? (
-                <div
-                  onClick={handleOpenOmniboxCurrentTab}
-                  className="app-no-drag arc-pressable group max-w-[360px] flex-1 h-[26px] px-2.5 rounded-lg flex items-center justify-center gap-1.5 text-[12px] cursor-text opacity-50 hover:opacity-95 hover:bg-black/[0.05] dark:hover:bg-white/[0.07] overflow-hidden"
-                >
-                  <Search size={11.5} className="shrink-0" />
-                  <span className="truncate">
-                    {tr(lang, 'Search or enter URL…', '搜索或输入网址…')}
-                  </span>
-                  <span className="text-[10.5px] font-mono opacity-60 shrink-0">⌘T</span>
-                </div>
-              ) : (
-                <div className="flex-1" />
-              )}
+                      {copiedTopUrl ? (
+                        <Check size={11.5} className="text-emerald-500" />
+                      ) : (
+                        <Copy size={11.5} />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleOpenReader()}
+                      title={tr(lang, 'Reader View (⇧⌘R)', '沉浸阅读视图 (⇧⌘R)')}
+                      className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/10"
+                    >
+                      <BookOpen size={11.5} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleOpenInlineWrite()}
+                      title={tr(lang, 'Inline Write (⌘J)', '网页内联帮写 (⌘J)')}
+                      className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/10"
+                    >
+                      <PenLine size={11.5} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleToggleBookmarkCurrent}
+                      title={tr(lang, 'Bookmark (⌘D)', '收藏网页 (⌘D)')}
+                      className={`p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/10 ${
+                        isCurrentBookmarked ? 'text-amber-500 opacity-100' : 'opacity-65 hover:opacity-100'
+                      }`}
+                    >
+                      <Bookmark
+                        size={11.5}
+                        fill={isCurrentBookmarked ? 'currentColor' : 'none'}
+                      />
+                    </button>
+                  </div>
+                ) : (
+                  <span className="text-[10.5px] font-mono opacity-40 shrink-0">⌘L</span>
+                )}
 
-              {/* Right Subtle Utility Icons */}
-              <div className="app-no-drag flex items-center gap-0.5 shrink-0">
+                {activeTab?.isLoading && <div className="dia-loading-bar" />}
+              </div>
+
+              {/* Right utility cluster and Chat pill */}
+              <div className="app-no-drag flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setConnectToolsOpen(true)}
+                  title={tr(
+                    lang,
+                    connectedChromeTools.length > 0
+                      ? `${connectedChromeTools.length} Connected Tools`
+                      : 'Connect Tools',
+                    connectedChromeTools.length > 0
+                      ? `已连接 ${connectedChromeTools.length} 个常用工具`
+                      : '连接常用工具'
+                  )}
+                  className="arc-pressable p-1.5 rounded-lg opacity-70 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07] flex items-center"
+                >
+                  {connectedChromeTools.length > 0 ? (
+                    <span className="flex items-center gap-1">
+                      {connectedChromeTools.slice(0, 3).map((t) => (
+                        <ToolBrandIcon key={t.id} id={t.id} size={13} />
+                      ))}
+                    </span>
+                  ) : (
+                    <Plug size={13.5} />
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleToggleSplitView}
+                  title={tr(lang, 'Split View (⌘⇧\\)', '左右分屏 (⌘⇧\\)')}
+                  className={`arc-pressable p-1.5 rounded-lg ${
+                    splitView.enabled
+                      ? 'opacity-100 bg-black/[0.07] dark:bg-white/[0.11]'
+                      : 'opacity-55 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
+                  }`}
+                >
+                  <Columns2 size={14} />
+                </button>
+
                 <button
                   type="button"
                   onClick={() => handleOpenSettingsAt('account')}
@@ -1607,8 +1704,8 @@ export const App: React.FC = () => {
                   }
                   className={`arc-pressable relative p-1.5 rounded-lg ${
                     state.accountState?.authenticated
-                      ? 'opacity-85 hover:opacity-100 text-indigo-500 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
-                      : 'opacity-50 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
+                      ? 'opacity-90 hover:opacity-100 text-indigo-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
+                      : 'opacity-55 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
                   }`}
                 >
                   <UserRound size={14} />
@@ -1616,29 +1713,23 @@ export const App: React.FC = () => {
                     <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-emerald-500" />
                   )}
                 </button>
-                <button
-                  type="button"
-                  onClick={handleToggleSplitView}
-                  title={tr(lang, 'Split View (⌘⇧\\)', '左右分屏 (⌘⇧\\)')}
-                  className={`arc-pressable p-1.5 rounded-lg ${
-                    splitView.enabled
-                      ? 'opacity-100 bg-black/[0.07] dark:bg-white/[0.11]'
-                      : 'opacity-50 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
-                  }`}
-                >
-                  <Columns2 size={14} />
-                </button>
+
                 <button
                   type="button"
                   onClick={() => void window.arko.setAISidebarOpen(!state.aiSidebarOpen)}
                   title={tr(lang, 'Toggle Chat Sidebar (⌘E)', '切换右侧对话侧栏 (⌘E)')}
-                  className={`arc-pressable p-1.5 rounded-lg ${
+                  className={`arc-pressable h-[27px] px-2.5 rounded-lg text-[12px] font-medium flex items-center gap-1.5 border transition ${
                     state.aiSidebarOpen
-                      ? 'opacity-100 bg-black/[0.07] dark:bg-white/[0.11]'
-                      : 'opacity-50 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
+                      ? isDark
+                        ? 'bg-zinc-100 text-zinc-900 border-white/20'
+                        : 'bg-zinc-900 text-white border-black/20'
+                      : isDark
+                        ? 'bg-white/[0.06] hover:bg-white/[0.11] border-white/[0.08] text-zinc-200'
+                        : 'bg-white/85 hover:bg-white border-black/[0.08] text-zinc-800 shadow-2xs'
                   }`}
                 >
-                  <PanelRight size={14} />
+                  <MessageSquare size={12} className="fill-current opacity-85" />
+                  <span>{tr(lang, 'Chat', '对话')}</span>
                 </button>
               </div>
             </div>
@@ -2261,10 +2352,10 @@ export const App: React.FC = () => {
         />
       )}
 
-      {/* Omnibox Modal (⌘T / ⌘L / ⌘K) */}
+      {/* Dia Smart URL Bar Popover (⌘T / ⌘L) */}
       {omniboxAnim.mounted && (
         <CommandOmniboxModal
-          key={omniboxMode}
+          key={`${omniboxMode}-${state.activeTabId || 'none'}`}
           mode={omniboxMode}
           focusTrigger={omniboxFocusSeq}
           isDark={isDark}
@@ -2272,7 +2363,8 @@ export const App: React.FC = () => {
           isClosing={omniboxAnim.isClosing}
           activeTabId={state.activeTabId}
           initialUrl={activeTab?.url}
-          recentlyClosedCount={state.recentlyClosedCount}
+          memoryCount={enabledMemoryCount}
+          connectedTools={state.connectedTools}
           tabs={state.tabs}
           bookmarks={state.bookmarks}
           history={state.history}
@@ -2281,21 +2373,9 @@ export const App: React.FC = () => {
           onOpenInNewTab={handleOpenInputInNewTab}
           onSwitchTab={(tid) => void window.arko.switchTab(tid)}
           onOpenTabInSplit={(tid) => void window.arko.openSplitView(tid)}
-          onAskAI={(p, inNewTab) => void handleAskAIFromOmnibox(p, inNewTab)}
-          onNewChatTab={() => void window.arko.openChatAsTab()}
+          onAskAI={(p, inNewTab, mentions) => void handleAskAIFromOmnibox(p, inNewTab, mentions)}
           onOrganizeTabs={() => void handleOrganizeTabs()}
-          onOpenReader={() => void handleOpenReader()}
-          onToggleSplitView={handleToggleSplitView}
-          onReopenClosedTab={() => {
-            void window.arko.reopenClosedTab().then((ok) => {
-              if (ok) showToast(tr(lang, '↩️ Reopened closed tab', '↩️ 已恢复刚关闭的标签页'))
-            })
-          }}
-          onToggleTheme={() =>
-            void handleUpdateSettings({ theme: isDark ? 'light' : 'dark' })
-          }
-          onToggleLanguage={handleToggleLanguage}
-          onCheckUpdates={() => handleOpenSettingsAt('updates')}
+          onShowToast={showToast}
           onClose={() => setOmniboxOpen(false)}
         />
       )}

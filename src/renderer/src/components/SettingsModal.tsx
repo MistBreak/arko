@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import {
   ArrowDownCircle,
   Brain,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Coins,
   Copy,
   Download,
@@ -123,7 +125,36 @@ export const SettingsModal: React.FC<Props> = ({
   onClose
 }) => {
   const lang: AppLanguage = settings.language === 'zh-CN' ? 'zh-CN' : 'en'
-  const [tab, setTab] = useState<SettingsTabId>(initialTab)
+  const [tabHistory, setTabHistory] = useState<{ stack: SettingsTabId[]; index: number }>({
+    stack: [initialTab],
+    index: 0
+  })
+  const tab = tabHistory.stack[tabHistory.index] ?? initialTab
+
+  const selectTab = useCallback((next: SettingsTabId): void => {
+    setTabHistory((prev) => {
+      const current = prev.stack[prev.index]
+      if (current === next) return prev
+      const nextStack = [...prev.stack.slice(0, prev.index + 1), next]
+      return { stack: nextStack, index: nextStack.length - 1 }
+    })
+  }, [])
+
+  const canGoBack = tabHistory.index > 0
+  const canGoForward = tabHistory.index < tabHistory.stack.length - 1
+
+  const goBackTab = (): void => {
+    setTabHistory((prev) =>
+      prev.index > 0 ? { ...prev, index: prev.index - 1 } : prev
+    )
+  }
+
+  const goForwardTab = (): void => {
+    setTabHistory((prev) =>
+      prev.index < prev.stack.length - 1 ? { ...prev, index: prev.index + 1 } : prev
+    )
+  }
+
   const [selectedProviderId, setSelectedProviderId] = useState(settings.activeProviderId)
   const [showKey, setShowKey] = useState(false)
   const [customModelInput, setCustomModelInput] = useState('')
@@ -154,7 +185,7 @@ export const SettingsModal: React.FC<Props> = ({
   const [importJsonText, setImportJsonText] = useState('')
 
   useEffect(() => {
-    setTab(initialTab)
+    setTabHistory({ stack: [initialTab], index: 0 })
   }, [initialTab])
 
   useEffect(() => {
@@ -425,32 +456,103 @@ export const SettingsModal: React.FC<Props> = ({
     }
   }
 
+  const tabMeta: Record<
+    SettingsTabId,
+    { title: string; description: string }
+  > = {
+    account: {
+      title: tr(lang, 'Arko Account', 'Arko 账号'),
+      description: tr(
+        lang,
+        'Manage your Arko Cloud sign-in, sync built-in flagship AI models, and view or redeem cloud credits.',
+        '管理你的 Arko 邮箱账号登录状态、云端可用额度，并自动激活内置旗舰大模型。'
+      )
+    },
+    ai: {
+      title: tr(lang, 'AI & Models', 'AI 与模型渠道'),
+      description: tr(
+        lang,
+        'Choose between built-in Arko Cloud routing or bring your own OpenAI, Anthropic, Gemini, or local Ollama endpoints.',
+        '自由切换官方内置 Arko 云端引擎，或接入你自己的 OpenAI、Anthropic、Gemini 与本地 Ollama 模型接口。'
+      )
+    },
+    tools: {
+      title: tr(lang, 'Connected Tools', '已连接工具'),
+      description: tr(
+        lang,
+        'Connect logged-in web apps directly from your browser session so Arko can reference context with zero OAuth setup.',
+        '直接复用当前浏览器的已登录网页会话，无需繁琐配置即可让 AI 结合工具上下文工作。'
+      )
+    },
+    memory: {
+      title: tr(lang, 'Personal Memory', '个人记忆库'),
+      description: tr(
+        lang,
+        'Personalize how Arko thinks and writes across sidebar chats, Chat Tabs, and ⌘J Inline Write.',
+        '记录你的背景偏好、常用技术栈与表达习惯，让 Arko 在问答与帮写时更懂你的语境。'
+      )
+    },
+    skills: {
+      title: tr(lang, 'Slash /Skills', '快捷技能 (/Skills)'),
+      description: tr(
+        lang,
+        'Create reusable /command prompt workflows or trigger built-in zero-token local browser actions.',
+        '定制可复用的 /command 专属提示词工作流，或一键运行本地零 Token 网页导出引擎。'
+      )
+    },
+    general: {
+      title: tr(lang, 'Appearance & Privacy', '外观、语言与隐私'),
+      description: tr(
+        lang,
+        'Customize interface language, sidebar layout, selection floating actions, and sensitive-site privacy guards.',
+        '调整浏览器界面语言、标签栏布局形态、网页划词灵动条以及敏感站点隐私护栏。'
+      )
+    },
+    updates: {
+      title: tr(lang, 'Updates & License', '一键更新与许可'),
+      description: tr(
+        lang,
+        'Keep Arko up to date directly from official GitHub Releases and review open-source licensing terms.',
+        '通过官方 GitHub Releases 一键检查并升级客户端版本，查看项目开源许可说明。'
+      )
+    }
+  }
+
+  const navBtnCls = (active: boolean): string =>
+    `w-full flex items-center justify-between gap-2 px-3 py-2 rounded-[10px] text-[13.5px] font-medium tracking-[-0.01em] transition ${
+      active
+        ? 'bg-indigo-600 text-white shadow-2xs'
+        : isDark
+          ? 'hover:bg-white/[0.06] text-zinc-300'
+          : 'hover:bg-black/[0.05] text-zinc-700'
+    }`
+
   return (
     <div
       onClick={onClose}
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/32 backdrop-blur-sm p-4 ${
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/36 backdrop-blur-sm p-5 ${
         isClosing ? 'arc-backdrop-exit' : 'arc-backdrop-enter'
       }`}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className={`w-full max-w-[860px] h-[640px] rounded-[22px] border shadow-2xl flex overflow-hidden ${
+        className={`w-full max-w-[940px] h-[min(696px,calc(100vh-40px))] rounded-[18px] border shadow-2xl flex overflow-hidden ${
           isClosing ? 'arc-modal-exit' : 'arc-modal-enter'
         } ${
           isDark
-            ? 'bg-[#1D1D24] border-white/12 text-zinc-100'
-            : 'bg-white border-black/10 text-zinc-900'
+            ? 'bg-[#1D1D22] border-white/[0.11] text-zinc-100'
+            : 'bg-white border-black/[0.09] text-zinc-900'
         }`}
       >
-        {/* Left Navigation Rail */}
+        {/* Left Navigation Rail (Dia-inspired proportions & spacing) */}
         <div
-          className={`w-56 shrink-0 p-4 border-r flex flex-col gap-1.5 ${
-            isDark ? 'bg-[#17171C] border-white/8' : 'bg-zinc-50 border-black/6'
+          className={`w-[244px] shrink-0 px-3.5 py-4 border-r flex flex-col gap-1 ${
+            isDark ? 'bg-[#16161A] border-white/[0.07]' : 'bg-[#F6F6F8] border-black/[0.06]'
           }`}
         >
-          <div className="px-2 pb-3 pt-1 flex items-center justify-between gap-2">
-            <div className="font-semibold text-sm flex items-center gap-2">
-              <Sparkles size={16} className="text-indigo-500" />
+          <div className="px-2 pb-3.5 pt-0.5 flex items-center justify-between gap-2">
+            <div className="font-semibold text-[14px] tracking-[-0.01em] flex items-center gap-2 whitespace-nowrap shrink-0">
+              <Sparkles size={15} className="text-indigo-500 shrink-0" />
               <span>{tr(lang, 'Arko Settings', 'Arko 设置')}</span>
             </div>
 
@@ -460,34 +562,38 @@ export const SettingsModal: React.FC<Props> = ({
                 void onUpdateSettings({ language: lang === 'zh-CN' ? 'en' : 'zh-CN' })
               }
               title={tr(lang, 'Switch UI Language', '切换界面语言')}
-              className={`px-2 py-0.5 rounded-full text-[10.5px] font-medium inline-flex items-center gap-1 border transition ${
+              className={`h-6 px-2.5 rounded-full text-[11px] font-medium inline-flex items-center gap-1 border shrink-0 whitespace-nowrap transition ${
                 isDark
-                  ? 'border-white/12 bg-white/5 hover:bg-white/12 text-zinc-300'
-                  : 'border-black/10 bg-white hover:bg-zinc-100 text-zinc-700'
+                  ? 'border-white/12 bg-white/[0.05] hover:bg-white/[0.11] text-zinc-300'
+                  : 'border-black/10 bg-white hover:bg-zinc-100 text-zinc-700 shadow-2xs'
               }`}
             >
-              <Globe size={10} />
+              <Globe size={11} className="shrink-0 opacity-80" />
               <span>{lang === 'zh-CN' ? 'EN' : '中文'}</span>
             </button>
           </div>
 
           <button
-            onClick={() => setTab('account')}
-            className={`flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'account'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('account')}
+            className={navBtnCls(tab === 'account')}
           >
             <span className="flex items-center gap-2.5 min-w-0">
               {accountState?.authenticated ? (
-                <UserCheck size={14} className={tab === 'account' ? 'text-white' : 'text-emerald-500'} />
+                <UserCheck
+                  size={16}
+                  strokeWidth={1.85}
+                  className={`shrink-0 ${tab === 'account' ? 'text-white' : 'text-emerald-500'}`}
+                />
               ) : (
-                <UserRound size={14} />
+                <UserRound
+                  size={16}
+                  strokeWidth={1.85}
+                  className={`shrink-0 ${tab === 'account' ? 'opacity-100' : 'opacity-75'}`}
+                />
               )}
-              <span className="truncate">{tr(lang, 'Arko Account', 'Arko 账号')}</span>
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Arko Account', 'Arko 账号')}
+              </span>
             </span>
             {accountState?.authenticated ? (
               <span
@@ -497,8 +603,8 @@ export const SettingsModal: React.FC<Props> = ({
               />
             ) : (
               <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] shrink-0 ${
-                  tab === 'account' ? 'bg-white/20 text-white' : 'bg-indigo-500/15 text-indigo-500'
+                className={`px-2 py-0.5 rounded-full text-[10.5px] font-medium shrink-0 whitespace-nowrap ${
+                  tab === 'account' ? 'bg-white/20 text-white' : 'bg-indigo-500/14 text-indigo-500'
                 }`}
               >
                 {tr(lang, 'Sign In', '登录')}
@@ -507,37 +613,39 @@ export const SettingsModal: React.FC<Props> = ({
           </button>
 
           <button
-            onClick={() => setTab('ai')}
-            className={`flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'ai'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('ai')}
+            className={navBtnCls(tab === 'ai')}
           >
-            <Zap size={14} />
-            <span>{tr(lang, 'AI & Models', 'AI 与模型渠道')}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Zap
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'ai' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'AI & Models', 'AI 与模型渠道')}
+              </span>
+            </span>
           </button>
 
           <button
-            onClick={() => setTab('tools')}
-            className={`flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'tools'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('tools')}
+            className={navBtnCls(tab === 'tools')}
           >
-            <span className="flex items-center gap-2.5">
-              <Plug size={14} />
-              <span>{tr(lang, 'Connected Tools', '已连接工具')}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Plug
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'tools' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Connected Tools', '已连接工具')}
+              </span>
             </span>
             {connectedTools.some((t) => t.status !== 'disconnected') && (
               <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] ${
-                  tab === 'tools' ? 'bg-white/20 text-white' : 'bg-indigo-500/15 text-indigo-500'
+                className={`px-1.5 py-0.5 rounded-full text-[10.5px] shrink-0 whitespace-nowrap ${
+                  tab === 'tools' ? 'bg-white/20 text-white' : 'bg-indigo-500/14 text-indigo-500'
                 }`}
               >
                 {connectedTools.filter((t) => t.status !== 'disconnected').length}
@@ -546,23 +654,23 @@ export const SettingsModal: React.FC<Props> = ({
           </button>
 
           <button
-            onClick={() => setTab('memory')}
-            className={`flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'memory'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('memory')}
+            className={navBtnCls(tab === 'memory')}
           >
-            <span className="flex items-center gap-2.5">
-              <Brain size={14} />
-              <span>{tr(lang, 'Personal Memory', '个人记忆库')}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Brain
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'memory' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Personal Memory', '个人记忆库')}
+              </span>
             </span>
             {memories.length > 0 && (
               <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] ${
-                  tab === 'memory' ? 'bg-white/20 text-white' : 'bg-indigo-500/15 text-indigo-500'
+                className={`px-1.5 py-0.5 rounded-full text-[10.5px] shrink-0 whitespace-nowrap ${
+                  tab === 'memory' ? 'bg-white/20 text-white' : 'bg-indigo-500/14 text-indigo-500'
                 }`}
               >
                 {memories.filter((m) => m.enabled).length}
@@ -571,23 +679,23 @@ export const SettingsModal: React.FC<Props> = ({
           </button>
 
           <button
-            onClick={() => setTab('skills')}
-            className={`flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'skills'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('skills')}
+            className={navBtnCls(tab === 'skills')}
           >
-            <span className="flex items-center gap-2.5">
-              <Wand2 size={14} />
-              <span>{tr(lang, 'Slash /Skills', '快捷技能 (/Skills)')}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Wand2
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'skills' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Slash /Skills', '快捷技能 (/Skills)')}
+              </span>
             </span>
             {customSkills.length > 0 && (
               <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] ${
-                  tab === 'skills' ? 'bg-white/20 text-white' : 'bg-indigo-500/15 text-indigo-500'
+                className={`px-1.5 py-0.5 rounded-full text-[10.5px] shrink-0 whitespace-nowrap ${
+                  tab === 'skills' ? 'bg-white/20 text-white' : 'bg-indigo-500/14 text-indigo-500'
                 }`}
               >
                 {customSkills.length}
@@ -596,36 +704,38 @@ export const SettingsModal: React.FC<Props> = ({
           </button>
 
           <button
-            onClick={() => setTab('general')}
-            className={`flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'general'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('general')}
+            className={navBtnCls(tab === 'general')}
           >
-            <Sliders size={14} />
-            <span>{tr(lang, 'Appearance & Privacy', '外观、语言与隐私')}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Sliders
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'general' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Appearance & Privacy', '外观、语言与隐私')}
+              </span>
+            </span>
           </button>
 
           <button
-            onClick={() => setTab('updates')}
-            className={`flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition ${
-              tab === 'updates'
-                ? 'bg-indigo-600 text-white'
-                : isDark
-                  ? 'hover:bg-white/6 text-zinc-300'
-                  : 'hover:bg-black/5 text-zinc-700'
-            }`}
+            onClick={() => selectTab('updates')}
+            className={navBtnCls(tab === 'updates')}
           >
-            <span className="flex items-center gap-2.5">
-              <ArrowDownCircle size={14} />
-              <span>{tr(lang, 'Updates & License', '一键更新与许可')}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <ArrowDownCircle
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'updates' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Updates & License', '一键更新与许可')}
+              </span>
             </span>
             {hasUpdateHighlight && (
               <span
-                className={`px-1.5 py-0.2 rounded-full text-[10px] font-semibold ${
+                className={`px-1.5 py-0.5 rounded-full text-[10.5px] font-semibold shrink-0 whitespace-nowrap ${
                   tab === 'updates'
                     ? 'bg-white/20 text-white'
                     : 'bg-emerald-500/20 text-emerald-500'
@@ -636,67 +746,59 @@ export const SettingsModal: React.FC<Props> = ({
             )}
           </button>
 
-          <div className="mt-auto pt-3 text-[10.5px] opacity-45 px-2 leading-relaxed space-y-0.5">
-            <div>{tr(lang, '⌘E Sidebar · ⌘L Command Bar', '⌘E 开关侧栏 · ⌘L 智能栏')}</div>
-            <div>{tr(lang, '⇧⌘R Reader · ⇧⌘T Reopen Tab', '⇧⌘R 阅读视图 · ⇧⌘T 恢复标签')}</div>
-            <div>{tr(lang, '⌘⇧\\ Split View · ⇧⌘S Focus', '⌘⇧\\ 左右分屏 · ⇧⌘S 极简沉浸')}</div>
-            <div>{tr(lang, '⌘J Inline Write & Form Fill', '⌘J 网页输入框帮写')}</div>
+          <div className="mt-auto pt-3 text-[11px] opacity-40 px-2 leading-[1.65] space-y-0.5 select-none">
+            <div className="truncate">{tr(lang, '⌘E Sidebar · ⌘L Command Bar', '⌘E 开关侧栏 · ⌘L 智能栏')}</div>
+            <div className="truncate">{tr(lang, '⇧⌘R Reader · ⇧⌘T Reopen Tab', '⇧⌘R 阅读视图 · ⇧⌘T 恢复标签')}</div>
+            <div className="truncate">{tr(lang, '⌘⇧\\ Split View · ⇧⌘S Focus', '⌘⇧\\ 左右分屏 · ⇧⌘S 极简沉浸')}</div>
+            <div className="truncate">{tr(lang, '⌘J Inline Write & Form Fill', '⌘J 网页输入框帮写')}</div>
           </div>
         </div>
 
         {/* Main Content Area */}
         <div className="flex-1 flex flex-col min-w-0">
+          {/* Dia-style Top Header Bar with Back/Forward Capsule & Concise Section Title */}
           <div
-            className={`h-13 px-6 border-b flex items-center justify-between ${
-              isDark ? 'border-white/8' : 'border-black/6'
+            className={`h-[56px] px-7 border-b flex items-center justify-between gap-4 shrink-0 ${
+              isDark ? 'border-white/[0.07]' : 'border-black/[0.06]'
             }`}
           >
-            <h2 className="font-semibold text-sm">
-              {tab === 'account'
-                ? tr(
-                    lang,
-                    'Arko Account — Email Sign-In, Cloud Credits & Built-in AI',
-                    'Arko 账号中心 — 邮箱注册登录、云端额度与内置 AI 管理'
-                  )
-                : tab === 'ai'
-                  ? tr(
-                      lang,
-                      'AI Model Providers (Arko Cloud · OpenAI / Anthropic / Gemini / Ollama)',
-                      'AI 模型渠道配置（内置 Arko 云端引擎 & 可选自定义 BYOK / 本地模型）'
-                    )
-                  : tab === 'tools'
-                  ? tr(
-                      lang,
-                      'Connect your Tools — Browser Session Context, Zero Setup Time',
-                      '连接常用工具 — 复用浏览器已登录会话，零配置即刻就绪'
-                    )
-                : tab === 'memory'
-                  ? tr(
-                      lang,
-                      'Arko Personal Memory (Context & Tone Personalization)',
-                      'Arko 长期个人记忆库（让浏览器越用越懂你的工作流与口吻）'
-                    )
-                  : tab === 'skills'
-                    ? tr(
-                        lang,
-                        'Custom Slash /Skills Builder & Zero-Token Local Skills',
-                        '自定义 /Skills 技能编辑器 & 本地零模型导出技能'
-                      )
-                    : tab === 'general'
-                      ? tr(
-                          lang,
-                          'Language, Arc Sidebar Layout, Selection Bar & Privacy Guard',
-                          '界面语言、布局模式、划词灵动条与隐私护栏'
-                        )
-                      : tr(
-                          lang,
-                          'One-Click Updates, GitHub Organization & Non-Commercial License',
-                          '一键更新、GitHub 开源仓库与非商用许可证'
-                        )}
-            </h2>
+            <div className="flex items-center gap-3 min-w-0">
+              <div
+                className={`h-[30px] px-1 rounded-full border inline-flex items-center shrink-0 ${
+                  isDark
+                    ? 'bg-white/[0.04] border-white/[0.09]'
+                    : 'bg-zinc-100/80 border-black/[0.07]'
+                }`}
+              >
+                <button
+                  type="button"
+                  disabled={!canGoBack}
+                  onClick={goBackTab}
+                  title={tr(lang, 'Previous section', '返回上一设置页')}
+                  className="w-7 h-6 rounded-full flex items-center justify-center transition enabled:hover:bg-black/[0.06] dark:enabled:hover:bg-white/[0.08] disabled:opacity-25"
+                >
+                  <ChevronLeft size={15} />
+                </button>
+                <button
+                  type="button"
+                  disabled={!canGoForward}
+                  onClick={goForwardTab}
+                  title={tr(lang, 'Next section', '前进至下一设置页')}
+                  className="w-7 h-6 rounded-full flex items-center justify-center transition enabled:hover:bg-black/[0.06] dark:enabled:hover:bg-white/[0.08] disabled:opacity-25"
+                >
+                  <ChevronRight size={15} />
+                </button>
+              </div>
+
+              <h2 className="font-semibold text-[15.5px] tracking-[-0.015em] truncate">
+                {tabMeta[tab].title}
+              </h2>
+            </div>
+
             <button
               onClick={onClose}
-              className="p-1.5 rounded-lg opacity-60 hover:opacity-100 transition"
+              title={tr(lang, 'Close (Esc)', '关闭设置 (Esc)')}
+              className="w-7 h-7 rounded-lg flex items-center justify-center opacity-55 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.08] transition shrink-0"
             >
               <X size={16} />
             </button>
@@ -709,10 +811,13 @@ export const SettingsModal: React.FC<Props> = ({
               settings={settings}
               accountState={accountState}
               onUpdateSettings={onUpdateSettings}
-              onJumpToModels={() => setTab('ai')}
+              onJumpToModels={() => selectTab('ai')}
             />
           ) : tab === 'tools' ? (
-            <div className="flex-1 overflow-y-auto p-6 text-xs">
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-4 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60">
+                {tabMeta.tools.description}
+              </p>
               <ConnectToolsListPanel
                 isDark={isDark}
                 lang={lang}
@@ -732,8 +837,11 @@ export const SettingsModal: React.FC<Props> = ({
               />
             </div>
           ) : tab === 'ai' ? (
-            <div className="flex-1 overflow-y-auto p-6 space-y-5 text-xs">
-              <div className="space-y-2">
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-5 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60 -mb-1">
+                {tabMeta.ai.description}
+              </p>
+              <div className="space-y-2.5">
                 <div className="flex items-center justify-between">
                   <label className="font-semibold opacity-75">
                     {tr(lang, 'Active AI Provider', '选择当前使用的模型渠道')}
@@ -829,8 +937,8 @@ export const SettingsModal: React.FC<Props> = ({
                     </div>
                     <button
                       type="button"
-                      onClick={() => setTab('account')}
-                      className="h-8 px-3 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-500 transition shrink-0"
+                      onClick={() => selectTab('account')}
+                      className="h-8.5 px-3.5 rounded-[10px] bg-indigo-600 text-white font-medium hover:bg-indigo-500 transition shrink-0"
                     >
                       {accountState?.authenticated
                         ? tr(lang, 'Manage Account', '管理账号与额度')
@@ -1091,7 +1199,10 @@ export const SettingsModal: React.FC<Props> = ({
               </div>
             </div>
           ) : tab === 'memory' ? (
-            <div className="flex-1 overflow-y-auto p-6 space-y-5 text-xs">
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-5 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60 -mb-1">
+                {tabMeta.memory.description}
+              </p>
               <div
                 className={`p-3.5 rounded-2xl border flex items-center justify-between gap-4 ${
                   isDark ? 'bg-white/[0.03] border-white/8' : 'bg-zinc-50 border-black/7'
@@ -1241,7 +1352,10 @@ export const SettingsModal: React.FC<Props> = ({
               </div>
             </div>
           ) : tab === 'skills' ? (
-            <div className="flex-1 overflow-y-auto p-6 space-y-5 text-xs">
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-5 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60 -mb-1">
+                {tabMeta.skills.description}
+              </p>
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="font-semibold opacity-75">
@@ -1647,7 +1761,10 @@ export const SettingsModal: React.FC<Props> = ({
               </div>
             </div>
           ) : tab === 'general' ? (
-            <div className="flex-1 overflow-y-auto p-6 space-y-4 text-xs">
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-4 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60 -mb-0.5">
+                {tabMeta.general.description}
+              </p>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
                   <label className="font-semibold opacity-75">
@@ -1831,7 +1948,10 @@ export const SettingsModal: React.FC<Props> = ({
             </div>
           ) : (
             /* ==================== Tab 5: One-Click Updates & License ==================== */
-            <div className="flex-1 overflow-y-auto p-6 space-y-5 text-xs">
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-5 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60 -mb-1">
+                {tabMeta.updates.description}
+              </p>
               {/* Brand & Version Hero Card */}
               <div
                 className={`p-5 rounded-2xl border flex items-center justify-between gap-4 ${
