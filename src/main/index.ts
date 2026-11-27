@@ -67,7 +67,7 @@ function createMainWindow(
     ...(isMac
       ? {
           titleBarStyle: 'hiddenInset' as const,
-          trafficLightPosition: { x: 14, y: 12 },
+          trafficLightPosition: { x: 16, y: 15 },
           vibrancy: 'under-window' as const,
           visualEffectState: 'active' as const
         }
@@ -76,10 +76,10 @@ function createMainWindow(
           titleBarOverlay: {
             color: isInitDark ? '#19191B' : '#F4F4F5',
             symbolColor: isInitDark ? '#E4E4E7' : '#27272A',
-            height: 38
+            height: 42
           }
         }),
-    backgroundColor: isInitDark ? '#19191B' : '#F4F4F5',
+    backgroundColor: isMac ? '#00000000' : isInitDark ? '#19191B' : '#F4F4F5',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -140,6 +140,13 @@ function createMainWindow(
   } else {
     void win.loadFile(join(__dirname, '../renderer/index.html'))
   }
+
+  win.on('closed', () => {
+    if (mainWindow === win) {
+      mainWindow = null
+      browserManager = null
+    }
+  })
 
   return win
 }
@@ -478,6 +485,10 @@ function registerIpcHandlers(
     return browserManager!.completeOnboarding()
   })
 
+  ipcMain.handle('arko:reset-onboarding-state', () => {
+    return browserManager!.resetOnboardingState()
+  })
+
   // Connected Tools IPC
   ipcMain.handle('arko:get-connected-tools', async () => {
     return (await browserManager?.getConnectedTools()) ?? []
@@ -654,6 +665,17 @@ function registerIpcHandlers(
     'arko:create-tab-group',
     (_e, title: string, color: TabGroupColor, tabIds?: string[]) => {
       return browserManager!.createTabGroup(title, color, tabIds)
+    }
+  )
+
+  ipcMain.handle(
+    'arko:update-tab-group',
+    (
+      _e,
+      groupId: string,
+      partial: Partial<{ title: string; color: TabGroupColor; collapsed: boolean }>
+    ) => {
+      return browserManager?.updateTabGroup(groupId, partial) ?? null
     }
   )
 
@@ -848,6 +870,32 @@ function registerIpcHandlers(
 
   ipcMain.handle('arko:redeem-account-code', async (_e, code: string) => {
     return await accountService.redeemCode(code)
+  })
+
+  // 计算在线充值金额对应的实付金额与预计到账额度
+  ipcMain.handle('arko:quote-topup-amount', async (_e, amount: number) => {
+    return await accountService.quoteTopUpAmount(amount)
+  })
+
+  // 创建独立品牌中性标题的支付宝/微信原生扫码充值订单
+  ipcMain.handle(
+    'arko:create-topup-qr-order',
+    async (
+      _e,
+      params: { amount: number; paymentMethod: string; confirmedPayAmount: string }
+    ) => {
+      return await accountService.createTopUpQrOrder(params)
+    }
+  )
+
+  // 轮询扫码充值订单状态并在支付成功后自动刷新账户余额
+  ipcMain.handle('arko:check-topup-order-status', async (_e, tradeNo: string) => {
+    return await accountService.checkTopUpOrderStatus(tradeNo)
+  })
+
+  // 使用已充值的钱包余额在应用内直接购买并激活订阅套餐
+  ipcMain.handle('arko:purchase-subscription-balance', async (_e, planId: number) => {
+    return await accountService.purchaseSubscriptionWithBalance(planId)
   })
 
   ipcMain.handle(
@@ -1059,6 +1107,10 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = createMainWindow(store, aiService, updateManager!, accountService)
     }
+  })
+
+  app.on('before-quit', () => {
+    store.flushSync()
   })
 })
 

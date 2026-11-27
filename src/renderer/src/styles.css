@@ -311,14 +311,23 @@
   display: grid;
   grid-template-rows: 0fr;
   opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
   transition:
     grid-template-rows 220ms var(--arc-spring),
-    opacity 170ms ease;
+    opacity 160ms ease,
+    visibility 0s linear 220ms;
 }
 
 .arc-collapse-grid[data-open="true"] {
   grid-template-rows: 1fr;
   opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition:
+    grid-template-rows 220ms var(--arc-spring),
+    opacity 170ms ease,
+    visibility 0s linear 0s;
 }
 
 .arc-collapse-inner {
@@ -342,17 +351,81 @@
 
 .arc-fav-pressable {
   transition:
-    transform 160ms var(--arc-spring),
-    background-color 150ms ease,
+    transform 170ms var(--arc-spring),
+    background 160ms ease,
     box-shadow 170ms ease;
 }
 
 .arc-fav-pressable:hover {
-  transform: translateY(-0.5px);
+  transform: translateY(-1px);
 }
 
 .arc-fav-pressable:active {
-  transform: scale(0.94);
+  transform: scale(0.95);
+}
+
+/* Dia / macOS Tahoe Liquid Glass Favorites Card & Capsule Pill */
+.dia-liquid-card {
+  position: relative;
+  isolation: isolate;
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+.dia-liquid-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    165deg,
+    rgba(255, 255, 255, 0.95) 0%,
+    rgba(255, 255, 255, 0.34) 48%,
+    rgba(255, 255, 255, 0.72) 100%
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+
+.dark .dia-liquid-card::before {
+  background: linear-gradient(
+    165deg,
+    rgba(255, 255, 255, 0.26) 0%,
+    rgba(255, 255, 255, 0.05) 50%,
+    rgba(255, 255, 255, 0.14) 100%
+  );
+}
+
+.dia-liquid-card:not([data-active="true"]):hover {
+  background:
+    radial-gradient(125% 100% at 50% 0%, rgba(255, 255, 255, 0.88) 0%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.74) 0%, rgba(255, 255, 255, 0.42) 100%) !important;
+  box-shadow:
+    0 5px 14px -3px rgba(15, 23, 42, 0.08),
+    0 1px 3px rgba(15, 23, 42, 0.04),
+    0 0 0 0.5px rgba(15, 23, 42, 0.06),
+    inset 0 1px 0.5px #ffffff !important;
+}
+
+.dark .dia-liquid-card:not([data-active="true"]):hover {
+  background:
+    radial-gradient(125% 100% at 50% 0%, rgba(255, 255, 255, 0.20) 0%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0.06) 100%) !important;
+  box-shadow:
+    0 6px 16px -3px rgba(0, 0, 0, 0.38),
+    0 1px 3px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0.5px rgba(255, 255, 255, 0.24) !important;
+}
+
+.dia-liquid-pill {
+  backdrop-filter: blur(16px) saturate(170%);
+  -webkit-backdrop-filter: blur(16px) saturate(170%);
 }
 
 .dia-loading-bar {

@@ -235,32 +235,32 @@ export const DEFAULT_PROVIDERS: AIProviderConfig[] = [
 ]
 
 export const PROFILE_ACCENT_PRESETS: Array<{ hex: string; label: string; labelEn: string }> = [
-  { hex: '#4F46E5', label: 'Indigo 靛蓝', labelEn: 'Indigo' },
+  { hex: '#0284C7', label: 'Sky 晴空蓝', labelEn: 'Sky Blue' },
+  { hex: '#52525B', label: 'Graphite 曜石灰', labelEn: 'Graphite' },
+  { hex: '#6366F1', label: 'Indigo 靛蓝', labelEn: 'Indigo' },
   { hex: '#0D9488', label: 'Teal 青碧', labelEn: 'Teal' },
+  { hex: '#7C3AED', label: 'Violet 紫罗兰', labelEn: 'Violet' },
   { hex: '#E11D48', label: 'Rose 绯红', labelEn: 'Rose' },
   { hex: '#D97706', label: 'Amber 琥珀', labelEn: 'Amber' },
-  { hex: '#0284C7', label: 'Sky 晴空', labelEn: 'Sky' },
-  { hex: '#7C3AED', label: 'Violet 紫罗兰', labelEn: 'Violet' },
   { hex: '#059669', label: 'Emerald 翡翠', labelEn: 'Emerald' },
   { hex: '#EA580C', label: 'Coral 珊瑚橙', labelEn: 'Coral' },
-  { hex: '#DB2777', label: 'Magenta 洋红', labelEn: 'Magenta' },
   { hex: '#64748B', label: 'Slate 极简灰蓝', labelEn: 'Slate' }
 ]
 
 export const DEFAULT_PROFILES: BrowserProfile[] = [
   {
-    id: 'work',
-    name: 'Work',
-    emoji: '💼',
-    accentColor: '#4F46E5',
-    partition: 'persist:arko-profile-work'
-  },
-  {
     id: 'personal',
     name: 'Personal',
     emoji: '🌿',
-    accentColor: '#0D9488',
+    accentColor: '#0284C7',
     partition: 'persist:arko-profile-personal'
+  },
+  {
+    id: 'work',
+    name: 'Work',
+    emoji: '💼',
+    accentColor: '#52525B',
+    partition: 'persist:arko-profile-work'
   }
 ]
 

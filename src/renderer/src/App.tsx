@@ -67,6 +67,7 @@ import { InlineWriteOverlay } from './components/InlineWriteOverlay'
 import { FaviconIcon } from './components/FaviconIcon'
 import { ConnectToolsModal, ToolBrandIcon } from './components/ConnectToolsModal'
 import { SpaceEditorPopover, type SpacePopoverRequest } from './components/SpaceEditorPopover'
+import { OnboardingImportModal } from './components/OnboardingImportModal'
 
 /**
  * Keeps boolean-controlled overlays mounted briefly during their CSS exit animation
@@ -139,6 +140,7 @@ export const App: React.FC = () => {
   const [omniboxFocusSeq, setOmniboxFocusSeq] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [connectToolsOpen, setConnectToolsOpen] = useState(false)
+  const [importModalMode, setImportModalMode] = useState<'onboarding' | 'standalone' | null>(null)
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabId>('ai')
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [downloadsOpen, setDownloadsOpen] = useState(false)
@@ -162,6 +164,8 @@ export const App: React.FC = () => {
   const [spaceHudLeaving, setSpaceHudLeaving] = useState(false)
   const prevProfileIdRef = useRef<string | null>(null)
   const pendingSpaceDirRef = useRef<'left' | 'right' | null>(null)
+  const pillSwipeLockedRef = useRef<boolean>(false)
+  const pillSwipeResetTimerRef = useRef<number | null>(null)
   const spaceHudTimerRef = useRef<number | null>(null)
   const spaceHudOutTimerRef = useRef<number | null>(null)
 
@@ -207,11 +211,18 @@ export const App: React.FC = () => {
   const splitContainerRef = useRef<HTMLDivElement>(null)
   const leftViewportRef = useRef<HTMLDivElement>(null)
   const rightViewportRef = useRef<HTMLDivElement>(null)
+  const hasStateRef = useRef(false)
+  const splitEnabledRef = useRef(false)
+  const lastSentBoundsKeyRef = useRef('')
+
+  hasStateRef.current = Boolean(state)
+  splitEnabledRef.current = Boolean(state?.splitView.enabled)
 
   // Animated overlay presence hooks
   const omniboxAnim = useAnimatedBool(omniboxOpen, 130)
   const settingsAnim = useAnimatedBool(settingsOpen, 140)
   const connectToolsAnim = useAnimatedBool(connectToolsOpen, 140)
+  const importModalAnim = useAnimatedValue(importModalMode, 140)
   const libraryAnim = useAnimatedBool(libraryOpen, 140)
   const downloadsAnim = useAnimatedBool(downloadsOpen, 125)
   const readerAnim = useAnimatedValue(readerArticle, 140)
@@ -240,6 +251,9 @@ export const App: React.FC = () => {
     void window.arko.getInitialState().then((initial) => {
       if (!mounted) return
       setState(initial)
+      if (!initial.settings.onboardingCompleted) {
+        setImportModalMode('onboarding')
+      }
       if (initial.updateState) {
         setUpdateState(initial.updateState)
       }
@@ -335,6 +349,20 @@ export const App: React.FC = () => {
       unsubExtDrag()
       window.removeEventListener('drop', clearExtDrag)
       window.removeEventListener('dragend', clearExtDrag)
+      for (const timerRef of [
+        toastLeaveTimerRef,
+        toastClearTimerRef,
+        peekEnterTimerRef,
+        peekLeaveTimerRef,
+        spaceHudTimerRef,
+        spaceHudOutTimerRef,
+        pillSwipeResetTimerRef
+      ]) {
+        if (timerRef.current !== null) {
+          window.clearTimeout(timerRef.current)
+          timerRef.current = null
+        }
+      }
     }
   }, [])
 
@@ -377,6 +405,9 @@ export const App: React.FC = () => {
         setSettingsOpen(true)
       } else if (cmd === 'open-connect-tools') {
         setConnectToolsOpen(true)
+      } else if (cmd === 'open-import-data') {
+        setSettingsOpen(false)
+        setImportModalMode('standalone')
       } else if (cmd === 'open-skills-editor') {
         setSettingsInitialTab('skills')
         setSettingsOpen(true)
@@ -428,6 +459,7 @@ export const App: React.FC = () => {
     omniboxAnim.mounted ||
     settingsAnim.mounted ||
     connectToolsAnim.mounted ||
+    Boolean(importModalAnim.rendered) ||
     libraryAnim.mounted ||
     downloadsAnim.mounted ||
     Boolean(readerAnim.rendered) ||
@@ -468,44 +500,51 @@ export const App: React.FC = () => {
   }, [anyOverlayOpen])
 
   const syncBounds = useCallback(() => {
-    if (!state) return
-    if (state.splitView.enabled) {
+    if (!hasStateRef.current) return
+    if (splitEnabledRef.current) {
       const leftEl = leftViewportRef.current
       const rightEl = rightViewportRef.current
       if (!leftEl || !rightEl) return
       const lRect = leftEl.getBoundingClientRect()
       const rRect = rightEl.getBoundingClientRect()
+      const lx = Math.round(lRect.left)
+      const ly = Math.round(lRect.top)
+      const lw = Math.round(lRect.width)
+      const lh = Math.round(lRect.height)
+      const rx = Math.round(rRect.left)
+      const ry = Math.round(rRect.top)
+      const rw = Math.round(rRect.width)
+      const rh = Math.round(rRect.height)
+      const key = `split:${lx},${ly},${lw},${lh}|${rx},${ry},${rw},${rh}`
+      if (lastSentBoundsKeyRef.current === key) return
+      lastSentBoundsKeyRef.current = key
       void window.arko.updateViewportBounds({
-        primary: {
-          x: lRect.left,
-          y: lRect.top,
-          width: lRect.width,
-          height: lRect.height
-        },
-        secondary: {
-          x: rRect.left,
-          y: rRect.top,
-          width: rRect.width,
-          height: rRect.height
-        }
+        primary: { x: lx, y: ly, width: lw, height: lh },
+        secondary: { x: rx, y: ry, width: rw, height: rh }
       })
     } else {
       const el = singleViewportRef.current
       if (!el) return
       const rect = el.getBoundingClientRect()
+      const x = Math.round(rect.left)
+      const y = Math.round(rect.top)
+      const width = Math.round(rect.width)
+      const height = Math.round(rect.height)
+      const key = `single:${x},${y},${width},${height}`
+      if (lastSentBoundsKeyRef.current === key) return
+      lastSentBoundsKeyRef.current = key
       void window.arko.updateViewportBounds({
-        primary: {
-          x: rect.left,
-          y: rect.top,
-          width: rect.width,
-          height: rect.height
-        },
+        primary: { x, y, width, height },
         secondary: null
       })
     }
-  }, [state])
+  }, [])
+
+  const hasLoadedState = Boolean(state)
 
   useEffect(() => {
+    if (!hasLoadedState) return
+    lastSentBoundsKeyRef.current = ''
     syncBounds()
     const observer = new ResizeObserver(() => syncBounds())
     if (singleViewportRef.current) observer.observe(singleViewportRef.current)
@@ -516,6 +555,10 @@ export const App: React.FC = () => {
       observer.disconnect()
       window.removeEventListener('resize', syncBounds)
     }
+  }, [hasLoadedState, state?.splitView.enabled, syncBounds])
+
+  useEffect(() => {
+    syncBounds()
   }, [
     syncBounds,
     state?.settings.layoutMode,
@@ -524,7 +567,6 @@ export const App: React.FC = () => {
     state?.aiSidebarOpen,
     aiSidebarAnim.mounted,
     state?.activeTabId,
-    state?.splitView.enabled,
     state?.splitView.leftTabId,
     state?.splitView.rightTabId,
     state?.splitView.ratio,
@@ -534,7 +576,7 @@ export const App: React.FC = () => {
     findBarOpen
   ])
 
-  // High-frame-rate bounds tracking during sidebar collapse/expand & AI sidebar slide animations
+  // High-frame-rate bounds tracking ONLY during sidebar collapse/expand & AI sidebar slide animations
   useEffect(() => {
     let rafId = 0
     const start = performance.now()
@@ -967,13 +1009,15 @@ export const App: React.FC = () => {
   const handleDropExternalUrl = (
     url: string,
     zone: TabPinMode,
-    insertBeforeTabId?: string | null
+    insertBeforeTabId?: string | null,
+    groupId?: string | null
   ): void => {
     setExternalDragLink(null)
     void window.arko.createTab(url, {
       favorite: zone === 'favorite',
       pinned: zone === 'favorite' || zone === 'pinned',
-      insertBeforeTabId
+      insertBeforeTabId,
+      groupId
     })
     if (zone === 'favorite') {
       showToast(tr(lang, '📌 Pinned link to Top Favorites', '📌 已将链接固定到顶部常驻栏'))
@@ -1173,6 +1217,7 @@ export const App: React.FC = () => {
     isDark,
     lang,
     width: sidebarWidth,
+    isProfileMenuOpen: Boolean(spacePopoverReq),
     onResizeWidth: (w: number, commit?: boolean) => {
       setSidebarWidth(w)
       if (commit) {
@@ -1218,13 +1263,16 @@ export const App: React.FC = () => {
         anchor: { x: sidebarWidth + 6, y: 84, placement: 'right-top' }
       })
     },
-    onOpenSpacePopover: (req: SpacePopoverRequest) => setSpacePopoverReq(req),
+    onOpenSpacePopover: (req: SpacePopoverRequest) =>
+      setSpacePopoverReq((cur) =>
+        cur && cur.mode === 'menu' && req.mode === 'menu' ? null : req
+      ),
     onRenameProfileInline: (pid: string, nextName: string) => {
       void window.arko.updateProfile(pid, { name: nextName })
     },
     onSelectTab: (id: string) => {
       void window.arko.switchTab(id)
-      if (sidebarPeekOpen) setSidebarPeekOpen(false)
+      setSidebarPeekOpen(false)
     },
     onCloseTab: (id: string) => void window.arko.closeTab(id),
     onSetTabPinState: (id: string, mode: TabPinMode) => void window.arko.setTabPinState(id, mode),
@@ -1244,6 +1292,13 @@ export const App: React.FC = () => {
     onTabContextMenu: (tab: TabState, pos: { x: number; y: number }) =>
       setTabMenuState({ tab, pos }),
     onToggleGroupCollapsed: (gid: string) => void window.arko.toggleTabGroupCollapsed(gid),
+    onAssignTabToGroup: (tid: string, gid: string | null) =>
+      void window.arko.assignTabToGroup(tid, gid),
+    onUpdateTabGroup: (
+      gid: string,
+      partial: Partial<{ title: string; color: TabGroupColor; collapsed: boolean }>
+    ) => void window.arko.updateTabGroup(gid, partial),
+    onDeleteTabGroup: (gid: string) => void window.arko.deleteTabGroup(gid),
     onOrganizeTabs: () => void handleOrganizeTabs(),
     onNewTab: handleOpenOmniboxNewTab,
     onToggleSplitView: handleToggleSplitView,
@@ -1310,12 +1365,16 @@ export const App: React.FC = () => {
           onToggleCompactBar={() =>
             void handleUpdateSettings({ compactTopBar: !state.settings.compactTopBar })
           }
-          onOpenProfileMenu={(pos) =>
-            setSpacePopoverReq({
-              mode: 'edit',
-              profileId: activeProfile.id,
-              anchor: { x: pos.x, y: pos.y, placement: 'bottom-left' }
-            })
+          onOpenProfileMenu={(pos, mode = 'menu') =>
+            setSpacePopoverReq((cur) =>
+              cur
+                ? null
+                : {
+                    mode,
+                    profileId: activeProfile.id,
+                    anchor: { x: pos.x, y: pos.y, placement: 'bottom-left' }
+                  }
+            )
           }
           onCycleProfile={(dir) => {
             pendingSpaceDirRef.current = dir === 1 ? 'right' : 'left'
@@ -1412,7 +1471,7 @@ export const App: React.FC = () => {
                   window.clearTimeout(peekEnterTimerRef.current)
                 }
               }}
-              className="fixed left-0 top-10 bottom-3 w-[7px] z-30"
+              className="fixed left-0 top-[46px] bottom-3 w-[7px] z-30"
             />
 
             {peekSidebarAnim.mounted && (
@@ -1436,7 +1495,7 @@ export const App: React.FC = () => {
                   transition:
                     'transform 220ms cubic-bezier(0.16, 1, 0.3, 1), opacity 180ms ease'
                 }}
-                className="fixed left-2 top-10 bottom-2.5 z-40"
+                className="fixed left-2 top-[46px] bottom-2.5 z-40"
               >
                 <VerticalSidebar
                   {...sharedSidebarProps}
@@ -1464,16 +1523,84 @@ export const App: React.FC = () => {
           {/* Dia-Style Unified Top Bar in Vertical Mode */}
           {isVertical && (
             <div
-              className={`relative app-drag h-[40px] flex items-center justify-between gap-2.5 shrink-0 ${
+              className={`relative app-drag h-[46px] flex items-center justify-between gap-3 shrink-0 ${
                 state.platform === 'darwin' && isSidebarCollapsed
-                  ? 'pl-[76px] pr-2'
+                  ? 'pl-[86px] pr-2.5'
                   : state.platform !== 'darwin' && !state.aiSidebarOpen
                     ? 'pl-2 pr-[142px]'
-                    : 'pl-2 pr-2'
+                    : 'pl-1.5 pr-2.5'
               }`}
             >
-              {/* Left Navigation Cluster: [Sidebar Toggle] (Space Pill when collapsed) [<] [>] [↻] */}
-              <div className="app-no-drag flex items-center gap-0.5 shrink-0">
+              {/* Left Navigation Cluster: (Profile Pill when collapsed) [Sidebar Toggle] [<] [>] [↻] */}
+              <div className="app-no-drag flex items-center gap-1 shrink-0">
+                {isSidebarCollapsed && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      const rect = e.currentTarget.getBoundingClientRect()
+                      setSpacePopoverReq((cur) =>
+                        cur && cur.mode === 'menu'
+                          ? null
+                          : {
+                              mode: 'menu',
+                              profileId: activeProfile.id,
+                              anchor: {
+                                x: Math.max(8, rect.left - 2),
+                                y: rect.bottom + 5,
+                                placement: 'bottom-left'
+                              }
+                            }
+                      )
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      const rect = e.currentTarget.getBoundingClientRect()
+                      setSpacePopoverReq({
+                        mode: 'edit',
+                        profileId: activeProfile.id,
+                        anchor: {
+                          x: Math.max(8, rect.left - 2),
+                          y: rect.bottom + 5,
+                          placement: 'bottom-left'
+                        }
+                      })
+                    }}
+                    onWheel={(e) => {
+                      if (pillSwipeResetTimerRef.current !== null) {
+                        window.clearTimeout(pillSwipeResetTimerRef.current)
+                      }
+                      pillSwipeResetTimerRef.current = window.setTimeout(() => {
+                        pillSwipeLockedRef.current = false
+                      }, 180)
+                      if (
+                        !pillSwipeLockedRef.current &&
+                        Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.4 &&
+                        Math.abs(e.deltaX) > 16
+                      ) {
+                        pillSwipeLockedRef.current = true
+                        pendingSpaceDirRef.current = e.deltaX > 0 ? 'right' : 'left'
+                        void window.arko.cycleProfile(e.deltaX > 0 ? 1 : -1)
+                      }
+                    }}
+                    title={tr(
+                      lang,
+                      `${activeProfile.name} — Click to switch Profile · Right-click for Profile Settings`,
+                      `${activeProfile.name} — 点击切换个人资料 · 右键打开资料设置`
+                    )}
+                    className={`dia-liquid-pill arc-pressable mr-1 h-[25px] max-w-[104px] px-2.5 rounded-full flex items-center justify-center text-[12px] font-medium tracking-[-0.01em] leading-none truncate shrink-0 ${
+                      spacePopoverReq
+                        ? isDark
+                          ? 'bg-white/[0.16] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_1px_4px_rgba(0,0,0,0.25)]'
+                          : 'bg-white/88 text-zinc-950 shadow-[inset_0_1px_0_#fff,0_0_0_0.5px_rgba(15,23,42,0.08),0_2px_6px_rgba(15,23,42,0.06)]'
+                        : isDark
+                          ? 'bg-white/[0.075] text-zinc-100/90 shadow-[inset_0_1px_0_rgba(255,255,255,0.14)] hover:bg-white/[0.14] hover:text-white'
+                          : 'bg-white/55 text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.90),0_0_0_0.5px_rgba(15,23,42,0.055),0_1px_2px_rgba(15,23,42,0.03)] hover:bg-white/85 hover:text-zinc-950'
+                    }`}
+                  >
+                    <span className="truncate">{activeProfile.name}</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={() =>
@@ -1484,74 +1611,37 @@ export const App: React.FC = () => {
                       ? tr(lang, 'Show Sidebar (⇧⌘S)', '展开侧边栏 (⇧⌘S)')
                       : tr(lang, 'Hide Sidebar (⇧⌘S)', '收起侧边栏 (⇧⌘S)')
                   }
-                  className="arc-pressable p-1.5 rounded-lg opacity-60 hover:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-60 hover:opacity-100 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
                 >
-                  <PanelLeft size={14.5} />
+                  <PanelLeft size={15} />
                 </button>
-
-                {isSidebarCollapsed && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      const rect = e.currentTarget.getBoundingClientRect()
-                      setSpacePopoverReq({
-                        mode: 'edit',
-                        profileId: activeProfile.id,
-                        anchor: { x: rect.left, y: rect.bottom + 6, placement: 'bottom-left' }
-                      })
-                    }}
-                    onWheel={(e) => {
-                      if (Math.abs(e.deltaX) > Math.abs(e.deltaY) && Math.abs(e.deltaX) > 20) {
-                        pendingSpaceDirRef.current = e.deltaX > 0 ? 'right' : 'left'
-                        void window.arko.cycleProfile(e.deltaX > 0 ? 1 : -1)
-                      }
-                    }}
-                    title={tr(
-                      lang,
-                      `${activeProfile.name} — Click for Space theme & switcher`,
-                      `${activeProfile.name} — 点击切换空间或调整氛围色`
-                    )}
-                    style={{
-                      backgroundColor: activeSpaceTheme.spaceBadgeBg,
-                      borderColor: activeSpaceTheme.spaceBadgeBorder
-                    }}
-                    className="arc-pressable mx-0.5 px-2 py-0.5 rounded-full border flex items-center gap-1.5 text-[11.5px] font-semibold hover:brightness-105"
-                  >
-                    <span className="text-xs leading-none">{activeProfile.emoji}</span>
-                    <span className="max-w-[72px] truncate">{activeProfile.name}</span>
-                    <span
-                      style={{ backgroundColor: activeSpaceTheme.accentHex }}
-                      className="w-1.5 h-1.5 rounded-full shrink-0"
-                    />
-                  </button>
-                )}
 
                 <button
                   type="button"
                   onClick={() => void window.arko.goBack()}
                   disabled={!activeTab?.canGoBack}
                   title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
-                  className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
                 >
-                  <ChevronLeft size={15} />
+                  <ChevronLeft size={15.5} />
                 </button>
                 <button
                   type="button"
                   onClick={() => void window.arko.goForward()}
                   disabled={!activeTab?.canGoForward}
                   title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
-                  className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
                 >
-                  <ChevronRight size={15} />
+                  <ChevronRight size={15.5} />
                 </button>
                 <button
                   type="button"
                   onClick={() => void window.arko.reload()}
                   disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
                   title={tr(lang, 'Reload (⌘R)', '刷新页面 (⌘R)')}
-                  className="arc-pressable p-1.5 rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
                 >
-                  <RotateCw size={13} className={activeTab?.isLoading ? 'animate-spin' : ''} />
+                  <RotateCw size={13.5} className={activeTab?.isLoading ? 'animate-spin' : ''} />
                 </button>
               </div>
 
@@ -1559,12 +1649,12 @@ export const App: React.FC = () => {
               <div
                 data-arko-urlbar-anchor="true"
                 onClick={handleOpenOmniboxCurrentTab}
-                className={`app-no-drag arc-pressable group relative max-w-[600px] flex-1 mx-auto h-[29px] px-3 rounded-[10px] border flex items-center gap-2 text-[12.5px] cursor-text overflow-hidden transition-all ${
+                className={`app-no-drag dia-liquid-pill arc-pressable group relative max-w-[600px] flex-1 mx-auto h-[31px] px-3.5 rounded-[11px] border flex items-center gap-2 text-[12.5px] cursor-text overflow-hidden transition-all ${
                   omniboxAnim.mounted ? 'opacity-0 pointer-events-none' : ''
                 } ${
                   isDark
-                    ? 'bg-white/[0.055] hover:bg-white/[0.085] border-white/[0.07] hover:border-white/[0.13] text-zinc-200'
-                    : 'bg-black/[0.038] hover:bg-white/90 border-black/[0.06] hover:border-black/[0.12] text-zinc-800'
+                    ? 'bg-white/[0.06] hover:bg-white/[0.10] border-white/[0.08] hover:border-white/[0.15] shadow-[inset_0_1px_0_rgba(255,255,255,0.09)] text-zinc-200'
+                    : 'bg-white/58 hover:bg-white/88 border-black/[0.05] hover:border-black/[0.10] shadow-[inset_0_1px_0_rgba(255,255,255,0.92),0_1px_2px_rgba(15,23,42,0.03)] text-zinc-800'
                 }`}
               >
                 {activeTab?.isSensitive ? (
@@ -1699,7 +1789,11 @@ export const App: React.FC = () => {
                   onClick={() => handleOpenSettingsAt('account')}
                   title={
                     state.accountState?.authenticated && state.accountState.user
-                      ? `${state.accountState.user.email || state.accountState.user.username} · $${(state.accountState.user.remainingUsd ?? 0).toFixed(2)}`
+                      ? `${state.accountState.user.email || state.accountState.user.username} · ${
+                          state.accountState.user.effectiveUnlimited
+                            ? '∞'
+                            : `$${(state.accountState.user.remainingUsd ?? 0).toFixed(2)}`
+                        }`
                       : tr(lang, 'Arko Account (Sign in / Register)', 'Arko 账号（邮箱登录 / 注册）')
                   }
                   className={`arc-pressable relative p-1.5 rounded-lg ${
@@ -1718,14 +1812,14 @@ export const App: React.FC = () => {
                   type="button"
                   onClick={() => void window.arko.setAISidebarOpen(!state.aiSidebarOpen)}
                   title={tr(lang, 'Toggle Chat Sidebar (⌘E)', '切换右侧对话侧栏 (⌘E)')}
-                  className={`arc-pressable h-[27px] px-2.5 rounded-lg text-[12px] font-medium flex items-center gap-1.5 border transition ${
+                  className={`dia-liquid-pill arc-pressable h-[28px] px-2.5 rounded-[9px] text-[12px] font-medium flex items-center gap-1.5 border transition ${
                     state.aiSidebarOpen
                       ? isDark
                         ? 'bg-zinc-100 text-zinc-900 border-white/20'
                         : 'bg-zinc-900 text-white border-black/20'
                       : isDark
-                        ? 'bg-white/[0.06] hover:bg-white/[0.11] border-white/[0.08] text-zinc-200'
-                        : 'bg-white/85 hover:bg-white border-black/[0.08] text-zinc-800 shadow-2xs'
+                        ? 'bg-white/[0.07] hover:bg-white/[0.13] border-white/[0.09] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] text-zinc-200'
+                        : 'bg-white/65 hover:bg-white/92 border-black/[0.06] shadow-[inset_0_1px_0_#fff,0_1px_2px_rgba(15,23,42,0.035)] text-zinc-800'
                   }`}
                 >
                   <MessageSquare size={12} className="fill-current opacity-85" />
@@ -2137,9 +2231,11 @@ export const App: React.FC = () => {
               <AISidebar
                 isDark={isDark}
                 width={aiWidth}
-                onResizeWidth={(w) => {
+                onResizeWidth={(w, commit) => {
                   setAiWidth(w)
-                  void handleUpdateSettings({ aiSidebarWidth: w })
+                  if (commit) {
+                    void handleUpdateSettings({ aiSidebarWidth: w })
+                  }
                 }}
                 onResizeDragChange={setDraggingAiSash}
                 tabs={state.tabs}
@@ -2193,22 +2289,30 @@ export const App: React.FC = () => {
         )}
       </div>
 
-      {/* Arc Space Switch Floating HUD Pill (Spring In + Dissolve Out) */}
+      {/* Dia-Style Profile Switch Floating HUD Pill */}
       {spaceSwitchHud && hudSpaceTheme && !anyOverlayOpen && (
         <div
           key={spaceSwitchHud.seq}
           style={{
-            backgroundColor: hudSpaceTheme.hudBackground,
-            borderColor: hudSpaceTheme.hudBorderColor,
-            boxShadow: `0 14px 36px -6px rgba(0, 0, 0, ${isDark ? 0.58 : 0.18}), 0 0 0 1px rgba(${hudSpaceTheme.rgbString}, 0.16)`
+            backgroundColor: isDark ? 'rgba(34, 34, 39, 0.90)' : 'rgba(255, 255, 255, 0.92)',
+            borderColor: isDark ? 'rgba(255, 255, 255, 0.14)' : 'rgba(0, 0, 0, 0.10)',
+            boxShadow: `0 14px 36px -6px rgba(0, 0, 0, ${isDark ? 0.6 : 0.16})`
           }}
           className={`${
             spaceHudLeaving ? 'dia-space-hud-out' : 'dia-space-hud'
-          } fixed bottom-6 left-1/2 z-40 px-3.5 py-1.5 rounded-full border backdrop-blur-xl flex items-center gap-2 text-xs font-semibold pointer-events-none ${
+          } fixed bottom-6 left-1/2 z-40 px-3.5 py-1.5 rounded-full border backdrop-blur-xl flex items-center gap-2 text-xs font-medium pointer-events-none ${
             isDark ? 'text-zinc-100' : 'text-zinc-800'
           }`}
         >
-          <span className="text-sm leading-none">{spaceSwitchHud.profile.emoji}</span>
+          <span
+            style={{
+              backgroundColor: spaceSwitchHud.profile.accentColor || '#52525B',
+              boxShadow: isDark
+                ? 'inset 0 0 0 1px rgba(255, 255, 255, 0.28)'
+                : 'inset 0 0 0 1px rgba(0, 0, 0, 0.14)'
+            }}
+            className="w-2.5 h-2.5 rounded-full shrink-0"
+          />
           <span>{spaceSwitchHud.profile.name}</span>
           <div className="flex items-center gap-1.5 pl-1">
             {state.profiles.map((p) => {
@@ -2216,12 +2320,15 @@ export const App: React.FC = () => {
               return (
                 <span
                   key={p.id}
-                  className={`h-1.5 rounded-full transition-all duration-200 ${
-                    isCur ? 'w-4 opacity-100' : 'w-1.5 opacity-55'
+                  className={`rounded-full transition-all duration-200 ${
+                    isCur
+                      ? isDark
+                        ? 'w-[6px] h-[6px] bg-white'
+                        : 'w-[6px] h-[6px] bg-zinc-900'
+                      : isDark
+                        ? 'w-[5px] h-[5px] bg-white/30'
+                        : 'w-[5px] h-[5px] bg-black/25'
                   }`}
-                  style={{
-                    backgroundColor: p.accentColor || '#4F46E5'
-                  }}
                 />
               )
             })}
@@ -2241,9 +2348,10 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      {/* Arc-Style Floating Space Theme & Switcher Popover */}
+      {/* Dia-Style Floating Profile Menu & Settings Popover */}
       {spacePopoverAnim.rendered && (
         <SpaceEditorPopover
+          platform={state.platform}
           isDark={isDark}
           lang={lang}
           isClosing={spacePopoverAnim.isClosing}
@@ -2284,7 +2392,9 @@ export const App: React.FC = () => {
           lang={lang}
           isClosing={tabMenuAnim.isClosing}
           tab={tabMenuAnim.rendered.tab}
-          tabGroups={state.tabGroups}
+          tabGroups={state.allTabGroups.filter(
+            (g) => g.profileId === tabMenuAnim.rendered!.tab.profileId
+          )}
           position={tabMenuAnim.rendered.pos}
           onOpenInSplit={handleOpenTabInSplit}
           onSetTabPinState={(id, mode) => void window.arko.setTabPinState(id, mode)}
@@ -2458,6 +2568,16 @@ export const App: React.FC = () => {
           }}
           onNavigateInBrowser={(url) => void window.arko.createTab(url)}
           onTrySkill={handleTrySkillFromSettings}
+          onOpenBrowserImport={() => {
+            setSettingsOpen(false)
+            setImportModalMode('standalone')
+          }}
+          onResetOnboarding={async () => {
+            const snap = await window.arko.resetOnboardingState()
+            setState(snap)
+            setSettingsOpen(false)
+            setImportModalMode('onboarding')
+          }}
           onCheckUpdates={async () => {
             await window.arko.checkForUpdates(false)
           }}
@@ -2485,6 +2605,18 @@ export const App: React.FC = () => {
           onRemoveBookmark={(id) => void window.arko.removeBookmark(id)}
           onClearHistory={() => void window.arko.clearHistory()}
           onClose={() => setLibraryOpen(false)}
+        />
+      )}
+
+      {importModalAnim.rendered && (
+        <OnboardingImportModal
+          isDark={isDark}
+          isClosing={importModalAnim.isClosing}
+          mode={importModalAnim.rendered}
+          settings={state.settings}
+          onUpdateSettings={handleUpdateSettings}
+          onShowToast={showToast}
+          onClose={() => setImportModalMode(null)}
         />
       )}
     </div>

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
 import {
   AlertCircle,
@@ -59,7 +59,7 @@ export const ReasoningBlock: React.FC<{
   isDark: boolean
   lang?: AppLanguage
   isStreaming?: boolean
-}> = ({ reasoning, isDark, lang, isStreaming }) => {
+}> = React.memo(({ reasoning, isDark, lang, isStreaming }) => {
   const [expanded, setExpanded] = useState(false)
   if (!reasoning) return null
 
@@ -93,13 +93,13 @@ export const ReasoningBlock: React.FC<{
       )}
     </div>
   )
-}
+})
 
 export const ToolStepsBlock: React.FC<{
   steps: AgentToolStep[]
   isDark: boolean
   lang?: AppLanguage
-}> = ({ steps, isDark, lang }) => {
+}> = React.memo(({ steps, isDark, lang }) => {
   const hasRunning = steps.some((s) => s.status === 'running')
   const [manualExpanded, setManualExpanded] = useState<boolean | null>(null)
   const expanded = manualExpanded !== null ? manualExpanded : hasRunning
@@ -224,83 +224,106 @@ export const ToolStepsBlock: React.FC<{
       )}
     </div>
   )
-}
+})
 
 interface MarkdownProps {
   content: string
   lang?: AppLanguage
+  isStreaming?: boolean
   className?: string
   onOpenLink?: (url: string, openInSplit?: boolean) => void
   onClickCitation?: (titleQuery: string) => void
 }
 
-export const ChatMarkdown: React.FC<MarkdownProps> = ({
-  content,
-  lang,
-  className = '',
-  onOpenLink,
-  onClickCitation
-}) => {
-  const html = useMemo(() => {
-    if (!content) return ''
-    const parsed = marked.parse(content) as string
-    return enhanceArkoMarkdownHtml(parsed, lang)
-  }, [content, lang])
+export const ChatMarkdown: React.FC<MarkdownProps> = React.memo(
+  ({ content, lang, isStreaming = false, className = '', onOpenLink, onClickCitation }) => {
+    // Throttle full Markdown re-parsing on long actively-streaming responses to prevent O(N^2) jank
+    const [parsedSource, setParsedSource] = useState(content)
+    const lastParseAtRef = useRef(0)
 
-  const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>): void => {
-    const target = e.target as HTMLElement | null
-    if (!target) return
-
-    // 1) Handle Code Copy button
-    const copyBtn = target.closest('[data-dia-copy-code]') as HTMLButtonElement | null
-    if (copyBtn) {
-      e.preventDefault()
-      const wrap = copyBtn.closest('.dia-code-wrap')
-      const codeEl = wrap?.querySelector('pre code')
-      const rawCode = codeEl?.textContent || ''
-      if (rawCode) {
-        void navigator.clipboard.writeText(rawCode)
-        const prev = copyBtn.textContent
-        copyBtn.textContent = tr(lang, '✓ Copied', '✓ 已复制')
-        setTimeout(() => {
-          copyBtn.textContent = prev || tr(lang, 'Copy', '复制代码')
-        }, 1400)
+    useEffect(() => {
+      if (!isStreaming || content.length < 1800) {
+        setParsedSource(content)
+        lastParseAtRef.current = performance.now()
+        return
       }
-      return
-    }
-
-    // 2) Handle [@Citation] pill click
-    const citeBtn = target.closest('[data-dia-cite]') as HTMLButtonElement | null
-    if (citeBtn) {
-      e.preventDefault()
-      const citeTitle = citeBtn.getAttribute('data-dia-cite') || ''
-      if (citeTitle && onClickCitation) {
-        onClickCitation(citeTitle)
+      const elapsed = performance.now() - lastParseAtRef.current
+      const intervalMs = content.length > 6000 ? 75 : 42
+      if (elapsed >= intervalMs) {
+        setParsedSource(content)
+        lastParseAtRef.current = performance.now()
+        return
       }
-      return
-    }
+      const timer = window.setTimeout(() => {
+        setParsedSource(content)
+        lastParseAtRef.current = performance.now()
+      }, intervalMs - elapsed)
+      return () => window.clearTimeout(timer)
+    }, [content, isStreaming])
 
-    // 3) Intercept any <a> link so it opens inside Arko Browser tabs (or Split View with Alt/Shift)
-    const anchor = target.closest('a') as HTMLAnchorElement | null
-    if (anchor) {
-      const href = anchor.getAttribute('href') || ''
-      if (href && /^https?:\/\//i.test(href)) {
+    const effectiveContent = !isStreaming || content.length < 1800 ? content : parsedSource
+
+    const innerHtmlObj = useMemo(() => {
+      if (!effectiveContent) return { __html: '' }
+      const parsed = marked.parse(effectiveContent) as string
+      return { __html: enhanceArkoMarkdownHtml(parsed, lang) }
+    }, [effectiveContent, lang])
+
+    const handleContainerClick = (e: React.MouseEvent<HTMLDivElement>): void => {
+      const target = e.target as HTMLElement | null
+      if (!target) return
+
+      // 1) Handle Code Copy button
+      const copyBtn = target.closest('[data-dia-copy-code]') as HTMLButtonElement | null
+      if (copyBtn) {
         e.preventDefault()
-        e.stopPropagation()
-        if (onOpenLink) {
-          onOpenLink(href, e.altKey || e.shiftKey)
-        } else {
-          void window.arko.createTab(href)
+        const wrap = copyBtn.closest('.dia-code-wrap')
+        const codeEl = wrap?.querySelector('pre code')
+        const rawCode = codeEl?.textContent || ''
+        if (rawCode) {
+          void navigator.clipboard.writeText(rawCode)
+          const prev = copyBtn.textContent
+          copyBtn.textContent = tr(lang, '✓ Copied', '✓ 已复制')
+          setTimeout(() => {
+            copyBtn.textContent = prev || tr(lang, 'Copy', '复制代码')
+          }, 1400)
+        }
+        return
+      }
+
+      // 2) Handle [@Citation] pill click
+      const citeBtn = target.closest('[data-dia-cite]') as HTMLButtonElement | null
+      if (citeBtn) {
+        e.preventDefault()
+        const citeTitle = citeBtn.getAttribute('data-dia-cite') || ''
+        if (citeTitle && onClickCitation) {
+          onClickCitation(citeTitle)
+        }
+        return
+      }
+
+      // 3) Intercept any <a> link so it opens inside Arko Browser tabs (or Split View with Alt/Shift)
+      const anchor = target.closest('a') as HTMLAnchorElement | null
+      if (anchor) {
+        const href = anchor.getAttribute('href') || ''
+        if (href && /^https?:\/\//i.test(href)) {
+          e.preventDefault()
+          e.stopPropagation()
+          if (onOpenLink) {
+            onOpenLink(href, e.altKey || e.shiftKey)
+          } else {
+            void window.arko.createTab(href)
+          }
         }
       }
     }
-  }
 
-  return (
-    <div
-      onClick={handleContainerClick}
-      className={`dia-prose ${className}`}
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  )
-}
+    return (
+      <div
+        onClick={handleContainerClick}
+        className={`dia-prose ${className}`}
+        dangerouslySetInnerHTML={innerHtmlObj}
+      />
+    )
+  }
+)

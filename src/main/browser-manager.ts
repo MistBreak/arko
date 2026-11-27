@@ -17,8 +17,10 @@ import os from 'os'
 import path from 'path'
 import {
   ARKO_CLOUD_PROVIDER_ID,
+  DEFAULT_PROFILES,
   getAllSlashSkills,
   getChatThreadIdFromUrl,
+  GITHUB_REPO_URL,
   isChatTabUrl,
   isInternalDiaUrl,
   isSensitiveUrl,
@@ -104,6 +106,9 @@ import {
 } from './connected-tools'
 
 const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0]
+const MAX_LIVE_WEB_VIEWS = 12
+const IDLE_VIEW_HIBERNATE_MS = 25 * 60 * 1000
+const IDLE_VIEW_SWEEP_INTERVAL_MS = 2 * 60 * 1000
 
 function cleanChromeUserAgent(defaultUa: string): string {
   return defaultUa
@@ -199,6 +204,9 @@ function buildCalmErrorHtml(failedUrl: string, errorDesc: string, lang?: AppLang
 }
 
 export class BrowserManager {
+  private static activeInstance: BrowserManager | null = null
+  private static configuredPartitions = new Set<string>()
+
   private mainWindow: BrowserWindow
   public store: PersistenceStore
   public aiService: AIService
@@ -215,10 +223,16 @@ export class BrowserManager {
   private activeTabByProfile: Record<string, string> = {}
   private splitByProfile: Record<string, SplitViewState> = {}
   private views = new Map<string, WebContentsView>()
+  private appliedViewLayout = new Map<
+    string,
+    { x: number; y: number; width: number; height: number; visible: boolean }
+  >()
   private consoleLogsByTab = new Map<string, string[]>()
-  private initializedPartitions = new Set<string>()
   private connectedToolsByProfile: Record<string, ConnectedToolItem[]> = {}
   private cookieRefreshTimers = new Map<string, NodeJS.Timeout>()
+  private scheduledBroadcastTimer: NodeJS.Timeout | null = null
+  private viewEvictionTimer: NodeJS.Timeout | null = null
+  private onNativeThemeUpdated: () => void
   private webIpcRegistered = false
 
   private primaryBounds: ViewportBounds = { x: 0, y: 80, width: 1200, height: 720 }
@@ -238,17 +252,40 @@ export class BrowserManager {
     this.aiService = aiService
     this.getUpdateState = getUpdateState
     this.getAccountState = getAccountState
+    BrowserManager.activeInstance = this
 
     this.registerWebPreloadIpc()
     this.attachShortcutInterceptor(this.mainWindow.webContents)
     this.restoreTabsFromStore()
     void this.refreshConnectedTools(this.store.activeProfileId, true)
 
-    nativeTheme.on('updated', () => {
+    this.onNativeThemeUpdated = () => {
       this.syncAllViewsOverlayConfig()
-    })
+    }
+    nativeTheme.on('updated', this.onNativeThemeUpdated)
+
+    this.viewEvictionTimer = setInterval(() => {
+      this.evictIdleBackgroundViews()
+    }, IDLE_VIEW_SWEEP_INTERVAL_MS)
 
     this.mainWindow.on('closed', () => {
+      if (BrowserManager.activeInstance === this) {
+        BrowserManager.activeInstance = null
+      }
+      nativeTheme.removeListener('updated', this.onNativeThemeUpdated)
+      if (this.viewEvictionTimer) {
+        clearInterval(this.viewEvictionTimer)
+        this.viewEvictionTimer = null
+      }
+      if (this.scheduledBroadcastTimer) {
+        clearTimeout(this.scheduledBroadcastTimer)
+        this.scheduledBroadcastTimer = null
+      }
+      for (const timer of this.cookieRefreshTimers.values()) {
+        clearTimeout(timer)
+      }
+      this.cookieRefreshTimers.clear()
+
       for (const view of this.views.values()) {
         try {
           if (!view.webContents.isDestroyed()) {
@@ -259,7 +296,99 @@ export class BrowserManager {
         }
       }
       this.views.clear()
+      this.appliedViewLayout.clear()
+      this.consoleLogsByTab.clear()
     })
+  }
+
+  private destroyTabView(tabId: string): void {
+    this.appliedViewLayout.delete(tabId)
+    this.consoleLogsByTab.delete(tabId)
+    const view = this.views.get(tabId)
+    if (!view) return
+    this.views.delete(tabId)
+    try {
+      if (!this.mainWindow.isDestroyed()) {
+        this.mainWindow.contentView.removeChildView(view)
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (!view.webContents.isDestroyed()) {
+        view.webContents.close()
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private getProtectedLiveTabIds(extraProtectedId?: string): Set<string> {
+    const protectedIds = new Set<string>()
+    if (extraProtectedId) protectedIds.add(extraProtectedId)
+    const activeProfileId = this.store.activeProfileId
+    const activeId = this.activeTabByProfile[activeProfileId]
+    if (activeId) protectedIds.add(activeId)
+    const sp = this.getSplitView(activeProfileId)
+    if (sp.enabled) {
+      if (sp.leftTabId) protectedIds.add(sp.leftTabId)
+      if (sp.rightTabId) protectedIds.add(sp.rightTabId)
+    }
+    for (const t of this.tabs) {
+      if (t.isLoading || t.isAudioPlaying) {
+        protectedIds.add(t.id)
+      }
+    }
+    return protectedIds
+  }
+
+  private evictIdleBackgroundViews(extraProtectedId?: string): void {
+    if (this.views.size <= 4) return
+
+    // First clean up any orphan views whose tab no longer exists or moved to an internal URL
+    const validWebTabById = new Map<string, TabState>()
+    for (const t of this.tabs) {
+      if (!isInternalDiaUrl(t.url)) {
+        validWebTabById.set(t.id, t)
+      }
+    }
+    let evicted = false
+    for (const tabId of Array.from(this.views.keys())) {
+      if (!validWebTabById.has(tabId)) {
+        this.destroyTabView(tabId)
+        evicted = true
+      }
+    }
+
+    const protectedIds = this.getProtectedLiveTabIds(extraProtectedId)
+    const now = Date.now()
+    const candidates: TabState[] = []
+    for (const tabId of this.views.keys()) {
+      if (protectedIds.has(tabId)) continue
+      const tab = validWebTabById.get(tabId)
+      if (tab) candidates.push(tab)
+    }
+    candidates.sort((a, b) => (a.lastAccessedAt || 0) - (b.lastAccessedAt || 0))
+
+    // 1) Hibernate background views untouched for > 25 minutes when > 4 views are alive
+    while (candidates.length > 0 && this.views.size > 4) {
+      const oldest = candidates[0]
+      if (now - (oldest.lastAccessedAt || 0) < IDLE_VIEW_HIBERNATE_MS) break
+      candidates.shift()
+      this.destroyTabView(oldest.id)
+      evicted = true
+    }
+
+    // 2) Enforce hard ceiling on simultaneous live background Chromium renderers
+    while (candidates.length > 0 && this.views.size > MAX_LIVE_WEB_VIEWS) {
+      const oldest = candidates.shift()!
+      this.destroyTabView(oldest.id)
+      evicted = true
+    }
+
+    if (evicted) {
+      this.scheduleBroadcast(60)
+    }
   }
 
   private isEffectiveDark(): boolean {
@@ -523,6 +652,49 @@ export class BrowserManager {
     this.tabGroups = this.tabGroups.filter((g) => usedGroupIds.has(g.id))
   }
 
+  private clusterTierTabsByGroup(tierTabs: TabState[]): TabState[] {
+    const validGroupIds = new Set(this.tabGroups.map((g) => g.id))
+    const seenGroups = new Set<string>()
+    const result: TabState[] = []
+
+    for (const tab of tierTabs) {
+      const gid = tab.groupId && validGroupIds.has(tab.groupId) ? tab.groupId : null
+      if (!gid) {
+        if (tab.groupId) tab.groupId = null
+        result.push(tab)
+        continue
+      }
+      if (seenGroups.has(gid)) continue
+      seenGroups.add(gid)
+      for (const member of tierTabs) {
+        if (member.groupId === gid) {
+          result.push(member)
+        }
+      }
+    }
+    return result
+  }
+
+  private sortSingleProfileTabs(list: TabState[]): TabState[] {
+    const favorites = list.filter((t) => t.isFavorite)
+    const pinned = list.filter((t) => !t.isFavorite && t.isPinned)
+    const unpinned = list.filter((t) => !t.isFavorite && !t.isPinned)
+
+    // Ensure a single TabGroup never straddles both Pinned and Today zones
+    const pinnedGroupIds = new Set(pinned.map((t) => t.groupId).filter(Boolean) as string[])
+    for (const t of unpinned) {
+      if (t.groupId && pinnedGroupIds.has(t.groupId)) {
+        t.groupId = null
+      }
+    }
+
+    return [
+      ...favorites,
+      ...this.clusterTierTabsByGroup(pinned),
+      ...this.clusterTierTabsByGroup(unpinned)
+    ]
+  }
+
   private sortProfileTabsByTier(profileId?: string): void {
     if (!profileId) {
       const byProfile = new Map<string, TabState[]>()
@@ -533,26 +705,19 @@ export class BrowserManager {
       }
       const next: TabState[] = []
       for (const list of byProfile.values()) {
-        next.push(
-          ...list.filter((t) => t.isFavorite),
-          ...list.filter((t) => !t.isFavorite && t.isPinned),
-          ...list.filter((t) => !t.isFavorite && !t.isPinned)
-        )
+        next.push(...this.sortSingleProfileTabs(list))
       }
       this.tabs = next
       return
     }
     const profileTabs = this.tabs.filter((t) => t.profileId === profileId)
-    const sortedProfileTabs = [
-      ...profileTabs.filter((t) => t.isFavorite),
-      ...profileTabs.filter((t) => !t.isFavorite && t.isPinned),
-      ...profileTabs.filter((t) => !t.isFavorite && !t.isPinned)
-    ]
+    const sortedProfileTabs = this.sortSingleProfileTabs(profileTabs)
     let ptr = 0
     this.tabs = this.tabs.map((t) => (t.profileId === profileId ? sortedProfileTabs[ptr++] : t))
   }
 
   private applyPinModeToTab(tab: TabState, mode: TabPinMode): void {
+    const wasPinnedTier = Boolean(!tab.isFavorite && tab.isPinned)
     if (mode === 'favorite') {
       tab.isFavorite = true
       tab.isPinned = true
@@ -561,12 +726,18 @@ export class BrowserManager {
         tab.pinnedUrl = tab.url
       }
     } else if (mode === 'pinned') {
+      if (!wasPinnedTier) {
+        tab.groupId = null
+      }
       tab.isFavorite = false
       tab.isPinned = true
       if (!tab.pinnedUrl && tab.url && tab.url !== NEW_TAB_URL) {
         tab.pinnedUrl = tab.url
       }
     } else {
+      if (wasPinnedTier || tab.isFavorite) {
+        tab.groupId = null
+      }
       tab.isFavorite = false
       tab.isPinned = false
       tab.pinnedUrl = null
@@ -616,13 +787,17 @@ export class BrowserManager {
     for (const p of this.store.profiles) {
       splitByProfileCopy[p.id] = { ...this.getSplitView(p.id) }
     }
+    const decorateTab = (t: TabState): TabState => ({
+      ...t,
+      isLoaded: isInternalDiaUrl(t.url) || this.views.has(t.id)
+    })
     return {
       platform,
       profiles: this.store.profiles,
       activeProfileId,
-      tabs: this.tabs.filter((t) => t.profileId === activeProfileId),
+      tabs: this.tabs.filter((t) => t.profileId === activeProfileId).map(decorateTab),
       tabGroups: this.tabGroups.filter((g) => g.profileId === activeProfileId),
-      allTabs: this.tabs.map((t) => ({ ...t })),
+      allTabs: this.tabs.map(decorateTab),
       allTabGroups: this.tabGroups.map((g) => ({ ...g })),
       activeTabByProfile: { ...this.activeTabByProfile },
       splitByProfile: splitByProfileCopy,
@@ -757,9 +932,21 @@ export class BrowserManager {
   }
 
   public broadcastState(): void {
+    if (this.scheduledBroadcastTimer) {
+      clearTimeout(this.scheduledBroadcastTimer)
+      this.scheduledBroadcastTimer = null
+    }
     if (!this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send('arko:state-changed', this.getSnapshot())
     }
+  }
+
+  private scheduleBroadcast(delayMs = 24): void {
+    if (this.scheduledBroadcastTimer || this.mainWindow.isDestroyed()) return
+    this.scheduledBroadcastTimer = setTimeout(() => {
+      this.scheduledBroadcastTimer = null
+      this.broadcastState()
+    }, delayMs)
   }
 
   public emitShortcut(cmd: ShortcutCommand): void {
@@ -800,39 +987,45 @@ export class BrowserManager {
 
   private ensureSessionConfigured(partition: string): Electron.Session {
     const ses = session.fromPartition(partition)
-    if (!this.initializedPartitions.has(partition)) {
-      this.initializedPartitions.add(partition)
+    if (!BrowserManager.configuredPartitions.has(partition)) {
+      BrowserManager.configuredPartitions.add(partition)
       ses.setUserAgent(cleanChromeUserAgent(ses.getUserAgent()))
 
       // Live watch browser session cookies to auto-update "Connect your Tools" status
+      // Delegate through BrowserManager.activeInstance so persistent partitions never retain closed windows
       ses.cookies.on('changed', () => {
-        const prevTimer = this.cookieRefreshTimers.get(partition)
+        const mgr = BrowserManager.activeInstance
+        if (!mgr || mgr.mainWindow.isDestroyed()) return
+        const prevTimer = mgr.cookieRefreshTimers.get(partition)
         if (prevTimer) clearTimeout(prevTimer)
         const timer = setTimeout(() => {
-          this.cookieRefreshTimers.delete(partition)
-          const ownerProfile = this.store.profiles.find((p) => p.partition === partition)
+          mgr.cookieRefreshTimers.delete(partition)
+          if (BrowserManager.activeInstance !== mgr || mgr.mainWindow.isDestroyed()) return
+          const ownerProfile = mgr.store.profiles.find((p) => p.partition === partition)
           if (ownerProfile) {
-            void this.refreshConnectedTools(
+            void mgr.refreshConnectedTools(
               ownerProfile.id,
-              ownerProfile.id === this.store.activeProfileId
+              ownerProfile.id === mgr.store.activeProfileId
             )
           }
         }, 650)
-        this.cookieRefreshTimers.set(partition, timer)
+        mgr.cookieRefreshTimers.set(partition, timer)
       })
 
       // Capture HTTP 4xx/5xx network errors for the Browser-Native Coding Agent
       ses.webRequest.onCompleted((details) => {
+        const mgr = BrowserManager.activeInstance
+        if (!mgr || mgr.mainWindow.isDestroyed()) return
         if (details.statusCode >= 400 && details.webContentsId) {
-          for (const [tabId, v] of this.views.entries()) {
+          for (const [tabId, v] of mgr.views.entries()) {
             if (!v.webContents.isDestroyed() && v.webContents.id === details.webContentsId) {
               if (['mainFrame', 'xhr', ' subFrame'].includes(details.resourceType) || details.resourceType === 'xhr') {
-                this.appendTabDiagnostic(
+                mgr.appendTabDiagnostic(
                   tabId,
                   `[HTTP ${details.statusCode}] ${details.method} ${details.url.slice(0, 140)}`
                 )
               } else if (details.statusCode >= 500) {
-                this.appendTabDiagnostic(
+                mgr.appendTabDiagnostic(
                   tabId,
                   `[HTTP ${details.statusCode}] ${details.method} ${details.url.slice(0, 140)}`
                 )
@@ -845,6 +1038,8 @@ export class BrowserManager {
 
       // Native Downloads tracking with sleek live progress updates
       ses.on('will-download', (_event, item) => {
+        const mgr = BrowserManager.activeInstance
+        if (!mgr || mgr.mainWindow.isDestroyed()) return
         const dlId = `dl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
         const fileName = item.getFilename() || 'download'
         const defaultPath = path.join(app.getPath('downloads'), fileName)
@@ -871,9 +1066,9 @@ export class BrowserManager {
           state: 'progressing',
           startedAt: Date.now()
         }
-        this.downloads.unshift(record)
-        if (this.downloads.length > 30) this.downloads.length = 30
-        this.broadcastState()
+        mgr.downloads.unshift(record)
+        if (mgr.downloads.length > 30) mgr.downloads.length = 30
+        mgr.broadcastState()
 
         let lastBroadcast = 0
         item.on('updated', (_e, state) => {
@@ -882,9 +1077,9 @@ export class BrowserManager {
           record.savePath = item.getSavePath() || record.savePath
           record.state = state === 'interrupted' ? 'interrupted' : 'progressing'
           const now = Date.now()
-          if (now - lastBroadcast > 180) {
+          if (now - lastBroadcast > 220) {
             lastBroadcast = now
-            this.broadcastState()
+            BrowserManager.activeInstance?.scheduleBroadcast(16)
           }
         })
 
@@ -898,7 +1093,7 @@ export class BrowserManager {
               : state === 'cancelled'
                 ? 'cancelled'
                 : 'interrupted'
-          this.broadcastState()
+          BrowserManager.activeInstance?.broadcastState()
         })
       })
     }
@@ -909,6 +1104,10 @@ export class BrowserManager {
     const existing = this.views.get(tab.id)
     if (existing && !existing.webContents.isDestroyed()) {
       return existing
+    }
+    if (existing) {
+      this.views.delete(tab.id)
+      this.appliedViewLayout.delete(tab.id)
     }
 
     const profile =
@@ -933,9 +1132,27 @@ export class BrowserManager {
     view.setVisible(false)
     this.mainWindow.contentView.addChildView(view)
     this.views.set(tab.id, view)
+    this.appliedViewLayout.set(tab.id, { x: 0, y: 0, width: 0, height: 0, visible: false })
+    if (this.views.size > MAX_LIVE_WEB_VIEWS) {
+      this.evictIdleBackgroundViews(tab.id)
+    }
 
     const wc = view.webContents
+    if (tab.zoomFactor && tab.zoomFactor !== 1) {
+      try {
+        wc.setZoomFactor(tab.zoomFactor)
+      } catch {
+        // ignore
+      }
+    }
     this.attachShortcutInterceptor(wc)
+
+    wc.on('render-process-gone', () => {
+      tab.isLoading = false
+      tab.isAudioPlaying = false
+      this.destroyTabView(tab.id)
+      this.scheduleBroadcast(16)
+    })
 
     wc.on('focus', () => {
       const sp = this.getSplitView(tab.profileId)
@@ -957,7 +1174,10 @@ export class BrowserManager {
 
     wc.setWindowOpenHandler(({ url }) => {
       if (url && /^https?:\/\//i.test(url)) {
-        void this.createTab(url, { background: false, groupId: tab.groupId })
+        void this.createTab(url, {
+          background: false,
+          groupId: tab.isPinned || tab.isFavorite ? null : tab.groupId
+        })
       }
       return { action: 'deny' }
     })
@@ -1046,24 +1266,24 @@ export class BrowserManager {
         tab.isSensitive = isSensitiveUrl(url)
         this.syncNavigationFlags(tab, wc)
         this.persistTabs()
-        this.broadcastState()
+        this.scheduleBroadcast(24)
       }
     })
 
     wc.on('page-title-updated', (_event, title) => {
-      if (title) {
+      if (title && title !== tab.title) {
         tab.title = title
         this.store.recordHistory(tab.profileId, tab.url, tab.title, tab.favicon)
         this.persistTabs()
-        this.broadcastState()
+        this.scheduleBroadcast(24)
       }
     })
 
     wc.on('page-favicon-updated', (_event, favicons) => {
-      if (Array.isArray(favicons) && favicons.length > 0) {
+      if (Array.isArray(favicons) && favicons.length > 0 && favicons[0] !== tab.favicon) {
         tab.favicon = favicons[0]
         this.persistTabs()
-        this.broadcastState()
+        this.scheduleBroadcast(32)
       }
     })
 
@@ -1174,7 +1394,10 @@ export class BrowserManager {
           {
             label: tr(lang, 'Open Link in New Tab', '在新标签页中打开链接'),
             click: () => {
-              void this.createTab(params.linkURL, { background: false, groupId: tab.groupId })
+              void this.createTab(params.linkURL, {
+                background: false,
+                groupId: tab.isPinned || tab.isFavorite ? null : tab.groupId
+              })
             }
           },
           {
@@ -1186,7 +1409,10 @@ export class BrowserManager {
           {
             label: tr(lang, 'Open Link in Background Tab', '后台打开链接'),
             click: () => {
-              void this.createTab(params.linkURL, { background: true, groupId: tab.groupId })
+              void this.createTab(params.linkURL, {
+                background: true,
+                groupId: tab.isPinned || tab.isFavorite ? null : tab.groupId
+              })
             }
           },
           {
@@ -1254,7 +1480,10 @@ export class BrowserManager {
     const profileId = this.store.activeProfileId
     const sp = this.getSplitView(profileId)
     const active = this.getActiveTab()
-    const newRightId = await this.createTab(url, { background: true, groupId: active?.groupId })
+    const newRightId = await this.createTab(url, {
+      background: true,
+      groupId: active?.isPinned || active?.isFavorite ? null : active?.groupId
+    })
     if (sp.enabled && sp.leftTabId) {
       sp.rightTabId = newRightId
       sp.activePane = 'right'
@@ -1356,7 +1585,7 @@ export class BrowserManager {
         return
       }
 
-      // Arc Space / Profile cycling: Ctrl+Option+Left / Ctrl+Option+Right
+      // Arc / Dia Space cycling: Ctrl+Option+Left / Ctrl+Option+Right
       if (
         input.control &&
         input.alt &&
@@ -1369,6 +1598,26 @@ export class BrowserManager {
         this.cycleProfile(dir)
         this.emitShortcut(dir === -1 ? 'switch-profile-prev' : 'switch-profile-next')
         return
+      }
+
+      // Dia-style direct Profile switch: Ctrl+1..Ctrl+9 on macOS (⌃1..⌃9), Alt+1..Alt+9 on Win/Linux
+      const isProfileDigitShortcut =
+        process.platform === 'darwin'
+          ? input.control && !input.meta && !input.alt && !input.shift && /^[1-9]$/.test(input.key)
+          : input.alt && !input.control && !input.meta && !input.shift && /^[1-9]$/.test(input.key)
+
+      if (isProfileDigitShortcut) {
+        const targetIdx = Number(input.key) - 1
+        const targetProfile = this.store.profiles[targetIdx]
+        if (targetProfile) {
+          event.preventDefault()
+          const curIdx = this.store.profiles.findIndex((p) => p.id === this.store.activeProfileId)
+          if (targetProfile.id !== this.store.activeProfileId) {
+            this.switchProfile(targetProfile.id)
+            this.emitShortcut(targetIdx >= curIdx ? 'switch-profile-next' : 'switch-profile-prev')
+          }
+          return
+        }
       }
 
       if (!cmdOrCtrl) return
@@ -1466,6 +1715,40 @@ export class BrowserManager {
     })
   }
 
+  private applyViewBoundsAndVisibility(
+    tabId: string,
+    view: WebContentsView,
+    rect: ViewportBounds | null
+  ): void {
+    const prev = this.appliedViewLayout.get(tabId)
+    if (!rect) {
+      if (!prev || prev.visible) {
+        view.setVisible(false)
+        this.appliedViewLayout.set(tabId, {
+          x: prev?.x ?? 0,
+          y: prev?.y ?? 0,
+          width: prev?.width ?? 0,
+          height: prev?.height ?? 0,
+          visible: false
+        })
+      }
+      return
+    }
+
+    const x = Math.round(rect.x)
+    const y = Math.round(rect.y)
+    const width = Math.round(rect.width)
+    const height = Math.round(rect.height)
+
+    if (!prev || prev.x !== x || prev.y !== y || prev.width !== width || prev.height !== height) {
+      view.setBounds({ x, y, width, height })
+    }
+    if (!prev || !prev.visible) {
+      view.setVisible(true)
+    }
+    this.appliedViewLayout.set(tabId, { x, y, width, height, visible: true })
+  }
+
   public syncViewsLayout(): void {
     const sp = this.getSplitView()
     const activeTab = this.getActiveTab()
@@ -1486,13 +1769,7 @@ export class BrowserManager {
           this.primaryBounds.width > 20 &&
           this.primaryBounds.height > 20
         ) {
-          view.setBounds({
-            x: Math.round(this.primaryBounds.x),
-            y: Math.round(this.primaryBounds.y),
-            width: Math.round(this.primaryBounds.width),
-            height: Math.round(this.primaryBounds.height)
-          })
-          view.setVisible(true)
+          this.applyViewBoundsAndVisibility(tabId, view, this.primaryBounds)
         } else if (
           rightTab &&
           tabId === rightTab.id &&
@@ -1502,15 +1779,9 @@ export class BrowserManager {
           rightRect.width > 20 &&
           rightRect.height > 20
         ) {
-          view.setBounds({
-            x: Math.round(rightRect.x),
-            y: Math.round(rightRect.y),
-            width: Math.round(rightRect.width),
-            height: Math.round(rightRect.height)
-          })
-          view.setVisible(true)
+          this.applyViewBoundsAndVisibility(tabId, view, rightRect)
         } else {
-          view.setVisible(false)
+          this.applyViewBoundsAndVisibility(tabId, view, null)
         }
       }
       return
@@ -1526,17 +1797,7 @@ export class BrowserManager {
         this.primaryBounds.width > 20 &&
         this.primaryBounds.height > 20
 
-      if (shouldShow) {
-        view.setBounds({
-          x: Math.round(this.primaryBounds.x),
-          y: Math.round(this.primaryBounds.y),
-          width: Math.round(this.primaryBounds.width),
-          height: Math.round(this.primaryBounds.height)
-        })
-        view.setVisible(true)
-      } else {
-        view.setVisible(false)
-      }
+      this.applyViewBoundsAndVisibility(tabId, view, shouldShow ? this.primaryBounds : null)
     }
   }
 
@@ -1638,6 +1899,7 @@ export class BrowserManager {
     if (prevRightId && prevRightId !== resolvedRightId && prevRightId !== leftId) {
       const prevTab = this.tabs.find((t) => t.id === prevRightId)
       if (prevTab && prevTab.url === NEW_TAB_URL && !prevTab.isPinned) {
+        this.destroyTabView(prevRightId)
         const idx = this.tabs.findIndex((t) => t.id === prevRightId)
         if (idx >= 0) this.tabs.splice(idx, 1)
       }
@@ -1685,6 +1947,7 @@ export class BrowserManager {
       const disc = this.tabs.find((t) => t.id === discardedSideId)
       const profileTabs = this.tabs.filter((t) => t.profileId === profileId)
       if (disc && disc.url === NEW_TAB_URL && !disc.isPinned && profileTabs.length > 1) {
+        this.destroyTabView(disc.id)
         const idx = this.tabs.findIndex((t) => t.id === disc.id)
         if (idx >= 0) this.tabs.splice(idx, 1)
       }
@@ -1799,6 +2062,7 @@ export class BrowserManager {
         if (t.profileId !== profileId) return true
         if (t.url !== NEW_TAB_URL || t.isPinned || t.isFavorite) return true
         if (sp.enabled && (t.id === sp.leftTabId || t.id === sp.rightTabId)) return true
+        this.destroyTabView(t.id)
         return false
       })
     }
@@ -1841,6 +2105,18 @@ export class BrowserManager {
       } else {
         this.tabs.push(tab)
       }
+    } else if (tab.groupId) {
+      let lastGroupIdx = -1
+      for (let i = 0; i < this.tabs.length; i++) {
+        if (this.tabs[i].profileId === profileId && this.tabs[i].groupId === tab.groupId) {
+          lastGroupIdx = i
+        }
+      }
+      if (lastGroupIdx >= 0) {
+        this.tabs.splice(lastGroupIdx + 1, 0, tab)
+      } else {
+        this.tabs.push(tab)
+      }
     } else {
       this.tabs.push(tab)
     }
@@ -1877,12 +2153,6 @@ export class BrowserManager {
     }
     tab.lastAccessedAt = Date.now()
 
-    // Expand group automatically if user selects a tab inside a collapsed group
-    if (tab.groupId) {
-      const grp = this.tabGroups.find((g) => g.id === tab.groupId)
-      if (grp && grp.collapsed) grp.collapsed = false
-    }
-
     const sp = this.getSplitView(tab.profileId)
     if (sp.enabled) {
       if (tab.id === sp.leftTabId) {
@@ -1899,9 +2169,14 @@ export class BrowserManager {
     }
 
     this.activeTabByProfile[tab.profileId] = tab.id
-    if (!isInternalDiaUrl(tab.url) && !this.views.has(tab.id)) {
-      this.ensureViewForTab(tab, true)
-    } else if (isInternalDiaUrl(tab.url) && !this.mainWindow.isDestroyed()) {
+    if (!isInternalDiaUrl(tab.url)) {
+      const view = this.views.has(tab.id)
+        ? this.views.get(tab.id)
+        : this.ensureViewForTab(tab, true)
+      if (view && !view.webContents.isDestroyed() && !this.overlayActive) {
+        view.webContents.focus()
+      }
+    } else if (!this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.focus()
     }
     this.persistTabs()
@@ -1909,7 +2184,7 @@ export class BrowserManager {
     this.broadcastState()
   }
 
-  public closeTab(tabId: string): void {
+  public closeTab(tabId: string, options?: { silent?: boolean }): void {
     const idx = this.tabs.findIndex((t) => t.id === tabId)
     if (idx === -1) return
     const target = this.tabs[idx]
@@ -1931,18 +2206,7 @@ export class BrowserManager {
       }
     }
 
-    const view = this.views.get(tabId)
-    if (view) {
-      try {
-        this.mainWindow.contentView.removeChildView(view)
-        if (!view.webContents.isDestroyed()) {
-          view.webContents.close()
-        }
-      } catch {
-        // ignore
-      }
-      this.views.delete(tabId)
-    }
+    this.destroyTabView(tabId)
 
     this.tabs.splice(idx, 1)
 
@@ -1959,7 +2223,7 @@ export class BrowserManager {
 
     const remaining = this.tabs.filter((t) => t.profileId === profileId)
     if (remaining.length === 0) {
-      void this.createTab(NEW_TAB_URL)
+      void this.createTab(NEW_TAB_URL, { profileId })
       return
     }
 
@@ -1970,14 +2234,21 @@ export class BrowserManager {
       const sorted = [...remaining].sort((a, b) => b.lastAccessedAt - a.lastAccessedAt)
       const nextTab = sorted[0]
       this.activeTabByProfile[profileId] = nextTab.id
-      if (!isInternalDiaUrl(nextTab.url) && !this.views.has(nextTab.id)) {
+      if (
+        !options?.silent &&
+        profileId === this.store.activeProfileId &&
+        !isInternalDiaUrl(nextTab.url) &&
+        !this.views.has(nextTab.id)
+      ) {
         this.ensureViewForTab(nextTab, true)
       }
     }
 
-    this.persistTabs()
-    this.syncViewsLayout()
-    this.broadcastState()
+    if (!options?.silent) {
+      this.persistTabs()
+      this.syncViewsLayout()
+      this.broadcastState()
+    }
   }
 
   public async reopenClosedTab(): Promise<boolean> {
@@ -1995,7 +2266,7 @@ export class BrowserManager {
     return await this.createTab(src.url, {
       background: false,
       pinned: false,
-      groupId: src.groupId
+      groupId: src.isPinned || src.isFavorite ? null : src.groupId
     })
   }
 
@@ -2074,9 +2345,7 @@ export class BrowserManager {
     if (srcIdx === -1) return
     const tab = this.tabs[srcIdx]
     this.applyPinModeToTab(tab, targetZone)
-    if (targetZone !== 'pinned') {
-      tab.groupId = null
-    }
+    tab.groupId = null
 
     // Move to the end of that zone within its profile
     this.tabs.splice(srcIdx, 1)
@@ -2099,7 +2368,7 @@ export class BrowserManager {
       )
       .map((t) => t.id)
     for (const id of toClose) {
-      this.closeTab(id)
+      this.closeTab(id, { silent: true })
     }
     this.switchTab(keepTabId)
   }
@@ -2131,18 +2400,7 @@ export class BrowserManager {
           this.closedTabsByProfile[profileId].length = 25
         }
       }
-      const view = this.views.get(t.id)
-      if (view) {
-        try {
-          this.mainWindow.contentView.removeChildView(view)
-          if (!view.webContents.isDestroyed()) {
-            view.webContents.close()
-          }
-        } catch {
-          // ignore
-        }
-        this.views.delete(t.id)
-      }
+      this.destroyTabView(t.id)
       const idx = this.tabs.findIndex((item) => item.id === t.id)
       if (idx >= 0) {
         this.tabs.splice(idx, 1)
@@ -2230,6 +2488,7 @@ export class BrowserManager {
     tab.isSensitive = isSensitiveUrl(url)
 
     if (isInternalDiaUrl(url)) {
+      this.destroyTabView(tab.id)
       if (url === NEW_TAB_URL) {
         tab.title = tr(this.store.settings.language, 'New Tab', '新标签页')
       } else {
@@ -2238,6 +2497,9 @@ export class BrowserManager {
         tab.title = th?.title || tr(this.store.settings.language, 'Arko Chat', 'Arko 对话')
       }
       tab.isLoading = false
+      tab.canGoBack = false
+      tab.canGoForward = false
+      tab.isAudioPlaying = false
       this.persistTabs()
       this.syncViewsLayout()
       this.broadcastState()
@@ -2367,7 +2629,9 @@ export class BrowserManager {
     color: TabGroupColor = 'indigo',
     tabIds: string[] = []
   ): TabGroup {
-    const profileId = this.store.activeProfileId
+    const firstTab = tabIds.length > 0 ? this.tabs.find((t) => t.id === tabIds[0]) : undefined
+    const profileId = firstTab?.profileId || this.store.activeProfileId
+    const targetIsPinned = Boolean(firstTab && !firstTab.isFavorite && firstTab.isPinned)
     const group: TabGroup = {
       id: `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       profileId,
@@ -2380,17 +2644,101 @@ export class BrowserManager {
       const tab = this.tabs.find(
         (t) => t.id === tid && t.profileId === profileId && !t.isFavorite
       )
-      if (tab) tab.groupId = group.id
+      if (tab) {
+        this.applyPinModeToTab(tab, targetIsPinned ? 'pinned' : 'unpinned')
+        tab.groupId = group.id
+      }
     }
+    this.sortProfileTabsByTier(profileId)
     this.persistTabs()
     this.broadcastState()
     return group
   }
 
+  public updateTabGroup(
+    groupId: string,
+    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed'>>
+  ): TabGroup | null {
+    const grp = this.tabGroups.find((g) => g.id === groupId)
+    if (!grp) return null
+    if (typeof partial.title === 'string' && partial.title.trim()) {
+      grp.title = partial.title.trim()
+    }
+    if (partial.color) {
+      grp.color = partial.color
+    }
+    if (typeof partial.collapsed === 'boolean') {
+      grp.collapsed = partial.collapsed
+    }
+    this.persistTabs()
+    this.broadcastState()
+    return { ...grp }
+  }
+
   public assignTabToGroup(tabId: string, groupId: string | null): void {
-    const tab = this.tabs.find((t) => t.id === tabId)
-    if (!tab || tab.isFavorite) return
-    tab.groupId = groupId
+    const tabIdx = this.tabs.findIndex((t) => t.id === tabId)
+    if (tabIdx === -1) return
+    const tab = this.tabs[tabIdx]
+
+    if (groupId === null) {
+      const prevGroupId = tab.groupId
+      tab.groupId = null
+      if (prevGroupId) {
+        let lastSiblingIdx = -1
+        for (let i = 0; i < this.tabs.length; i++) {
+          if (this.tabs[i].profileId === tab.profileId && this.tabs[i].groupId === prevGroupId) {
+            lastSiblingIdx = i
+          }
+        }
+        if (lastSiblingIdx >= 0) {
+          const curIdx = this.tabs.findIndex((t) => t.id === tabId)
+          if (curIdx >= 0 && curIdx < lastSiblingIdx) {
+            const [removed] = this.tabs.splice(curIdx, 1)
+            const newLastIdx = this.tabs.findIndex(
+              (t, idx) =>
+                t.profileId === tab.profileId &&
+                t.groupId === prevGroupId &&
+                !this.tabs.slice(idx + 1).some((x) => x.groupId === prevGroupId)
+            )
+            this.tabs.splice(newLastIdx >= 0 ? newLastIdx + 1 : curIdx, 0, removed)
+          }
+        }
+      }
+      this.sortProfileTabsByTier(tab.profileId)
+      this.persistTabs()
+      this.broadcastState()
+      return
+    }
+
+    const grp = this.tabGroups.find((g) => g.id === groupId && g.profileId === tab.profileId)
+    if (!grp) return
+
+    const siblings = this.tabs.filter(
+      (t) => t.profileId === tab.profileId && t.groupId === groupId && t.id !== tab.id
+    )
+    if (siblings.length > 0) {
+      const targetZone: TabPinMode = siblings[0].isPinned ? 'pinned' : 'unpinned'
+      this.applyPinModeToTab(tab, targetZone)
+      tab.groupId = groupId
+      const curIdx = this.tabs.findIndex((t) => t.id === tab.id)
+      if (curIdx >= 0) {
+        const [removed] = this.tabs.splice(curIdx, 1)
+        const lastSibling = siblings[siblings.length - 1]
+        const dstIdx = this.tabs.findIndex((t) => t.id === lastSibling.id)
+        if (dstIdx >= 0) {
+          this.tabs.splice(dstIdx + 1, 0, removed)
+        } else {
+          this.tabs.push(removed)
+        }
+      }
+    } else {
+      if (tab.isFavorite) {
+        this.applyPinModeToTab(tab, 'pinned')
+      }
+      tab.groupId = groupId
+    }
+
+    this.sortProfileTabsByTier(tab.profileId)
     this.persistTabs()
     this.broadcastState()
   }
@@ -2582,18 +2930,7 @@ export class BrowserManager {
 
     const toRemoveTabs = this.tabs.filter((t) => t.profileId === profileId)
     for (const t of toRemoveTabs) {
-      const view = this.views.get(t.id)
-      if (view) {
-        try {
-          this.mainWindow.contentView.removeChildView(view)
-          if (!view.webContents.isDestroyed()) {
-            view.webContents.close()
-          }
-        } catch {
-          // ignore
-        }
-        this.views.delete(t.id)
-      }
+      this.destroyTabView(t.id)
     }
 
     this.tabs = this.tabs.filter((t) => t.profileId !== profileId)
@@ -2601,6 +2938,7 @@ export class BrowserManager {
     delete this.activeTabByProfile[profileId]
     delete this.splitByProfile[profileId]
     delete this.closedTabsByProfile[profileId]
+    delete this.connectedToolsByProfile[profileId]
 
     this.store.profiles.splice(idx, 1)
     this.store.saveProfiles()
@@ -2747,14 +3085,36 @@ export class BrowserManager {
       ...partial
     }
     this.store.saveSettings(next)
-    this.syncWindowTitleBarOverlay()
-    this.syncAllViewsOverlayConfig()
+
+    if ('theme' in partial) {
+      this.syncWindowTitleBarOverlay()
+    }
+    if (
+      'theme' in partial ||
+      'selectionToolbarEnabled' in partial ||
+      'sensitiveSiteGuard' in partial ||
+      'language' in partial
+    ) {
+      this.syncAllViewsOverlayConfig()
+    }
+
     this.broadcastState()
-    void this.refreshConnectedTools(this.store.activeProfileId, true)
+
+    if (
+      'autoConnectLoggedInApps' in partial ||
+      'manuallyConnectedTools' in partial ||
+      'manuallyDisconnectedTools' in partial
+    ) {
+      void this.refreshConnectedTools(this.store.activeProfileId, true)
+    }
     return next
   }
 
   public syncWindowTitleBarOverlay(): void {
+    const desiredSource = this.store.settings.theme || 'system'
+    if (nativeTheme.themeSource !== desiredSource) {
+      nativeTheme.themeSource = desiredSource
+    }
     if (process.platform === 'darwin' || this.mainWindow.isDestroyed()) return
     if (typeof this.mainWindow.setTitleBarOverlay === 'function') {
       const dark = this.isEffectiveDark()
@@ -2762,7 +3122,7 @@ export class BrowserManager {
         this.mainWindow.setTitleBarOverlay({
           color: dark ? '#19191B' : '#F4F4F5',
           symbolColor: dark ? '#E4E4E7' : '#27272A',
-          height: 38
+          height: 42
         })
       } catch {
         // ignore if unsupported on older WM
@@ -2841,6 +3201,85 @@ export class BrowserManager {
     return this.updateSettings({ onboardingCompleted: true })
   }
 
+  public resetOnboardingState(): BrowserSnapshotState {
+    for (const tabId of Array.from(this.views.keys())) {
+      this.destroyTabView(tabId)
+    }
+    this.views.clear()
+    this.appliedViewLayout.clear()
+    this.consoleLogsByTab.clear()
+    this.connectedToolsByProfile = {}
+
+    this.store.profiles = structuredClone(DEFAULT_PROFILES)
+    this.store.activeProfileId = 'work'
+    this.store.saveProfiles()
+
+    const initTabId = `initial-tab-work-${Date.now().toString(36)}`
+    this.tabs = [
+      {
+        id: initTabId,
+        profileId: 'work',
+        url: NEW_TAB_URL,
+        title: tr(this.store.settings.language, 'New Tab', '新标签页'),
+        isLoading: false,
+        canGoBack: false,
+        canGoForward: false,
+        isPinned: false,
+        isFavorite: false,
+        pinnedUrl: null,
+        isAudioPlaying: false,
+        isMuted: false,
+        isSensitive: false,
+        lastAccessedAt: Date.now(),
+        groupId: null,
+        zoomFactor: 1
+      }
+    ]
+    this.tabGroups = []
+    this.activeTabByProfile = { work: initTabId }
+    this.splitByProfile = {
+      work: createDefaultSplitState(),
+      personal: createDefaultSplitState()
+    }
+    this.closedTabsByProfile = {}
+
+    this.store.bookmarks = [
+      {
+        id: 'bm-arko-github',
+        profileId: 'work',
+        url: GITHUB_REPO_URL,
+        title: 'Arko Browser — GitHub (MistBreak/arko)',
+        createdAt: Date.now()
+      },
+      {
+        id: 'bm-github',
+        profileId: 'work',
+        url: 'https://github.com',
+        title: 'GitHub',
+        createdAt: Date.now()
+      },
+      {
+        id: 'bm-hn',
+        profileId: 'work',
+        url: 'https://news.ycombinator.com',
+        title: 'Hacker News',
+        createdAt: Date.now()
+      }
+    ]
+    this.store.saveBookmarks()
+    this.store.clearHistory()
+
+    this.store.saveSettings({
+      ...this.store.settings,
+      onboardingCompleted: false
+    })
+
+    this.persistTabs()
+    this.syncViewsLayout()
+    this.broadcastState()
+    return this.getSnapshot()
+  }
+
   public executeBrowserImport(request: BrowserImportRequest): BrowserImportResult {
     const parsed = parseBrowserDataForImport(request)
     if (!parsed.ok) {
@@ -2867,8 +3306,13 @@ export class BrowserManager {
     let bookmarksImported = 0
     let historyImported = 0
     let firstTargetProfileId: string | null = null
+    const importedProfileOrder: string[] = []
+    // Preserve Arc's M-Spaces-to-N-Profiles cookie/session sharing:
+    // Spaces bound to the same source Chromium Profile share one Electron session partition.
+    const partitionBySourceProfile = new Map<string, string>()
 
     const isFreshOnboarding = !this.store.settings.onboardingCompleted
+    const hadNoPriorWebTabs = this.tabs.every((t) => isInternalDiaUrl(t.url))
     const totalIncomingBookmarks = parsed.spaces.reduce((s, sp) => s + sp.bookmarks.length, 0)
     if (isFreshOnboarding && request.scopes.bookmarks && totalIncomingBookmarks > 0) {
       const demoIds = new Set(['bm-arko-github', 'bm-github', 'bm-hn'])
@@ -2884,6 +3328,9 @@ export class BrowserManager {
 
     parsed.spaces.forEach((spacePayload, spaceIdx) => {
       let targetProfileId = this.store.activeProfileId
+      const sourceProfileKey = spacePayload.profileDir
+        ? `${request.browserId}:${spacePayload.profileDir}`
+        : null
 
       if (request.createSpacesFromProfiles) {
         const normalizedIncoming = spacePayload.name.trim().toLowerCase()
@@ -2896,14 +3343,56 @@ export class BrowserManager {
             if (spacePayload.emoji) matchedExisting.emoji = spacePayload.emoji
             if (spacePayload.accentColor) matchedExisting.accentColor = spacePayload.accentColor
           }
+          if (sourceProfileKey) {
+            const sharedPartition = partitionBySourceProfile.get(sourceProfileKey)
+            if (sharedPartition) {
+              matchedExisting.partition = sharedPartition
+            } else {
+              partitionBySourceProfile.set(sourceProfileKey, matchedExisting.partition)
+            }
+          }
+          if (!this.tabs.some((t) => t.profileId === targetProfileId)) {
+            const initTabId = `tab-${targetProfileId}-${Date.now()}-${spaceIdx}`
+            this.tabs.push({
+              id: initTabId,
+              profileId: targetProfileId,
+              url: NEW_TAB_URL,
+              title: tr(this.store.settings.language, 'New Tab', '新标签页'),
+              isLoading: false,
+              canGoBack: false,
+              canGoForward: false,
+              isPinned: false,
+              isFavorite: false,
+              pinnedUrl: null,
+              isAudioPlaying: false,
+              isMuted: false,
+              isSensitive: false,
+              lastAccessedAt: Date.now(),
+              groupId: null,
+              zoomFactor: 1
+            })
+            this.activeTabByProfile[targetProfileId] = initTabId
+            if (!this.splitByProfile[targetProfileId]) {
+              this.splitByProfile[targetProfileId] = createDefaultSplitState()
+            }
+          }
         } else {
           const slug = `profile-${request.browserId}-${Date.now().toString(36)}-${spaceIdx}`
+          let partition = `persist:arko-profile-${slug}`
+          if (sourceProfileKey) {
+            const sharedPartition = partitionBySourceProfile.get(sourceProfileKey)
+            if (sharedPartition) {
+              partition = sharedPartition
+            } else {
+              partitionBySourceProfile.set(sourceProfileKey, partition)
+            }
+          }
           const createdProfile: BrowserProfile = {
             id: slug,
             name: spacePayload.name.trim() || `Space ${spaceIdx + 1}`,
             emoji: spacePayload.emoji || '✨',
             accentColor: spacePayload.accentColor || '#4F46E5',
-            partition: `persist:arko-profile-${slug}`
+            partition
           }
           this.store.profiles.push(createdProfile)
           targetProfileId = slug
@@ -2931,6 +3420,10 @@ export class BrowserManager {
           this.activeTabByProfile[slug] = initTabId
           this.splitByProfile[slug] = createDefaultSplitState()
         }
+      }
+
+      if (!importedProfileOrder.includes(targetProfileId)) {
+        importedProfileOrder.push(targetProfileId)
       }
 
       if (!firstTargetProfileId) {
@@ -2991,7 +3484,7 @@ export class BrowserManager {
 
         let addedPinnedInSpace = 0
         for (const pt of spacePayload.pinnedTabs) {
-          if (addedPinnedInSpace >= 80) break
+          if (addedPinnedInSpace >= 500) break
           if (existingPinnedUrls.has(pt.url)) continue
           existingPinnedUrls.add(pt.url)
           addedPinnedInSpace++
@@ -3100,6 +3593,40 @@ export class BrowserManager {
 
     if (bookmarksImported > 0 || isFreshOnboarding) {
       this.store.saveBookmarks()
+    }
+
+    if (
+      isFreshOnboarding &&
+      hadNoPriorWebTabs &&
+      request.createSpacesFromProfiles &&
+      importedProfileOrder.length > 0
+    ) {
+      const importedSet = new Set(importedProfileOrder)
+      const removedIds = this.store.profiles
+        .filter((p) => !importedSet.has(p.id))
+        .map((p) => p.id)
+      if (removedIds.length > 0) {
+        const removedSet = new Set(removedIds)
+        for (const t of this.tabs) {
+          if (!removedSet.has(t.profileId)) continue
+          this.destroyTabView(t.id)
+        }
+        this.tabs = this.tabs.filter((t) => !removedSet.has(t.profileId))
+        for (const rid of removedIds) {
+          delete this.activeTabByProfile[rid]
+          delete this.splitByProfile[rid]
+          delete this.closedTabsByProfile[rid]
+          delete this.connectedToolsByProfile[rid]
+        }
+      }
+      const orderedProfiles: BrowserProfile[] = []
+      for (const pid of importedProfileOrder) {
+        const found = this.store.profiles.find((p) => p.id === pid)
+        if (found) orderedProfiles.push(found)
+      }
+      if (orderedProfiles.length > 0) {
+        this.store.profiles = orderedProfiles
+      }
     }
 
     this.store.saveProfiles()
@@ -3523,27 +4050,61 @@ export class BrowserManager {
       this.getSiblingSplitContext(params.tabId)
     ])
 
-    const sendChunk = (payload: InlineWriteStreamPayload): void => {
-      if (!this.mainWindow.isDestroyed()) {
-        this.mainWindow.webContents.send('arko:inline-write-chunk', payload)
+    let pendingDelta = ''
+    let flushTimer: NodeJS.Timeout | null = null
+    const flushInlineBuffer = (): void => {
+      if (flushTimer) {
+        clearTimeout(flushTimer)
+        flushTimer = null
+      }
+      if (pendingDelta && !this.mainWindow.isDestroyed()) {
+        const text = pendingDelta
+        pendingDelta = ''
+        this.mainWindow.webContents.send('arko:inline-write-chunk', {
+          requestId: params.requestId,
+          deltaContent: text
+        } satisfies InlineWriteStreamPayload)
       }
     }
 
-    await this.aiService.streamInlineWrite({
-      requestId: params.requestId,
-      provider,
-      modelId,
-      personalizationPrompt: settings.personalizationPrompt,
-      memories: settings.memoryEnabled ? this.store.memories : undefined,
-      preset: params.preset,
-      instruction: params.instruction,
-      fieldLabel: params.fieldLabel,
-      selectedText: params.selectedText,
-      surroundingValue: params.surroundingValue,
-      pageContext,
-      siblingSplitContext,
-      onChunk: sendChunk
-    })
+    const sendChunk = (payload: InlineWriteStreamPayload): void => {
+      if (this.mainWindow.isDestroyed()) return
+      if (payload.deltaContent && !payload.done && !payload.error) {
+        pendingDelta += payload.deltaContent
+        if (!flushTimer) {
+          flushTimer = setTimeout(flushInlineBuffer, 16)
+        }
+        return
+      }
+      if (payload.deltaContent) {
+        pendingDelta += payload.deltaContent
+      }
+      flushInlineBuffer()
+      this.mainWindow.webContents.send('arko:inline-write-chunk', {
+        ...payload,
+        deltaContent: undefined
+      })
+    }
+
+    try {
+      await this.aiService.streamInlineWrite({
+        requestId: params.requestId,
+        provider,
+        modelId,
+        personalizationPrompt: settings.personalizationPrompt,
+        memories: settings.memoryEnabled ? this.store.memories : undefined,
+        preset: params.preset,
+        instruction: params.instruction,
+        fieldLabel: params.fieldLabel,
+        selectedText: params.selectedText,
+        surroundingValue: params.surroundingValue,
+        pageContext,
+        siblingSplitContext,
+        onChunk: sendChunk
+      })
+    } finally {
+      flushInlineBuffer()
+    }
   }
 
   public async applyInlineWriteResult(params: {
@@ -4090,8 +4651,16 @@ export class BrowserManager {
           }
           const closedTitles = targets.map((t) => t.title || t.url)
           for (const t of targets) {
-            this.closeTab(t.id)
+            this.closeTab(t.id, { silent: true })
           }
+          const nextActiveId = this.activeTabByProfile[profileId]
+          const nextActiveTab = nextActiveId ? this.tabs.find((t) => t.id === nextActiveId) : undefined
+          if (nextActiveTab && !isInternalDiaUrl(nextActiveTab.url) && !this.views.has(nextActiveTab.id)) {
+            this.ensureViewForTab(nextActiveTab, true)
+          }
+          this.persistTabs()
+          this.syncViewsLayout()
+          this.broadcastState()
           return {
             ok: true,
             summary: `已关闭 ${targets.length} 个标签页`,
@@ -4115,8 +4684,11 @@ export class BrowserManager {
               !t.isFavorite
           )
           for (const t of toClose) {
-            this.closeTab(t.id)
+            this.closeTab(t.id, { silent: true })
           }
+          this.persistTabs()
+          this.syncViewsLayout()
+          this.broadcastState()
           return {
             ok: true,
             summary: `已关闭其他 ${toClose.length} 个标签`,
@@ -4129,8 +4701,11 @@ export class BrowserManager {
             (t) => !t.isPinned && !t.isFavorite && t.url !== protectedChatUrl && t.url !== NEW_TAB_URL
           )
           for (const t of toClose) {
-            this.closeTab(t.id)
+            this.closeTab(t.id, { silent: true })
           }
+          this.persistTabs()
+          this.syncViewsLayout()
+          this.broadcastState()
           return {
             ok: true,
             summary: `已清理 ${toClose.length} 个临时标签`,
@@ -4894,25 +5469,92 @@ export class BrowserManager {
       workspaceAgentRules: workspaceRules
     })
 
-    const sendStreamEvent = (payload: StreamChunkPayload): void => {
-      if (!this.mainWindow.isDestroyed()) {
-        this.mainWindow.webContents.send('arko:chat-stream-chunk', payload)
+    let bufferedContent = ''
+    let bufferedReasoning = ''
+    let latestReferencedUrls: Array<{ title: string; url: string }> | undefined
+    let streamFlushTimer: NodeJS.Timeout | null = null
+
+    const flushStreamBuffer = (): void => {
+      if (streamFlushTimer) {
+        clearTimeout(streamFlushTimer)
+        streamFlushTimer = null
+      }
+      if ((bufferedContent || bufferedReasoning) && !this.mainWindow.isDestroyed()) {
+        const chunkPayload: StreamChunkPayload = {
+          threadId: thread.id,
+          messageId: assistantMsgId,
+          deltaContent: bufferedContent || undefined,
+          deltaReasoning: bufferedReasoning || undefined,
+          referencedUrls: latestReferencedUrls
+        }
+        bufferedContent = ''
+        bufferedReasoning = ''
+        this.mainWindow.webContents.send('arko:chat-stream-chunk', chunkPayload)
       }
     }
 
-    const result = await this.aiService.streamChat({
-      threadId: thread.id,
-      messageId: assistantMsgId,
-      provider,
-      modelId,
-      systemPrompt,
-      historyMessages: historyForApi,
-      referencedUrls,
-      tools: combinedTools,
-      toolExecutor: agentToolsEnabled ? this.createHarnessExecutor(thread.id) : undefined,
-      maxSteps: activeWorkspace ? 20 : 15,
-      onChunk: sendStreamEvent
-    })
+    const sendStreamEvent = (payload: StreamChunkPayload): void => {
+      if (this.mainWindow.isDestroyed()) return
+      if (payload.referencedUrls) {
+        latestReferencedUrls = payload.referencedUrls
+      }
+      const isPureDelta =
+        (Boolean(payload.deltaContent) || Boolean(payload.deltaReasoning)) &&
+        !payload.toolStep &&
+        !payload.done &&
+        !payload.error &&
+        !payload.followUps
+
+      if (isPureDelta) {
+        if (payload.deltaContent) bufferedContent += payload.deltaContent
+        if (payload.deltaReasoning) bufferedReasoning += payload.deltaReasoning
+        if (!streamFlushTimer) {
+          streamFlushTimer = setTimeout(flushStreamBuffer, 16)
+        }
+        return
+      }
+
+      if (payload.deltaContent) bufferedContent += payload.deltaContent
+      if (payload.deltaReasoning) bufferedReasoning += payload.deltaReasoning
+      flushStreamBuffer()
+      this.mainWindow.webContents.send('arko:chat-stream-chunk', {
+        ...payload,
+        deltaContent: undefined,
+        deltaReasoning: undefined
+      })
+    }
+
+    let result: Awaited<ReturnType<AIService['streamChat']>>
+    try {
+      result = await this.aiService.streamChat({
+        threadId: thread.id,
+        messageId: assistantMsgId,
+        provider,
+        modelId,
+        systemPrompt,
+        historyMessages: historyForApi,
+        referencedUrls,
+        tools: combinedTools,
+        toolExecutor: agentToolsEnabled ? this.createHarnessExecutor(thread.id) : undefined,
+        maxSteps: activeWorkspace ? 20 : 15,
+        onChunk: sendStreamEvent
+      })
+    } finally {
+      flushStreamBuffer()
+    }
+
+    // Retain at most the latest 2 screenshot previews per assistant message to keep memory & IPC lean
+    if (result.toolSteps && result.toolSteps.length > 2) {
+      let keptShots = 0
+      for (let i = result.toolSteps.length - 1; i >= 0; i--) {
+        if (result.toolSteps[i].imagePreview) {
+          keptShots++
+          if (keptShots > 2) {
+            delete result.toolSteps[i].imagePreview
+          }
+        }
+      }
+    }
 
     assistantMsg.content = result.content
     assistantMsg.reasoning = result.reasoning || undefined

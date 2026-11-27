@@ -43,6 +43,7 @@ const arkoApi: ArkoAPI = {
     ipcRenderer.invoke('arko:pick-custom-browser-import-path', browserId),
   executeBrowserImport: (request) => ipcRenderer.invoke('arko:execute-browser-import', request),
   completeOnboarding: () => ipcRenderer.invoke('arko:complete-onboarding'),
+  resetOnboardingState: () => ipcRenderer.invoke('arko:reset-onboarding-state'),
 
   // Connected Tools (Zero-OAuth Browser Session Context)
   getConnectedTools: () => ipcRenderer.invoke('arko:get-connected-tools'),
@@ -93,6 +94,8 @@ const arkoApi: ArkoAPI = {
   // Tab Groups & AI Organizer
   createTabGroup: (title, color, tabIds) =>
     ipcRenderer.invoke('arko:create-tab-group', title, color, tabIds),
+  updateTabGroup: (groupId, partial) =>
+    ipcRenderer.invoke('arko:update-tab-group', groupId, partial),
   assignTabToGroup: (tabId, groupId) =>
     ipcRenderer.invoke('arko:assign-tab-to-group', tabId, groupId),
   toggleTabGroupCollapsed: (groupId) =>
@@ -137,6 +140,11 @@ const arkoApi: ArkoAPI = {
   logoutAccount: () => ipcRenderer.invoke('arko:logout-account'),
   refreshAccountProfile: () => ipcRenderer.invoke('arko:refresh-account-profile'),
   redeemAccountCode: (code) => ipcRenderer.invoke('arko:redeem-account-code', code),
+  quoteTopUpAmount: (amount) => ipcRenderer.invoke('arko:quote-topup-amount', amount),
+  createTopUpQrOrder: (params) => ipcRenderer.invoke('arko:create-topup-qr-order', params),
+  checkTopUpOrderStatus: (tradeNo) => ipcRenderer.invoke('arko:check-topup-order-status', tradeNo),
+  purchaseSubscriptionWithBalance: (planId) =>
+    ipcRenderer.invoke('arko:purchase-subscription-balance', planId),
   updateSettings: (partial) => ipcRenderer.invoke('arko:update-settings', partial),
   selectCodingWorkspace: () => ipcRenderer.invoke('arko:select-coding-workspace'),
   clearCodingWorkspace: () => ipcRenderer.invoke('arko:clear-coding-workspace'),

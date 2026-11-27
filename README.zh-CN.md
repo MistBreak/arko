@@ -1,6 +1,6 @@
 # Arko
 
-**基于 Chromium 打造的 Arc 开源平替桌面浏览器 —— 原生融合 AI 跨标签工作流。**
+**无地区限制的开源 Chromium 桌面浏览器 —— 延续 Arc 经典空间工作流，融合 Dia 式原生 AI 体验。**
 
 [English](./README.md) | 简体中文
 
@@ -13,14 +13,16 @@
 
 ## 为什么做 Arko？
 
-**Arc 浏览器**重新定义了现代桌面浏览器的空间秩序 —— 左侧垂直侧边栏、多空间隔离（Spaces）、`Favorites / Pinned / Today` 三层标签体系、丝滑分屏（Split View）以及克制沉静的无边框视觉。然而 Arc 本体闭源且已转向维护模式，而市面上多数开源替代品基于 Firefox 内核构建，难以兼顾 Chromium 渲染生态与原生 AI 生产力。
+**Arc 浏览器**曾重新定义了现代桌面浏览器的空间秩序 —— 左侧垂直侧边栏、多空间隔离（`Spaces`）、`Favorites / Pinned / Today` 三层标签体系、丝滑分屏（`Split View`）以及克制沉静的无边框视觉。
 
-**Arko**（世界语中意为 *"Arc / 弧"*）基于 **Chromium (`Electron WebContentsView`)** 完整重现了 Arc 标志性的空间交互体验，并深度内建 **本地优先、自带密钥（BYOK）的原生 AI 工作台**：
+然而随着官方重心全面转向继任者 **Dia**，**Arc 浏览器已准备下架退场**；但令人遗憾的是，**Dia 在部分国家和地区受到区域与账号限制而无法正常使用**，而市面上现有的开源平替又大多基于 Firefox 内核构建。这让无数习惯了 Chromium 生态的 Arc 用户陷入「老浏览器即将停摆、新浏览器无法使用」的尴尬境地。
 
-- **纯正 Chromium 内核**：完整的 Chromium 渲染性能、开发者工具（DevTools）与现代 Web 兼容性。
-- **一键无损迁移 Arc / Dia / Chrome 数据**：首次启动即可直接解析 **Arc `StorableSidebar.json`** 空间结构、顶部常驻网格、固定标签文件夹、Chrome 多配置书签树与历史记录（原浏览器运行占锁状态下同样支持安全读取）。
-- **原汁原味 Arc 空间体验**：自适应常驻图标网格（`Favorites`）、空间固定标签（`Pinned`，支持一键回到初始固定网址）、今日临时标签（`Today`，支持一键清理）、触控板双指左右滑切空间、拖拽分屏。
-- **自带 Key（BYOK）零捆绑 AI**：原生支持 **OpenAI**、**Anthropic Claude**、**Google Gemini**、**本地 Ollama** 及任意兼容中转网关 —— 无需强制注册账号，数据保存在本地。
+**正因如此，才有了 Arko**（世界语中意为 *"Arc / 弧"*）。我们希望打造一款 **不受地区限制、开源透明、本地优先** 的 Chromium 桌面浏览器 —— 既完整留住 **Arc 标志性的空间交互体验**，又原生融合 **Dia 式的跨标签 AI 生产力**：
+
+- **零地区限制 · 自带 Key（BYOK）自由接入**：无需强制绑定受地区限制的云端账号，数据保存在本地；原生支持 **OpenAI**、**Anthropic Claude**、**Google Gemini**、**本地 Ollama** 及任意兼容 API 中转网关，在任何地区都能开箱即用。
+- **赶在 Arc 下架前，一键无损迁移**：首次启动即可直接解析 **Arc (`StorableSidebar.json`)** 空间结构、顶部常驻网格、固定标签文件夹，以及 **Dia / Chrome** 多配置书签树与历史记录（原浏览器运行占锁状态下同样支持安全读取）。
+- **纯正 Chromium 内核**：基于 Electron `WebContentsView` 构建，拥有完整的 Chromium 渲染性能、开发者工具（DevTools）与现代 Web 生态兼容性。
+- **Arc 空间工作流 × Dia 原生 AI 二合一**：完整复刻自适应常驻图标网格（`Favorites`）、空间固定标签（`Pinned`）、今日临时标签（`Today`）、触控板双指滑切空间与拖拽分屏；同时内建 `@` 多标签联合上下文、独立对话页（`arko://chat/`）、`⌘J` 网页内联帮写与浏览器自动化 Agent。
 - **应用内一键更新（One-Click Update）**：后台自动检测 `MistBreak/arko` GitHub Releases，支持一键下载、自动替换安装并重启（macOS 未付费签名构建同样支持自动免检更新）。
 - **默认英文 · 中英双语实时切换**：默认提供纯净英文界面，可在 `Settings → EN / 中文` 一键实时切换为简体中文（同步覆盖主界面、系统原生菜单与网页划词工具条）。
 

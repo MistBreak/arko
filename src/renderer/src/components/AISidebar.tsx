@@ -54,7 +54,7 @@ import { ChatMarkdown, ReasoningBlock, ToolStepsBlock } from './ChatMarkdown'
 interface Props {
   isDark: boolean
   width: number
-  onResizeWidth: (w: number) => void
+  onResizeWidth: (w: number, commit?: boolean) => void
   onResizeDragChange?: (dragging: boolean) => void
   tabs: TabState[]
   activeTab: TabState | undefined
@@ -544,15 +544,17 @@ export const AISidebar: React.FC<Props> = ({
     e.preventDefault()
     const startX = e.clientX
     const startWidth = width
+    let latestWidth = startWidth
     onResizeDragChange?.(true)
 
     const onMove = (moveEvt: MouseEvent): void => {
       const delta = startX - moveEvt.clientX
-      const next = Math.max(320, Math.min(580, startWidth + delta))
-      onResizeWidth(next)
+      latestWidth = Math.max(320, Math.min(580, startWidth + delta))
+      onResizeWidth(latestWidth, false)
     }
     const onUp = (): void => {
       onResizeDragChange?.(false)
+      onResizeWidth(latestWidth, true)
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
     }
@@ -572,7 +574,7 @@ export const AISidebar: React.FC<Props> = ({
       {/* Left Resize Sash (double-click resets default width) */}
       <div
         onMouseDown={handleStartResize}
-        onDoubleClick={() => onResizeWidth(380)}
+        onDoubleClick={() => onResizeWidth(380, true)}
         title="拖拽调节侧栏宽度 · 双击恢复默认宽度"
         className="absolute left-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-white/15 transition z-20"
       />
@@ -884,6 +886,7 @@ export const AISidebar: React.FC<Props> = ({
                   <ChatMarkdown
                     content={msg.content}
                     lang={lang}
+                    isStreaming={Boolean(msg.isStreaming)}
                     onOpenLink={onSwitchToTabUrl}
                     onClickCitation={onJumpCitationTitle}
                   />

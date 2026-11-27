@@ -19,6 +19,7 @@ import type {
   BrowserProfile,
   ChatThread,
   HistoryItem,
+  InstalledExtensionItem,
   MemoryItem,
   SplitViewState,
   TabGroup
@@ -47,6 +48,7 @@ interface SessionsFile {
 export class PersistenceStore {
   private baseDir: string
   private writeTimers = new Map<string, NodeJS.Timeout>()
+  private pendingWrites = new Map<string, { getData: () => unknown; pretty: boolean }>()
 
   public settings: AppSettings = structuredClone(DEFAULT_SETTINGS)
   public legacyCloudApiKey = ''
@@ -56,6 +58,7 @@ export class PersistenceStore {
   public history: HistoryItem[] = []
   public memories: MemoryItem[] = []
   public threads: ChatThread[] = []
+  public extensions: InstalledExtensionItem[] = []
   public savedSession: SessionsFile = {
     activeProfileId: 'work',
     activeTabByProfile: {},
@@ -108,22 +111,45 @@ export class PersistenceStore {
     }
   }
 
-  private scheduleWrite(name: string, getData: () => unknown): void {
+  private scheduleWrite(name: string, getData: () => unknown, pretty = false): void {
     const prev = this.writeTimers.get(name)
     if (prev) clearTimeout(prev)
+    this.pendingWrites.set(name, { getData, pretty })
     const timer = setTimeout(async () => {
       this.writeTimers.delete(name)
+      this.pendingWrites.delete(name)
       try {
         const target = this.filePath(name)
         const tmp = `${target}.tmp`
-        const payload = JSON.stringify(getData(), null, 2)
+        const payload = pretty ? JSON.stringify(getData(), null, 2) : JSON.stringify(getData())
         await fs.promises.writeFile(tmp, payload, 'utf-8')
         await fs.promises.rename(tmp, target)
       } catch (err) {
         console.error(`[PersistenceStore] Failed writing ${name}:`, err)
       }
-    }, 180)
+    }, 220)
     this.writeTimers.set(name, timer)
+  }
+
+  public flushSync(): void {
+    for (const [name, timer] of this.writeTimers.entries()) {
+      clearTimeout(timer)
+      this.writeTimers.delete(name)
+      const pending = this.pendingWrites.get(name)
+      this.pendingWrites.delete(name)
+      if (!pending) continue
+      try {
+        const target = this.filePath(name)
+        const tmp = `${target}.tmp`
+        const payload = pending.pretty
+          ? JSON.stringify(pending.getData(), null, 2)
+          : JSON.stringify(pending.getData())
+        fs.writeFileSync(tmp, payload, 'utf-8')
+        fs.renameSync(tmp, target)
+      } catch (err) {
+        console.error(`[PersistenceStore] Failed flushing ${name}:`, err)
+      }
+    }
   }
 
   private loadAll(): void {
@@ -318,6 +344,10 @@ export class PersistenceStore {
     this.history = this.readJson<HistoryItem[]>('history', [])
     this.memories = this.readJson<MemoryItem[]>('memories', [])
     this.threads = this.readJson<ChatThread[]>('threads', [])
+    const rawExtensions = this.readJson<InstalledExtensionItem[]>('extensions', [])
+    this.extensions = Array.isArray(rawExtensions)
+      ? rawExtensions.filter((e) => e && typeof e.id === 'string' && typeof e.localPath === 'string')
+      : []
 
     const rawSession = this.readJson<SessionsFile>('sessions', {
       activeProfileId: this.profiles[0].id,
@@ -367,14 +397,21 @@ export class PersistenceStore {
       ...next,
       providers: sanitizedProviders
     }
-    this.scheduleWrite('settings', () => this.settings)
+    this.scheduleWrite('settings', () => this.settings, true)
   }
 
   public saveProfiles(): void {
-    this.scheduleWrite('profiles', () => this.profiles)
+    this.scheduleWrite('profiles', () => this.profiles, true)
+  }
+
+  public saveExtensions(): void {
+    this.scheduleWrite('extensions', () => this.extensions, true)
   }
 
   public saveBookmarks(): void {
+    if (this.bookmarks.length > 5000) {
+      this.bookmarks.length = 5000
+    }
     this.scheduleWrite('bookmarks', () => this.bookmarks)
   }
 
@@ -438,6 +475,24 @@ export class PersistenceStore {
     if (this.threads.length > 100) {
       this.threads.length = 100
     }
+    // Bound per-thread message history & prune stale agent step base64 screenshots on older threads
+    // so threads.json and IPC snapshots never bloat into tens of megabytes over weeks of usage.
+    this.threads.forEach((th, threadIdx) => {
+      if (th.messages.length > 160) {
+        th.messages = th.messages.slice(-160)
+      }
+      const isArchiveThread = threadIdx >= 3
+      const msgCutoff = Math.max(0, th.messages.length - 6)
+      th.messages.forEach((msg, msgIdx) => {
+        if ((isArchiveThread || msgIdx < msgCutoff) && msg.toolSteps) {
+          for (const step of msg.toolSteps) {
+            if (step.imagePreview) {
+              delete step.imagePreview
+            }
+          }
+        }
+      })
+    })
     this.scheduleWrite('threads', () => this.threads)
   }
 

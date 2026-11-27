@@ -72,6 +72,8 @@ export interface BrowserProfile {
   emoji: string
   accentColor: string
   partition: string
+  profileLabel?: string
+  sourceProfileKey?: string
 }
 
 export interface TabGroup {
@@ -102,6 +104,7 @@ export interface TabState {
   lastAccessedAt: number
   groupId?: string | null
   zoomFactor?: number
+  isLoaded?: boolean
 }
 
 export interface ViewportBounds {
@@ -218,8 +221,121 @@ export interface ArkoAccountUser {
   email: string
   group?: string
   remainingUsd?: number
+  walletRemainingUsd?: number
+  subscriptionRemainingUsd?: number
+  effectiveUnlimited?: boolean
   usedUsd?: number
   requestCount?: number
+}
+
+// 在线充值支付方式描述项
+export interface ArkoTopUpPaymentMethod {
+  name: string
+  type: string
+  color?: string
+  minTopup?: number
+}
+
+// 当前生效中的单条订阅套餐额度快照
+export interface ArkoSubscriptionItem {
+  id: number
+  planId: number
+  planTitle: string
+  amountTotal: number
+  amountUsed: number
+  amountRemaining: number
+  remainingUsd: number
+  unlimited: boolean
+  startTime: number
+  endTime: number
+  nextResetTime: number
+  allowWalletOverflow: boolean
+}
+
+// 可通过账户余额直接开通的套餐定义
+export interface ArkoSubscriptionPlanItem {
+  id: number
+  title: string
+  subtitle: string
+  priceAmount: number
+  currency: string
+  durationUnit: string
+  durationValue: number
+  totalAmountUsd: number
+  unlimited: boolean
+  quotaResetPeriod: string
+  allowBalancePay: boolean
+}
+
+// 聚合钱包余额、订阅套餐额度与应用内充值配置的统一账单摘要
+export interface ArkoBillingSummary {
+  effectiveRemainingUsd: number
+  effectiveUnlimited: boolean
+  walletRemainingUsd: number
+  walletUsedUsd: number
+  requestCount: number
+  subscription: {
+    billingPreference: string
+    hasActive: boolean
+    hasUnlimited: boolean
+    allowWalletOverflow: boolean
+    remainingUsd: number
+    usedUsd: number
+    items: ArkoSubscriptionItem[]
+  }
+  topup: {
+    enableOnlineTopup: boolean
+    supportsQrcodeCheckout: boolean
+    enableRedemption: boolean
+    payMethods: ArkoTopUpPaymentMethod[]
+    amountOptions: number[]
+    discount: Record<string, number>
+    minTopup: number
+    maxTopup: number
+    payCurrency: string
+    price: number
+  }
+}
+
+// 充值金额实时试算响应
+export interface ArkoTopUpQuoteResult {
+  ok: boolean
+  amount: number
+  payAmount?: string
+  payCurrency?: string
+  creditedUsd?: number
+  error?: string
+}
+
+// 扫码充值下单响应（含主进程离线生成的二维码 DataURL）
+export interface ArkoTopUpCheckoutResult {
+  ok: boolean
+  tradeNo?: string
+  payAmount?: string
+  payCurrency?: string
+  creditedUsd?: number
+  paymentMethod?: string
+  qrImageDataUrl?: string
+  qrImageUrl?: string
+  priceChanged?: boolean
+  latestPayAmount?: string
+  error?: string
+}
+
+// 扫码充值订单轮询状态响应
+export interface ArkoTopUpOrderStatusResult {
+  ok: boolean
+  tradeNo: string
+  status: 'pending' | 'success' | 'manual_review' | 'expired' | string
+  state?: ArkoAccountState
+  error?: string
+}
+
+// 使用钱包余额直购套餐响应
+export interface ArkoBalancePlanPurchaseResult {
+  ok: boolean
+  state?: ArkoAccountState
+  error?: string
 }
 
 export interface ArkoAuthServerCapabilities {
@@ -243,6 +359,8 @@ export interface ArkoAccountState {
   authenticated: boolean
   hasCloudCredential: boolean
   user: ArkoAccountUser | null
+  billing?: ArkoBillingSummary | null
+  plans?: ArkoSubscriptionPlanItem[]
   capabilities?: ArkoAuthServerCapabilities
   syncedAt?: number
 }
@@ -312,19 +430,37 @@ export type ImportBrowserId = 'arc' | 'dia' | 'chrome'
 
 export interface ImportDataScopes {
   spacesAndPinned: boolean
+  openTabs?: boolean
+  sessions?: boolean
+  extensions?: boolean
   bookmarks: boolean
   history: boolean
+}
+
+export interface DetectedExtensionPreview {
+  id: string
+  name: string
+  version: string
+  description?: string
+  iconDataUrl?: string
+  profileDir: string
+  enabled: boolean
 }
 
 export interface DetectedBrowserProfileInfo {
   id: string
   name: string
+  profileDir?: string
+  profileName?: string
   emoji?: string
   accentColor?: string
   bookmarkCount?: number
   pinnedCount?: number
   favoriteCount?: number
+  openTabCount?: number
+  extensionCount?: number
   hasHistory?: boolean
+  hasSessionData?: boolean
 }
 
 export interface DetectedBrowserSource {
@@ -335,9 +471,14 @@ export interface DetectedBrowserSource {
   isCustomPath?: boolean
   profiles: DetectedBrowserProfileInfo[]
   spacesCount?: number
+  distinctProfilesCount?: number
   bookmarksEstimate: number
   pinnedEstimate: number
+  openTabsEstimate?: number
+  extensionsEstimate?: number
+  detectedExtensions?: DetectedExtensionPreview[]
   hasHistory: boolean
+  hasSessionData?: boolean
   supportsSpacesAndPinned: boolean
 }
 
@@ -347,19 +488,69 @@ export interface BrowserImportRequest {
   selectedProfileIds?: string[]
   scopes: ImportDataScopes
   createSpacesFromProfiles: boolean
+  replaceStarterSpaces?: boolean
+}
+
+export type ImportProgressStage =
+  | 'parsing'
+  | 'spaces'
+  | 'sessions'
+  | 'tabs'
+  | 'extensions'
+  | 'library'
+  | 'done'
+
+export interface BrowserImportProgressPayload {
+  stage: ImportProgressStage
+  percent: number
+  detail?: string
+  detailZh?: string
 }
 
 export interface BrowserImportResult {
   ok: boolean
   browserId: ImportBrowserId
   spacesCreated: number
+  profilesShared?: number
   favoritesImported: number
   pinnedTabsImported: number
+  openTabsImported?: number
   tabGroupsCreated: number
+  cookiesImported?: number
+  storageProfilesMigrated?: number
+  extensionsImported?: number
   bookmarksImported: number
   historyImported: number
+  importedSpaces?: Array<{
+    id: string
+    name: string
+    emoji: string
+    accentColor: string
+    profileLabel?: string
+  }>
   warnings?: string[]
   error?: string
+}
+
+export interface InstalledExtensionItem {
+  id: string
+  electronExtensionId?: string
+  sourceExtensionId?: string
+  name: string
+  description: string
+  version: string
+  manifestVersion: number
+  localPath: string
+  iconDataUrl?: string
+  popupPath?: string | null
+  optionsPath?: string | null
+  homepageUrl?: string | null
+  enabled: boolean
+  partitions: string[]
+  sourceBrowser?: ImportBrowserId
+  installedAt: number
+  isLoaded?: boolean
+  loadError?: string | null
 }
 
 export interface AgentToolStep {
@@ -544,6 +735,7 @@ export interface BrowserSnapshotState {
   aiSidebarOpen: boolean
   updateState?: AppUpdateState
   connectedTools?: ConnectedToolItem[]
+  extensions?: InstalledExtensionItem[]
   accountState?: ArkoAccountState
 }
 
@@ -573,6 +765,7 @@ export type ShortcutCommand =
   | 'open-settings'
   | 'open-account-settings'
   | 'open-connect-tools'
+  | 'open-extensions'
   | 'open-import-data'
   | 'open-skills-editor'
   | 'open-memory-settings'
@@ -601,7 +794,29 @@ export interface ArkoAPI {
   detectImportBrowsers: () => Promise<DetectedBrowserSource[]>
   pickCustomBrowserImportPath: (browserId: ImportBrowserId) => Promise<DetectedBrowserSource | null>
   executeBrowserImport: (request: BrowserImportRequest) => Promise<BrowserImportResult>
+  onImportProgress: (cb: (payload: BrowserImportProgressPayload) => void) => () => void
   completeOnboarding: () => Promise<AppSettings>
+  resetOnboardingState: () => Promise<BrowserSnapshotState>
+
+  // Browser Extensions Ecosystem
+  getExtensions: () => Promise<InstalledExtensionItem[]>
+  installUnpackedExtension: () => Promise<{
+    ok: boolean
+    extension?: InstalledExtensionItem
+    error?: string
+  }>
+  installWebStoreExtension: (urlOrId: string) => Promise<{
+    ok: boolean
+    extension?: InstalledExtensionItem
+    error?: string
+  }>
+  toggleExtension: (extensionId: string, enabled: boolean) => Promise<InstalledExtensionItem[]>
+  removeExtension: (extensionId: string) => Promise<InstalledExtensionItem[]>
+  openExtensionPopup: (
+    extensionId: string,
+    anchor?: { x: number; y: number }
+  ) => Promise<{ ok: boolean; openedTab?: boolean; error?: string }>
+  openExtensionOptions: (extensionId: string) => Promise<boolean>
 
   // Connected Tools (Zero-OAuth Browser Session Context)
   getConnectedTools: () => Promise<ConnectedToolItem[]>
@@ -667,6 +882,10 @@ export interface ArkoAPI {
     color: TabGroupColor,
     tabIds?: string[]
   ) => Promise<TabGroup>
+  updateTabGroup: (
+    groupId: string,
+    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed'>>
+  ) => Promise<TabGroup | null>
   assignTabToGroup: (tabId: string, groupId: string | null) => Promise<void>
   toggleTabGroupCollapsed: (groupId: string) => Promise<void>
   deleteTabGroup: (groupId: string) => Promise<void>
@@ -722,6 +941,14 @@ export interface ArkoAPI {
     error?: string
   }>
   redeemAccountCode: (code: string) => Promise<ArkoRedeemResult>
+  quoteTopUpAmount: (amount: number) => Promise<ArkoTopUpQuoteResult>
+  createTopUpQrOrder: (params: {
+    amount: number
+    paymentMethod: string
+    confirmedPayAmount: string
+  }) => Promise<ArkoTopUpCheckoutResult>
+  checkTopUpOrderStatus: (tradeNo: string) => Promise<ArkoTopUpOrderStatusResult>
+  purchaseSubscriptionWithBalance: (planId: number) => Promise<ArkoBalancePlanPurchaseResult>
   updateSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
   selectCodingWorkspace: () => Promise<string | null>
   clearCodingWorkspace: () => Promise<void>

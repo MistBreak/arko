@@ -12,6 +12,7 @@ import {
   Columns2,
   Copy,
   Download,
+  Folder,
   FolderKanban,
   Link2,
   Loader2,
@@ -32,12 +33,7 @@ import {
   VolumeX,
   X
 } from 'lucide-react'
-import {
-  isChatTabUrl,
-  isInternalArkoUrl,
-  NEW_TAB_URL,
-  TAB_GROUP_COLOR_STYLES
-} from '@shared/constants'
+import { isChatTabUrl, isInternalArkoUrl, NEW_TAB_URL } from '@shared/constants'
 import { tr } from '@shared/i18n'
 import { getArcSpaceTheme } from '@shared/space-theme'
 import type {
@@ -76,7 +72,7 @@ interface Props {
   accountState?: ArkoAccountState
   onSwitchLayout: () => void
   onToggleCompactBar: () => void
-  onOpenProfileMenu: (anchor: { x: number; y: number }) => void
+  onOpenProfileMenu: (anchor: { x: number; y: number }, mode?: 'menu' | 'edit') => void
   onCycleProfile?: (direction: 1 | -1) => void
   onSelectTab: (tabId: string) => void
   onCloseTab: (tabId: string) => void
@@ -163,7 +159,19 @@ function formatCalmSmartBar(
   }
 }
 
-export const HorizontalChrome: React.FC<Props> = ({
+function areChromePropsEqual(prev: Props, next: Props): boolean {
+  const keys = Object.keys(next) as Array<keyof Props>
+  if (Object.keys(prev).length !== keys.length) return false
+  for (const k of keys) {
+    const pv = prev[k]
+    const nv = next[k]
+    if (typeof pv === 'function' && typeof nv === 'function') continue
+    if (!Object.is(pv, nv)) return false
+  }
+  return true
+}
+
+const HorizontalChromeInner: React.FC<Props> = ({
   platform = 'darwin',
   isDark,
   lang,
@@ -279,7 +287,6 @@ export const HorizontalChrome: React.FC<Props> = ({
     if (grp && !renderedGroupIds.has(grp.id)) {
       renderedGroupIds.add(grp.id)
       const countInGroup = normalTabs.filter((t) => t.groupId === grp.id).length
-      const style = TAB_GROUP_COLOR_STYLES[grp.color]
       tabStripNodes.push(
         <button
           key={`grp-pill-${grp.id}`}
@@ -290,9 +297,13 @@ export const HorizontalChrome: React.FC<Props> = ({
             `${grp.title} (${countInGroup} tabs · Click to collapse/expand)`,
             `${grp.title} (${countInGroup} 个标签 · 点击折叠/展开)`
           )}
-          className={`app-no-drag h-[26px] px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 shrink-0 transition ${style.badgeBg} ${style.badgeText}`}
+          className={`app-no-drag h-[26px] px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 shrink-0 transition ${
+            isDark
+              ? 'bg-white/[0.06] border-white/10 text-zinc-300'
+              : 'bg-black/[0.04] border-black/[0.08] text-zinc-600'
+          }`}
         >
-          <span className={`w-1.5 h-1.5 rounded-full ${style.dot}`} />
+          <Folder size={12} strokeWidth={1.75} className="opacity-60 shrink-0" />
           <span className="max-w-[96px] truncate">{grp.title}</span>
           <span className="opacity-65 text-[10px]">{countInGroup}</span>
           {grp.collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
@@ -300,7 +311,11 @@ export const HorizontalChrome: React.FC<Props> = ({
       )
     }
 
-    if (grp && grp.collapsed && tab.id !== activeTab?.id) {
+    const isKeptInCollapsedGroup =
+      tab.id === activeTab?.id ||
+      (splitView.enabled &&
+        (tab.id === splitView.leftTabId || tab.id === splitView.rightTabId))
+    if (grp && grp.collapsed && !isKeptInCollapsedGroup) {
       continue
     }
 
@@ -389,8 +404,9 @@ export const HorizontalChrome: React.FC<Props> = ({
       >
         {grp ? (
           <span
-            className="absolute left-2 right-2 bottom-0 h-[2px] rounded-full opacity-80"
-            style={{ backgroundColor: TAB_GROUP_COLOR_STYLES[grp.color].hex }}
+            className={`absolute left-2 right-2 bottom-0 h-[2px] rounded-full ${
+              isDark ? 'bg-white/28' : 'bg-zinc-400/80'
+            }`}
           />
         ) : isActive ? (
           <span
@@ -468,8 +484,8 @@ export const HorizontalChrome: React.FC<Props> = ({
     >
       {/* Row 1 */}
       <div
-        className={`app-drag h-[39px] flex items-center gap-1.5 ${
-          platform === 'darwin' ? 'pl-[78px] pr-2.5' : 'pl-2.5 pr-[142px]'
+        className={`app-drag h-[44px] flex items-center gap-1.5 ${
+          platform === 'darwin' ? 'pl-[86px] pr-2.5' : 'pl-2.5 pr-[142px]'
         }`}
       >
         <button
@@ -504,7 +520,12 @@ export const HorizontalChrome: React.FC<Props> = ({
         <button
           onClick={(e) => {
             const rect = e.currentTarget.getBoundingClientRect()
-            onOpenProfileMenu({ x: rect.left, y: rect.bottom + 6 })
+            onOpenProfileMenu({ x: Math.max(8, rect.left - 2), y: rect.bottom + 5 }, 'menu')
+          }}
+          onContextMenu={(e) => {
+            e.preventDefault()
+            const rect = e.currentTarget.getBoundingClientRect()
+            onOpenProfileMenu({ x: Math.max(8, rect.left - 2), y: rect.bottom + 5 }, 'edit')
           }}
           onWheel={(e) => {
             if (!onCycleProfile) return
@@ -518,26 +539,25 @@ export const HorizontalChrome: React.FC<Props> = ({
           }}
           title={tr(
             lang,
-            'Switch Space (click or two-finger swipe · ⌃⌥←/→)',
-            '切换物理隔离空间 (点击选择或触控板双指左右滑动 · ⌃⌥←/→)'
+            `${activeProfile.name} — Click to switch Profile · Right-click for Profile Settings`,
+            `${activeProfile.name} — 点击切换个人资料 · 右键打开资料设置`
           )}
-          style={{
-            backgroundColor: spaceTheme.spaceBadgeBg,
-            borderColor: spaceTheme.spaceBadgeBorder
-          }}
-          className={`app-no-drag flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold transition border shrink-0 hover:brightness-105 ${
-            isDark ? 'text-zinc-100' : 'text-zinc-800 shadow-2xs'
+          className={`app-no-drag arc-pressable flex items-center gap-1.5 h-[26px] px-2.5 rounded-[8.5px] text-[12.5px] font-medium tracking-[-0.01em] shrink-0 ${
+            isDark
+              ? 'bg-white/[0.065] text-zinc-100/90 hover:bg-white/[0.125] hover:text-white'
+              : 'bg-black/[0.045] text-zinc-800 hover:bg-black/[0.085] hover:text-zinc-950'
           }`}
         >
-          <span>{activeProfile.emoji}</span>
-          {!compactTopBar && <span className="max-w-[76px] truncate">{activeProfile.name}</span>}
           <span
             className="w-2 h-2 rounded-full shrink-0"
             style={{
               backgroundColor: spaceTheme.accentHex,
-              boxShadow: `0 0 6px rgba(${spaceTheme.rgbString}, 0.55)`
+              boxShadow: isDark
+                ? 'inset 0 0 0 1px rgba(255, 255, 255, 0.28)'
+                : 'inset 0 0 0 1px rgba(0, 0, 0, 0.14)'
             }}
           />
+          {!compactTopBar && <span className="max-w-[84px] truncate">{activeProfile.name}</span>}
         </button>
 
         {compactTopBar && (
@@ -1109,7 +1129,11 @@ export const HorizontalChrome: React.FC<Props> = ({
                 onClick={onOpenAccount}
                 title={
                   accountState?.authenticated && accountState.user
-                    ? `${accountState.user.email || accountState.user.username} · $${(accountState.user.remainingUsd ?? 0).toFixed(2)}`
+                    ? `${accountState.user.email || accountState.user.username} · ${
+                        accountState.user.effectiveUnlimited
+                          ? '∞'
+                          : `$${(accountState.user.remainingUsd ?? 0).toFixed(2)}`
+                      }`
                     : tr(lang, 'Sign in to Arko Account', '登录 / 注册 Arko 账号')
                 }
                 className={`relative p-1.5 rounded-lg transition ${
@@ -1161,3 +1185,5 @@ export const HorizontalChrome: React.FC<Props> = ({
     </header>
   )
 }
+
+export const HorizontalChrome = React.memo(HorizontalChromeInner, areChromePropsEqual)

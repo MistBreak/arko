@@ -623,10 +623,17 @@ export async function fetchConnectedToolContext(params: {
       hiddenWin.webContents.setUserAgent(userAgent)
     }
 
-    await Promise.race([
-      hiddenWin.loadURL(targetUrl),
-      new Promise<void>((resolve) => setTimeout(resolve, 9500))
-    ])
+    let loadTimer: NodeJS.Timeout | null = null
+    try {
+      await Promise.race([
+        hiddenWin.loadURL(targetUrl).catch(() => {}),
+        new Promise<void>((resolve) => {
+          loadTimer = setTimeout(resolve, 9500)
+        })
+      ])
+    } finally {
+      if (loadTimer) clearTimeout(loadTimer)
+    }
 
     await waitForWebContentsSettle(hiddenWin.webContents, 4200, 650)
 

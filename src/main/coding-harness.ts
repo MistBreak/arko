@@ -390,11 +390,12 @@ export async function runCrossPlatformCommand(params: {
       windowsHide: true
     })
 
+    let killTimer: NodeJS.Timeout | null = null
     const timer = setTimeout(() => {
       timedOut = true
       try {
         child.kill('SIGTERM')
-        setTimeout(() => {
+        killTimer = setTimeout(() => {
           try {
             child.kill('SIGKILL')
           } catch {}
@@ -418,6 +419,7 @@ export async function runCrossPlatformCommand(params: {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
       resolve({ exitCode: 1, stdout, stderr: `${stderr}\n${err.message}`.trim(), timedOut })
     })
 
@@ -425,6 +427,7 @@ export async function runCrossPlatformCommand(params: {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
       resolve({ exitCode: code, stdout, stderr, timedOut })
     })
   })

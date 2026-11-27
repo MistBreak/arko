@@ -27,6 +27,7 @@ import { AppIcon } from './AppIcon'
 
 interface Props {
   isDark: boolean
+  isClosing?: boolean
   mode: 'onboarding' | 'standalone'
   settings: AppSettings
   onUpdateSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
@@ -118,6 +119,7 @@ const BrowserBrandLogo: React.FC<{ id: ImportBrowserId; size?: number }> = ({
 
 export const OnboardingImportModal: React.FC<Props> = ({
   isDark,
+  isClosing = false,
   mode,
   settings,
   onUpdateSettings,
@@ -311,11 +313,15 @@ export const OnboardingImportModal: React.FC<Props> = ({
       onClick={() => {
         if (!isOnboarding && !importing) onClose()
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4 select-none"
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-md p-4 select-none ${
+        isClosing ? 'arc-backdrop-exit' : 'arc-backdrop-enter'
+      }`}
     >
       <div
         onClick={(e) => e.stopPropagation()}
         className={`w-full max-w-[780px] max-h-[90vh] rounded-3xl border shadow-2xl flex flex-col overflow-hidden transition-all ${
+          isClosing ? 'arc-modal-exit' : 'arc-modal-enter'
+        } ${
           isDark
             ? 'bg-[#191920] border-white/12 text-zinc-100'
             : 'bg-[#FAF9F6] border-black/10 text-zinc-900'
@@ -679,6 +685,15 @@ export const OnboardingImportModal: React.FC<Props> = ({
                                 key={prof.id}
                                 type="button"
                                 onClick={() => toggleProfileSelection(prof.id)}
+                                title={
+                                  selectedBrowserId === 'arc' && prof.profileName
+                                    ? tr(
+                                        lang,
+                                        `Arc Space "${prof.name}" · Bound to Profile "${prof.profileName}"`,
+                                        `Arc 空间「${prof.name}」· 关联底层配置 Profile: ${prof.profileName}`
+                                      )
+                                    : prof.name
+                                }
                                 className={`h-8 px-3 rounded-xl border text-xs inline-flex items-center gap-2 transition cursor-pointer ${
                                   checked
                                     ? isDark
@@ -700,6 +715,17 @@ export const OnboardingImportModal: React.FC<Props> = ({
                                 </span>
                                 <span>{prof.emoji || '🌐'}</span>
                                 <span className="truncate max-w-[150px]">{prof.name}</span>
+                                {selectedBrowserId === 'arc' && prof.profileName && (
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-normal ${
+                                      isDark
+                                        ? 'bg-white/8 text-zinc-300'
+                                        : 'bg-black/[0.05] text-zinc-600'
+                                    }`}
+                                  >
+                                    {prof.profileName}
+                                  </span>
+                                )}
                                 {countBadge > 0 && (
                                   <span className="text-[10px] opacity-55">({countBadge})</span>
                                 )}

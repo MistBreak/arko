@@ -26,6 +26,7 @@ if (typeof window !== 'undefined' && window === window.top) {
   let currentSelectedText = ''
   let activeEditableEl: HTMLElement | null = null
   let selectionTimer: ReturnType<typeof setTimeout> | null = null
+  let scrollRafId: number | null = null
   const buttonElsById = new Map<string, HTMLButtonElement>()
 
   const getLabels = () => {
@@ -355,7 +356,12 @@ if (typeof window !== 'undefined' && window === window.top) {
       hideInputBadge()
       return
     }
-    if (!document.contains(activeEditableEl) || !ensureOverlayMounted() || !inputBadgeEl) {
+    if (!document.contains(activeEditableEl)) {
+      activeEditableEl = null
+      hideInputBadge()
+      return
+    }
+    if (!ensureOverlayMounted() || !inputBadgeEl) {
       hideInputBadge()
       return
     }
@@ -425,7 +431,7 @@ if (typeof window !== 'undefined' && window === window.top) {
       if (selectionTimer) clearTimeout(selectionTimer)
       selectionTimer = setTimeout(evaluateSelection, 75)
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
@@ -436,7 +442,7 @@ if (typeof window !== 'undefined' && window === window.top) {
         selectionTimer = setTimeout(evaluateSelection, 90)
       }
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
@@ -445,16 +451,21 @@ if (typeof window !== 'undefined' && window === window.top) {
       if (hostEl && e.target === hostEl) return
       hideSelectionBar()
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
     'scroll',
     () => {
       hideSelectionBar()
-      if (activeEditableEl) updateInputBadgePosition()
+      if (activeEditableEl && scrollRafId === null) {
+        scrollRafId = window.requestAnimationFrame(() => {
+          scrollRafId = null
+          updateInputBadgePosition()
+        })
+      }
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
@@ -467,7 +478,7 @@ if (typeof window !== 'undefined' && window === window.top) {
         hideSelectionBar()
       }
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
@@ -482,7 +493,7 @@ if (typeof window !== 'undefined' && window === window.top) {
         hideInputBadge()
       }
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
@@ -495,7 +506,24 @@ if (typeof window !== 'undefined' && window === window.top) {
         }
       }, 120)
     },
-    true
+    { capture: true, passive: true }
+  )
+
+  window.addEventListener(
+    'pagehide',
+    () => {
+      activeEditableEl = null
+      currentSelectedText = ''
+      if (selectionTimer) {
+        clearTimeout(selectionTimer)
+        selectionTimer = null
+      }
+      if (scrollRafId !== null) {
+        window.cancelAnimationFrame(scrollRafId)
+        scrollRafId = null
+      }
+    },
+    { capture: true, passive: true }
   )
 
   ipcRenderer.on('arko-web:config', (_e, nextConfig: Partial<WebOverlayConfig>) => {
@@ -538,7 +566,7 @@ if (typeof window !== 'undefined' && window === window.top) {
         })
       }
     },
-    true
+    { capture: true, passive: true }
   )
 
   window.addEventListener(
@@ -546,6 +574,6 @@ if (typeof window !== 'undefined' && window === window.top) {
     () => {
       ipcRenderer.send('arko-web:link-drag-state', null)
     },
-    true
+    { capture: true, passive: true }
   )
 }

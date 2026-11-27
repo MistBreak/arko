@@ -212,7 +212,8 @@ export async function inspectEditableAndForms(params: {
           selectedText = val.slice(selStart, selEnd).slice(0, 3000);
           surroundingValue = val.slice(0, 4000);
           window.__diaInlineTarget = {
-            el,
+            elRef: typeof WeakRef === 'function' ? new WeakRef(el) : null,
+            el: typeof WeakRef === 'function' ? null : el,
             kind,
             selStart,
             selEnd,
@@ -240,7 +241,8 @@ export async function inspectEditableAndForms(params: {
             }
           }
           window.__diaInlineTarget = {
-            el,
+            elRef: typeof WeakRef === 'function' ? new WeakRef(el) : null,
+            el: typeof WeakRef === 'function' ? null : el,
             kind: 'contenteditable',
             selStart: 0,
             selEnd: 0,
@@ -275,7 +277,7 @@ export async function inspectEditableAndForms(params: {
         if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
 
         const fieldId = 'field-' + (formFields.length + 1);
-        formFieldMap[fieldId] = ctrl;
+        formFieldMap[fieldId] = typeof WeakRef === 'function' ? new WeakRef(ctrl) : ctrl;
 
         let options = undefined;
         if (tag === 'select') {
@@ -409,11 +411,12 @@ export async function injectInlineWriteText(params: {
     try {
       const { text, mode } = ${payloadJson};
       const target = window.__diaInlineTarget;
-      if (!target || !target.el || !document.contains(target.el)) {
+      const el = target ? (target.elRef && typeof target.elRef.deref === 'function' ? target.elRef.deref() : target.el) : null;
+      if (!target || !el || !document.contains(el)) {
+        if (target) target.savedRange = null;
         return false;
       }
 
-      const el = target.el;
       el.focus({ preventScroll: true });
 
       const flashHighlight = (node) => {
@@ -563,7 +566,8 @@ export async function applyWebFormFills(params: {
       let firstEl = null;
 
       for (const item of fills) {
-        const el = map[item.fieldId];
+        const rawEntry = map[item.fieldId];
+        const el = rawEntry && typeof rawEntry.deref === 'function' ? rawEntry.deref() : rawEntry;
         if (!el || !document.contains(el) || el.disabled || el.readOnly) continue;
         const tag = el.tagName.toLowerCase();
         const val = String(item.value ?? '');

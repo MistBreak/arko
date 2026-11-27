@@ -764,6 +764,7 @@ export const ChatTabView: React.FC<Props> = ({
                     <ChatMarkdown
                       content={msg.content}
                       lang={lang}
+                      isStreaming={Boolean(msg.isStreaming)}
                       onOpenLink={onSwitchToTabUrl}
                       onClickCitation={onJumpCitationTitle}
                     />

@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import {
   Columns2,
   Copy,
+  Folder,
   FolderPlus,
   Pin,
   PinOff,
@@ -13,7 +14,6 @@ import {
   X,
   XCircle
 } from 'lucide-react'
-import { TAB_GROUP_COLOR_STYLES } from '@shared/constants'
 import { tr } from '@shared/i18n'
 import type { AppLanguage, TabGroup, TabGroupColor, TabPinMode, TabState } from '@shared/types'
 
@@ -36,8 +36,6 @@ interface Props {
   onCloseMenu: () => void
 }
 
-const COLOR_KEYS: TabGroupColor[] = ['indigo', 'emerald', 'amber', 'rose', 'sky', 'violet']
-
 export const TabContextMenu: React.FC<Props> = ({
   isDark,
   lang,
@@ -58,7 +56,6 @@ export const TabContextMenu: React.FC<Props> = ({
 }) => {
   const [creatingGroup, setCreatingGroup] = useState(false)
   const [groupTitle, setGroupTitle] = useState('')
-  const [groupColor, setGroupColor] = useState<TabGroupColor>('indigo')
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
@@ -250,9 +247,7 @@ export const TabContextMenu: React.FC<Props> = ({
                   }`}
                 >
                   <span className="flex items-center gap-2 truncate">
-                    <span
-                      className={`w-2 h-2 rounded-full ${TAB_GROUP_COLOR_STYLES[g.color].dot}`}
-                    />
+                    <Folder size={12} strokeWidth={1.75} className="opacity-55 shrink-0" />
                     <span className="truncate">{g.title}</span>
                   </span>
                   {inThisGroup && (
@@ -278,7 +273,7 @@ export const TabContextMenu: React.FC<Props> = ({
                 onSubmit={(e) => {
                   e.preventDefault()
                   if (!groupTitle.trim()) return
-                  onCreateGroupWithTab(groupTitle.trim(), groupColor, tab.id)
+                  onCreateGroupWithTab(groupTitle.trim(), 'indigo', tab.id)
                   onCloseMenu()
                 }}
                 className="p-2 space-y-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.04]"
@@ -292,19 +287,7 @@ export const TabContextMenu: React.FC<Props> = ({
                     isDark ? 'bg-[#16161C] border-white/12' : 'bg-white border-black/12'
                   }`}
                 />
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1">
-                    {COLOR_KEYS.map((c) => (
-                      <button
-                        key={c}
-                        type="button"
-                        onClick={() => setGroupColor(c)}
-                        className={`w-4 h-4 rounded-full ${TAB_GROUP_COLOR_STYLES[c].dot} ${
-                          groupColor === c ? 'ring-2 ring-offset-1 ring-indigo-500' : 'opacity-65'
-                        }`}
-                      />
-                    ))}
-                  </div>
+                <div className="flex items-center justify-end">
                   <button
                     type="submit"
                     className="px-2 py-0.5 rounded-md bg-indigo-600 text-white text-[11px] font-medium"

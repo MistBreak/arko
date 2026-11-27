@@ -1,6 +1,6 @@
 # Arko
 
-**The open-source, Chromium-based Arc alternative — supercharged with native AI.**
+**The open-source, region-free Chromium browser — uniting Arc's spatial workflow with Dia-style native AI.**
 
 English | [简体中文](./README.zh-CN.md)
 
@@ -13,14 +13,16 @@ English | [简体中文](./README.zh-CN.md)
 
 ## Why Arko?
 
-**Arc** changed how we live on the web — introducing Spaces, a 3-tier vertical sidebar (`Favorites`, `Pinned`, `Today`), effortless Split View, and a calm, distraction-free frame. Yet Arc moved into maintenance mode as a closed-source product, while most open-source alternatives rely on Firefox engines rather than Chromium.
+**Arc** changed how we live on the web — introducing Spaces, a 3-tier vertical sidebar (`Favorites`, `Pinned`, `Today`), effortless Split View, and a calm, distraction-free frame.
 
-**Arko** (*"Arc"* in Esperanto) brings that beloved **spatial Chromium browsing experience** into the open, enhanced with a **local-first, Bring-Your-Own-Key (BYOK) AI workspace**:
+Now, **Arc is preparing to sunset** as official focus shifts to **Dia**. Yet **Dia is unavailable in many regions** due to regional and account restrictions — leaving countless users stranded between a disappearing browser they love, an AI successor they cannot access, and open-source alternatives mostly built on Firefox rather than Chromium.
 
+**That is why Arko exists.** **Arko** (*"Arc"* in Esperanto) brings **Arc's spatial Chromium experience** and **Dia-inspired native AI** together into an **open-source, local-first browser that works everywhere**:
+
+- **Zero Region Locks & Native BYOK AI**: No mandatory cloud sign-in, waitlist, or geo-restricted account. Connect **OpenAI**, **Anthropic Claude**, **Google Gemini**, **Local Ollama**, or any compatible API gateway — full control wherever you live.
+- **1-Click Migration Before Arc Sunsets**: Losslessly import your **Arc Spaces (`StorableSidebar.json`)**, Favorites grid, Pinned tabs & folders, plus **Dia** and **Chrome** profiles, Bookmarks, and History on first launch — even while your source browser is actively running.
 - **True Chromium Engine**: Built on Electron `WebContentsView` for full Chromium rendering speed, DevTools parity, and modern web compatibility.
-- **1-Click Migration from Arc, Dia & Chrome**: Losslessly import your **Arc Spaces (`StorableSidebar.json`)**, Favorites grid, Pinned tabs & folders, Chrome profiles, Bookmarks, and History on first launch — even while your source browser is actively running.
-- **Arc Spatial Workflow**: Adaptive `Favorites` icon grid, per-Space `Pinned` tabs with origin restore, ephemeral `Today` tabs, two-finger trackpad Space swiping, and drag-to-Split-View.
-- **Native BYOK AI (Zero Lock-In)**: Connect **OpenAI**, **Anthropic Claude**, **Google Gemini**, **Local Ollama**, or any compatible API gateway — no mandatory cloud account or subscription.
+- **Arc Spatial Workflow × Dia-Style AI**: Adaptive `Favorites` icon grid, per-Space `Pinned` tabs with origin restore, ephemeral `Today` tabs, two-finger Space swiping, and Split View — paired with `@` multi-tab context, `arko://chat/` tabs, `⌘J` inline writing, and an autonomous agent.
 - **One-Click In-App Updates**: Background release checks against `MistBreak/arko` with single-click download, install, and restart across macOS, Windows, and Linux.
 - **Bilingual Out of the Box**: Clean **English** UI by default with instant real-time switching to **Simplified Chinese (`简体中文`)**.
 

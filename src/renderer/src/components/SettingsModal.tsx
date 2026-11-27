@@ -86,6 +86,8 @@ interface Props {
   onDeleteMemory: (id: string) => Promise<void>
   onNavigateInBrowser: (url: string) => void
   onTrySkill?: (command: string) => void
+  onOpenBrowserImport?: () => void
+  onResetOnboarding?: () => Promise<void>
   onCheckUpdates?: () => Promise<void>
   onDownloadUpdate?: () => Promise<void>
   onInstallUpdate?: () => Promise<void>
@@ -118,6 +120,8 @@ export const SettingsModal: React.FC<Props> = ({
   onDeleteMemory,
   onNavigateInBrowser,
   onTrySkill,
+  onOpenBrowserImport,
+  onResetOnboarding,
   onCheckUpdates,
   onDownloadUpdate,
   onInstallUpdate,
@@ -519,7 +523,7 @@ export const SettingsModal: React.FC<Props> = ({
   }
 
   const navBtnCls = (active: boolean): string =>
-    `w-full flex items-center justify-between gap-2 px-3 py-2 rounded-[10px] text-[13.5px] font-medium tracking-[-0.01em] transition ${
+    `shrink-0 md:w-full flex items-center justify-between gap-2 px-3 py-1.5 md:py-2 rounded-[10px] text-[13px] md:text-[13.5px] font-medium tracking-[-0.01em] transition ${
       active
         ? 'bg-indigo-600 text-white shadow-2xs'
         : isDark
@@ -530,13 +534,13 @@ export const SettingsModal: React.FC<Props> = ({
   return (
     <div
       onClick={onClose}
-      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/36 backdrop-blur-sm p-5 ${
+      className={`fixed inset-0 z-50 flex items-center justify-center bg-black/36 backdrop-blur-sm p-2 sm:p-5 ${
         isClosing ? 'arc-backdrop-exit' : 'arc-backdrop-enter'
       }`}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className={`w-full max-w-[940px] h-[min(696px,calc(100vh-40px))] rounded-[18px] border shadow-2xl flex overflow-hidden ${
+        className={`w-full max-w-[940px] h-[min(696px,calc(100vh-16px))] sm:h-[min(696px,calc(100vh-40px))] rounded-[18px] border shadow-2xl flex flex-col md:flex-row overflow-hidden ${
           isClosing ? 'arc-modal-exit' : 'arc-modal-enter'
         } ${
           isDark
@@ -544,16 +548,16 @@ export const SettingsModal: React.FC<Props> = ({
             : 'bg-white border-black/[0.09] text-zinc-900'
         }`}
       >
-        {/* Left Navigation Rail (Dia-inspired proportions & spacing) */}
+        {/* 左侧/顶部自适应导航栏（桌面端固定宽侧栏，窄屏转为横向可滚动页签条） */}
         <div
-          className={`w-[244px] shrink-0 px-3.5 py-4 border-r flex flex-col gap-1 ${
+          className={`w-full md:w-[244px] shrink-0 px-3 py-2.5 md:px-3.5 md:py-4 border-b md:border-b-0 md:border-r flex flex-col gap-2 md:gap-1 ${
             isDark ? 'bg-[#16161A] border-white/[0.07]' : 'bg-[#F6F6F8] border-black/[0.06]'
           }`}
         >
-          <div className="px-2 pb-3.5 pt-0.5 flex items-center justify-between gap-2">
-            <div className="font-semibold text-[14px] tracking-[-0.01em] flex items-center gap-2 whitespace-nowrap shrink-0">
+          <div className="px-1 md:px-2 pb-0.5 md:pb-3.5 pt-0.5 flex flex-row md:flex-col items-center md:items-start justify-between gap-2.5">
+            <div className="font-semibold text-[14px] tracking-[-0.01em] flex items-center gap-2 min-w-0 max-w-full">
               <Sparkles size={15} className="text-indigo-500 shrink-0" />
-              <span>{tr(lang, 'Arko Settings', 'Arko 设置')}</span>
+              <span className="truncate">{tr(lang, 'Arko Settings', 'Arko 设置')}</span>
             </div>
 
             <button
@@ -562,21 +566,22 @@ export const SettingsModal: React.FC<Props> = ({
                 void onUpdateSettings({ language: lang === 'zh-CN' ? 'en' : 'zh-CN' })
               }
               title={tr(lang, 'Switch UI Language', '切换界面语言')}
-              className={`h-6 px-2.5 rounded-full text-[11px] font-medium inline-flex items-center gap-1 border shrink-0 whitespace-nowrap transition ${
+              className={`h-7 px-3 rounded-full text-[12px] leading-none font-medium inline-flex items-center gap-1.5 border whitespace-nowrap transition shrink-0 ${
                 isDark
                   ? 'border-white/12 bg-white/[0.05] hover:bg-white/[0.11] text-zinc-300'
                   : 'border-black/10 bg-white hover:bg-zinc-100 text-zinc-700 shadow-2xs'
               }`}
             >
-              <Globe size={11} className="shrink-0 opacity-80" />
-              <span>{lang === 'zh-CN' ? 'EN' : '中文'}</span>
+              <Globe size={13} className="shrink-0 opacity-80" />
+              <span className="whitespace-nowrap">{lang === 'zh-CN' ? 'English' : '中文'}</span>
             </button>
           </div>
 
-          <button
-            onClick={() => selectTab('account')}
-            className={navBtnCls(tab === 'account')}
-          >
+          <div className="flex flex-row md:flex-col gap-1 overflow-x-auto md:overflow-visible pb-0.5 md:pb-0">
+            <button
+              onClick={() => selectTab('account')}
+              className={navBtnCls(tab === 'account')}
+            >
             <span className="flex items-center gap-2.5 min-w-0">
               {accountState?.authenticated ? (
                 <UserCheck
@@ -745,8 +750,9 @@ export const SettingsModal: React.FC<Props> = ({
               </span>
             )}
           </button>
+          </div>
 
-          <div className="mt-auto pt-3 text-[11px] opacity-40 px-2 leading-[1.65] space-y-0.5 select-none">
+          <div className="hidden md:block mt-auto pt-3 text-[11px] opacity-40 px-2 leading-[1.65] space-y-0.5 select-none">
             <div className="truncate">{tr(lang, '⌘E Sidebar · ⌘L Command Bar', '⌘E 开关侧栏 · ⌘L 智能栏')}</div>
             <div className="truncate">{tr(lang, '⇧⌘R Reader · ⇧⌘T Reopen Tab', '⇧⌘R 阅读视图 · ⇧⌘T 恢复标签')}</div>
             <div className="truncate">{tr(lang, '⌘⇧\\ Split View · ⇧⌘S Focus', '⌘⇧\\ 左右分屏 · ⇧⌘S 极简沉浸')}</div>
@@ -754,11 +760,11 @@ export const SettingsModal: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Main Content Area */}
-        <div className="flex-1 flex flex-col min-w-0">
-          {/* Dia-style Top Header Bar with Back/Forward Capsule & Concise Section Title */}
+        {/* 主内容区域（min-h-0 保证窄屏纵向布局下内部面板独立纵向滚动） */}
+        <div className="flex-1 flex flex-col min-w-0 min-h-0">
+          {/* 顶部导航条 */}
           <div
-            className={`h-[56px] px-7 border-b flex items-center justify-between gap-4 shrink-0 ${
+            className={`h-[48px] md:h-[56px] px-4 md:px-7 border-b flex items-center justify-between gap-2 md:gap-4 shrink-0 ${
               isDark ? 'border-white/[0.07]' : 'border-black/[0.06]'
             }`}
           >
@@ -1765,6 +1771,72 @@ export const SettingsModal: React.FC<Props> = ({
               <p className="text-[13px] leading-relaxed opacity-60 -mb-0.5">
                 {tabMeta.general.description}
               </p>
+              <div
+                className={`p-4 rounded-2xl border flex items-center justify-between gap-4 ${
+                  isDark
+                    ? 'bg-indigo-500/[0.06] border-indigo-500/25'
+                    : 'bg-indigo-50/60 border-indigo-200/80'
+                }`}
+              >
+                <div className="space-y-1 min-w-0">
+                  <div className="font-semibold flex items-center gap-1.5">
+                    <Sparkles size={14} className="text-indigo-500 shrink-0" />
+                    <span>
+                      {tr(
+                        lang,
+                        'Import Data from Arc, Dia, or Google Chrome',
+                        '从 Arc、Dia 或 Chrome 导入数据 / 初始化引导'
+                      )}
+                    </span>
+                  </div>
+                  <div className="opacity-65 text-xs leading-relaxed">
+                    {tr(
+                      lang,
+                      'Migrate Spaces, Top Favorites, Pinned Folders, Bookmarks, and History anytime — or reset to re-run first-launch onboarding.',
+                      '一键迁移 Arc 空间、顶部常驻图标、固定标签文件夹、书签与历史记录，或重置回到初次启动状态重新体验。'
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {onResetOnboarding && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const ok = window.confirm(
+                          tr(
+                            lang,
+                            'Reset Spaces, tabs, bookmarks, and history to initial defaults and re-open First-Launch Setup? (Your AI models & keys will be kept.)',
+                            '确认将空间、标签页、书签与历史重置为初始空白状态，并重新打开初次启动导入向导？（已配置的 AI 模型与密钥会保留）'
+                          )
+                        )
+                        if (ok) {
+                          void onResetOnboarding()
+                        }
+                      }}
+                      className={`h-9 px-3 rounded-xl border text-xs font-medium inline-flex items-center gap-1.5 transition cursor-pointer ${
+                        isDark
+                          ? 'border-white/12 hover:bg-white/8 text-zinc-300'
+                          : 'bg-white border-black/10 hover:bg-zinc-100 text-zinc-700'
+                      }`}
+                    >
+                      <RefreshCw size={12} />
+                      <span>{tr(lang, 'Reset Onboarding', '初始化重来')}</span>
+                    </button>
+                  )}
+                  {onOpenBrowserImport && (
+                    <button
+                      type="button"
+                      onClick={onOpenBrowserImport}
+                      className="h-9 px-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow-2xs transition cursor-pointer"
+                    >
+                      <Download size={12.5} />
+                      <span>{tr(lang, 'Import Browser Data…', '导入浏览器数据…')}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-1.5">
                   <label className="font-semibold opacity-75">

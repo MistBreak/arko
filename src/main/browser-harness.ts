@@ -895,7 +895,7 @@ export async function inspectPageInteractiveElements(params: {
       for (const item of chosen) {
         const { el, rect, tag, type, role, label, href, ph } = item;
         const refId = 'e' + (lines.length + 1);
-        refMap[refId] = el;
+        refMap[refId] = typeof WeakRef === 'function' ? new WeakRef(el) : el;
 
         const typeSuffix = type ? ':' + type : role && role !== tag ? ':' + role : '';
         let desc = '[' + refId + '] <' + tag + typeSuffix + '>';
@@ -1277,7 +1277,8 @@ export async function executePageInteraction(params: {
     if (cleanRef) {
       const focusScript = `
       (() => {
-        const el = (window.__diaHarnessElements || {})[${JSON.stringify(cleanRef)}];
+        const rawEntry = (window.__diaHarnessElements || {})[${JSON.stringify(cleanRef)}];
+        const el = rawEntry && typeof rawEntry.deref === 'function' ? rawEntry.deref() : rawEntry;
         if (el && document.contains(el)) {
           const meta = [el.getAttribute('name') || '', el.getAttribute('id') || '', el.getAttribute('type') || ''].join(' ');
           if (/(password|passwd|passcode|cvv|cvc|cc-number|totp|otp)/i.test(meta)) return { blocked: true };
@@ -1377,7 +1378,8 @@ export async function executePageInteraction(params: {
 
       if (payload.action === 'scroll') {
         const map = window.__diaHarnessElements || {};
-        const targetEl = payload.ref ? map[payload.ref] : null;
+        const rawTarget = payload.ref ? map[payload.ref] : null;
+        const targetEl = rawTarget && typeof rawTarget.deref === 'function' ? rawTarget.deref() : rawTarget;
         if (targetEl && document.contains(targetEl) && targetEl.scrollHeight > targetEl.clientHeight + 20) {
           const step = Math.round(targetEl.clientHeight * 0.78);
           if (payload.scrollDirection === 'top') targetEl.scrollTop = 0;
@@ -1416,7 +1418,8 @@ export async function executePageInteraction(params: {
       }
 
       const map = window.__diaHarnessElements || {};
-      const el = map[payload.ref];
+      const rawEntry = map[payload.ref];
+      const el = rawEntry && typeof rawEntry.deref === 'function' ? rawEntry.deref() : rawEntry;
       if (!el || !document.contains(el)) {
         return {
           ok: false,
