@@ -62,8 +62,13 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" = "macOS" ] && [ -z "$CSC_LINK" ]; then
+          for var in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            # electron-builder treats an empty CSC_LINK as a path and fails with "not a file"
+            if [ -z "${!var}" ]; then unset "$var"; fi
+          done
+          if [ "${{ runner.os }}" = "macOS" ] && [ -z "${CSC_LINK:-}" ]; then
             export CSC_IDENTITY_AUTO_DISCOVERY=false
           fi
           pnpm exec electron-builder ${{ matrix.platform_flag }} --publish always
