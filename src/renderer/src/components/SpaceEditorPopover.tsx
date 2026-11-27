@@ -328,6 +328,16 @@ export const SpaceEditorPopover: React.FC<Props> = ({
                     {p.name}
                   </span>
 
+                  {p.profileLabel && p.profileLabel.toLowerCase() !== p.name.trim().toLowerCase() && (
+                    <span
+                      className={`shrink-0 px-1.5 py-0.2 rounded text-[10px] max-w-[68px] truncate ${
+                        isDark ? 'bg-white/[0.08] text-zinc-300' : 'bg-black/[0.05] text-zinc-600'
+                      }`}
+                    >
+                      {p.profileLabel}
+                    </span>
+                  )}
+
                   {shortcutHint && (
                     <span
                       className={`shrink-0 text-[12px] tabular-nums tracking-tight pl-2 ${

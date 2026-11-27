@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppUpdateState,
   ArkoAPI,
+  BrowserImportProgressPayload,
   BrowserSnapshotState,
   FindInPageResultPayload,
   InlineEditableTargetInfo,
@@ -42,8 +43,26 @@ const arkoApi: ArkoAPI = {
   pickCustomBrowserImportPath: (browserId) =>
     ipcRenderer.invoke('arko:pick-custom-browser-import-path', browserId),
   executeBrowserImport: (request) => ipcRenderer.invoke('arko:execute-browser-import', request),
+  onImportProgress: (cb) => {
+    const handler = (_e: unknown, payload: BrowserImportProgressPayload): void => cb(payload)
+    ipcRenderer.on('arko:import-progress', handler)
+    return () => ipcRenderer.removeListener('arko:import-progress', handler)
+  },
   completeOnboarding: () => ipcRenderer.invoke('arko:complete-onboarding'),
   resetOnboardingState: () => ipcRenderer.invoke('arko:reset-onboarding-state'),
+
+  // Browser Extensions Ecosystem
+  getExtensions: () => ipcRenderer.invoke('arko:get-extensions'),
+  installUnpackedExtension: () => ipcRenderer.invoke('arko:install-unpacked-extension'),
+  installWebStoreExtension: (urlOrId) =>
+    ipcRenderer.invoke('arko:install-webstore-extension', urlOrId),
+  toggleExtension: (extensionId, enabled) =>
+    ipcRenderer.invoke('arko:toggle-extension', extensionId, enabled),
+  removeExtension: (extensionId) => ipcRenderer.invoke('arko:remove-extension', extensionId),
+  openExtensionPopup: (extensionId, anchor) =>
+    ipcRenderer.invoke('arko:open-extension-popup', extensionId, anchor),
+  openExtensionOptions: (extensionId) =>
+    ipcRenderer.invoke('arko:open-extension-options', extensionId),
 
   // Connected Tools (Zero-OAuth Browser Session Context)
   getConnectedTools: () => ipcRenderer.invoke('arko:get-connected-tools'),
@@ -92,8 +111,8 @@ const arkoApi: ArkoAPI = {
   },
 
   // Tab Groups & AI Organizer
-  createTabGroup: (title, color, tabIds) =>
-    ipcRenderer.invoke('arko:create-tab-group', title, color, tabIds),
+  createTabGroup: (title, color, tabIds, options) =>
+    ipcRenderer.invoke('arko:create-tab-group', title, color, tabIds, options),
   updateTabGroup: (groupId, partial) =>
     ipcRenderer.invoke('arko:update-tab-group', groupId, partial),
   assignTabToGroup: (tabId, groupId) =>
@@ -131,8 +150,8 @@ const arkoApi: ArkoAPI = {
   getAccountState: () => ipcRenderer.invoke('arko:get-account-state'),
   getAuthCapabilities: () => ipcRenderer.invoke('arko:get-auth-capabilities'),
   getRegisterCaptcha: () => ipcRenderer.invoke('arko:get-register-captcha'),
-  sendEmailVerificationCode: (email) =>
-    ipcRenderer.invoke('arko:send-email-verification-code', email),
+  sendEmailVerificationCode: (params) =>
+    ipcRenderer.invoke('arko:send-email-verification-code', params),
   registerAccount: (params) => ipcRenderer.invoke('arko:register-account', params),
   loginAccount: (params) => ipcRenderer.invoke('arko:login-account', params),
   verifyTwoFactorLogin: (params) => ipcRenderer.invoke('arko:verify-2fa-login', params),

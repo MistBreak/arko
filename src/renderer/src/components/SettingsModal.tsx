@@ -18,6 +18,7 @@ import {
   Play,
   Plug,
   Plus,
+  Puzzle,
   RefreshCw,
   Scale,
   ShieldCheck,
@@ -48,6 +49,7 @@ import type {
   ConnectedToolId,
   ConnectedToolItem,
   ConnectionTestResult,
+  InstalledExtensionItem,
   MemoryItem,
   ProviderProtocol,
   SkillContextScope,
@@ -58,11 +60,13 @@ import { AppIcon } from './AppIcon'
 import { ChatMarkdown } from './ChatMarkdown'
 import { ConnectToolsListPanel } from './ConnectToolsModal'
 import { AccountSettingsPanel } from './AccountSettingsPanel'
+import { ExtensionsManagerPanel } from './ExtensionsPopover'
 
 export type SettingsTabId =
   | 'account'
   | 'ai'
   | 'tools'
+  | 'extensions'
   | 'memory'
   | 'skills'
   | 'general'
@@ -74,6 +78,9 @@ interface Props {
   settings: AppSettings
   memories: MemoryItem[]
   connectedTools?: ConnectedToolItem[]
+  extensions?: InstalledExtensionItem[]
+  activeTabUrl?: string
+  activeTabTitle?: string
   accountState?: ArkoAccountState
   updateState?: AppUpdateState
   onUpdateSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
@@ -81,6 +88,12 @@ interface Props {
   onDisconnectTool?: (toolId: ConnectedToolId) => Promise<void>
   onToggleAutoConnectTools?: (enabled: boolean) => Promise<void>
   onRefreshConnectedTools?: () => Promise<void>
+  onOpenExtensionPopup?: (extId: string) => Promise<void>
+  onOpenExtensionOptions?: (extId: string) => Promise<void>
+  onToggleExtension?: (extId: string, enabled: boolean) => Promise<void>
+  onRemoveExtension?: (extId: string) => Promise<void>
+  onInstallUnpackedExtension?: () => Promise<void>
+  onInstallWebStoreExtension?: (urlOrId: string) => Promise<boolean>
   onAddMemory: (content: string, category: MemoryItem['category']) => Promise<void>
   onToggleMemory: (id: string, enabled: boolean) => Promise<void>
   onDeleteMemory: (id: string) => Promise<void>
@@ -108,6 +121,9 @@ export const SettingsModal: React.FC<Props> = ({
   settings,
   memories,
   connectedTools = [],
+  extensions = [],
+  activeTabUrl,
+  activeTabTitle,
   accountState,
   updateState,
   onUpdateSettings,
@@ -115,6 +131,12 @@ export const SettingsModal: React.FC<Props> = ({
   onDisconnectTool,
   onToggleAutoConnectTools,
   onRefreshConnectedTools,
+  onOpenExtensionPopup,
+  onOpenExtensionOptions,
+  onToggleExtension,
+  onRemoveExtension,
+  onInstallUnpackedExtension,
+  onInstallWebStoreExtension,
   onAddMemory,
   onToggleMemory,
   onDeleteMemory,
@@ -488,6 +510,14 @@ export const SettingsModal: React.FC<Props> = ({
         '直接复用当前浏览器的已登录网页会话，无需繁琐配置即可让 AI 结合工具上下文工作。'
       )
     },
+    extensions: {
+      title: tr(lang, 'Browser Extensions', '浏览器扩展插件'),
+      description: tr(
+        lang,
+        'Manage Chrome/Arc extensions active in your current Space, install from Chrome Web Store, or load unpacked folders.',
+        '管理当前空间挂载的 Chrome / Arc 扩展插件、唤出插件弹窗，支持从应用商店或本地目录直接安装。'
+      )
+    },
     memory: {
       title: tr(lang, 'Personal Memory', '个人记忆库'),
       description: tr(
@@ -654,6 +684,33 @@ export const SettingsModal: React.FC<Props> = ({
                 }`}
               >
                 {connectedTools.filter((t) => t.status !== 'disconnected').length}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => selectTab('extensions')}
+            className={navBtnCls(tab === 'extensions')}
+          >
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Puzzle
+                size={16}
+                strokeWidth={1.85}
+                className={`shrink-0 ${tab === 'extensions' ? 'opacity-100' : 'opacity-75'}`}
+              />
+              <span className="truncate whitespace-nowrap">
+                {tr(lang, 'Extensions', '扩展插件')}
+              </span>
+            </span>
+            {extensions.length > 0 && (
+              <span
+                className={`px-1.5 py-0.5 rounded-full text-[10.5px] shrink-0 whitespace-nowrap ${
+                  tab === 'extensions'
+                    ? 'bg-white/20 text-white'
+                    : 'bg-violet-500/15 text-violet-500'
+                }`}
+              >
+                {extensions.filter((e) => e.enabled).length}
               </span>
             )}
           </button>
@@ -1765,6 +1822,44 @@ export const SettingsModal: React.FC<Props> = ({
                   })}
                 </div>
               </div>
+            </div>
+          ) : tab === 'extensions' ? (
+            <div className="flex-1 overflow-y-auto px-8 py-6 space-y-4 text-[13px]">
+              <p className="text-[13px] leading-relaxed opacity-60 -mb-0.5">
+                {tabMeta.extensions.description}
+              </p>
+              <ExtensionsManagerPanel
+                isDark={isDark}
+                lang={lang}
+                extensions={extensions}
+                activeTabUrl={activeTabUrl}
+                activeTabTitle={activeTabTitle}
+                onOpenPopup={async (extId) => {
+                  onClose()
+                  await onOpenExtensionPopup?.(extId)
+                }}
+                onOpenOptions={async (extId) => {
+                  onClose()
+                  await onOpenExtensionOptions?.(extId)
+                }}
+                onToggleExtension={async (extId, en) => {
+                  await onToggleExtension?.(extId, en)
+                }}
+                onRemoveExtension={async (extId) => {
+                  await onRemoveExtension?.(extId)
+                }}
+                onInstallUnpacked={async () => {
+                  await onInstallUnpackedExtension?.()
+                }}
+                onInstallWebStore={async (urlOrId) => {
+                  return (await onInstallWebStoreExtension?.(urlOrId)) ?? false
+                }}
+                onOpenWebStoreHome={() => {
+                  onClose()
+                  onNavigateInBrowser('https://chromewebstore.google.com')
+                }}
+                onOpenBrowserImport={onOpenBrowserImport}
+              />
             </div>
           ) : tab === 'general' ? (
             <div className="flex-1 overflow-y-auto px-8 py-6 space-y-4 text-[13px]">

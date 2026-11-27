@@ -182,6 +182,10 @@ function buildAppMenu(lang?: AppLanguage): void {
                 click: () => browserManager?.emitShortcut('open-connect-tools')
               },
               {
+                label: tr(lang, 'Manage Extensions…', '管理浏览器扩展插件…'),
+                click: () => browserManager?.emitShortcut('open-extensions')
+              },
+              {
                 label: tr(
                   lang,
                   'Import Browser Data (Arc / Dia / Chrome)…',
@@ -465,9 +469,9 @@ function registerIpcHandlers(
     }
   )
 
-  ipcMain.handle('arko:execute-browser-import', (_e, request: BrowserImportRequest) => {
+  ipcMain.handle('arko:execute-browser-import', async (_e, request: BrowserImportRequest) => {
     return (
-      browserManager?.executeBrowserImport(request) ?? {
+      (await browserManager?.executeBrowserImport(request)) ?? {
         ok: false,
         browserId: request.browserId,
         spacesCreated: 0,
@@ -487,6 +491,53 @@ function registerIpcHandlers(
 
   ipcMain.handle('arko:reset-onboarding-state', () => {
     return browserManager!.resetOnboardingState()
+  })
+
+  // Browser Extensions Ecosystem IPC
+  ipcMain.handle('arko:get-extensions', () => {
+    return browserManager?.getExtensions() ?? []
+  })
+
+  ipcMain.handle('arko:install-unpacked-extension', async () => {
+    return (
+      (await browserManager?.installUnpackedExtension()) ?? {
+        ok: false,
+        error: 'BrowserManager not ready'
+      }
+    )
+  })
+
+  ipcMain.handle('arko:install-webstore-extension', async (_e, urlOrId: string) => {
+    return (
+      (await browserManager?.installWebStoreExtension(urlOrId)) ?? {
+        ok: false,
+        error: 'BrowserManager not ready'
+      }
+    )
+  })
+
+  ipcMain.handle('arko:toggle-extension', async (_e, extensionId: string, enabled: boolean) => {
+    return (await browserManager?.toggleExtension(extensionId, enabled)) ?? []
+  })
+
+  ipcMain.handle('arko:remove-extension', async (_e, extensionId: string) => {
+    return (await browserManager?.removeExtension(extensionId)) ?? []
+  })
+
+  ipcMain.handle(
+    'arko:open-extension-popup',
+    async (_e, extensionId: string, anchor?: { x: number; y: number }) => {
+      return (
+        (await browserManager?.openExtensionPopup(extensionId, anchor)) ?? {
+          ok: false,
+          error: 'BrowserManager not ready'
+        }
+      )
+    }
+  )
+
+  ipcMain.handle('arko:open-extension-options', async (_e, extensionId: string) => {
+    return (await browserManager?.openExtensionOptions(extensionId)) ?? false
   })
 
   // Connected Tools IPC
@@ -663,8 +714,19 @@ function registerIpcHandlers(
   // Tab Groups & AI Organizer IPC
   ipcMain.handle(
     'arko:create-tab-group',
-    (_e, title: string, color: TabGroupColor, tabIds?: string[]) => {
-      return browserManager!.createTabGroup(title, color, tabIds)
+    (
+      _e,
+      title: string,
+      color: TabGroupColor,
+      tabIds?: string[],
+      options?: {
+        parentId?: string | null
+        profileId?: string
+        zone?: 'pinned' | 'unpinned'
+        keepEmpty?: boolean
+      }
+    ) => {
+      return browserManager!.createTabGroup(title, color, tabIds, options)
     }
   )
 
@@ -673,7 +735,12 @@ function registerIpcHandlers(
     (
       _e,
       groupId: string,
-      partial: Partial<{ title: string; color: TabGroupColor; collapsed: boolean }>
+      partial: Partial<{
+        title: string
+        color: TabGroupColor
+        collapsed: boolean
+        parentId: string | null
+      }>
     ) => {
       return browserManager?.updateTabGroup(groupId, partial) ?? null
     }
@@ -805,9 +872,15 @@ function registerIpcHandlers(
     return await accountService.getRegisterCaptcha()
   })
 
-  ipcMain.handle('arko:send-email-verification-code', async (_e, email: string) => {
-    return await accountService.sendEmailVerificationCode(email)
-  })
+  ipcMain.handle(
+    'arko:send-email-verification-code',
+    async (
+      _e,
+      params: string | { email: string; captchaId?: string; captchaCode?: string }
+    ) => {
+      return await accountService.sendEmailVerificationCode(params)
+    }
+  )
 
   ipcMain.handle(
     'arko:register-account',

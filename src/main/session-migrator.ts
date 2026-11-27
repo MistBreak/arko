@@ -149,6 +149,36 @@ export function copyChromiumSiteStorageToPartition(
   return { filesCopied: totalFiles, migratedStorageTypes }
 }
 
+function chromiumSafeStorageCandidates(
+  browserId: ImportBrowserId
+): Array<{ service: string; account?: string }> {
+  const named = (service: string, account: string) => [
+    { service: `${service} Safe Storage`, account },
+    { service: `${service} Safe Storage` }
+  ]
+  switch (browserId) {
+    case 'arc':
+      return named('Arc', 'Arc')
+    case 'dia':
+      return [...named('Dia', 'Dia'), { service: 'Chromium Safe Storage' }]
+    case 'chrome':
+      return [...named('Chrome', 'Chrome'), { service: 'Chromium Safe Storage' }]
+    case 'edge':
+      return named('Microsoft Edge', 'Microsoft Edge')
+    case 'brave':
+      return named('Brave', 'Brave')
+    case 'opera':
+      return named('Opera', 'Opera')
+    case 'vivaldi':
+      return named('Vivaldi', 'Vivaldi')
+    case 'chromium':
+      return named('Chromium', 'Chromium')
+    case 'firefox':
+    case 'safari':
+      return []
+  }
+}
+
 /**
  * Derives Chromium's OS Safe Storage AES key via documented OS keychain APIs.
  * On macOS, `/usr/bin/security` triggers the standard system Keychain prompt so the user
@@ -157,25 +187,12 @@ export function copyChromiumSiteStorageToPartition(
 export function deriveChromiumCookieDecryptionKey(
   browserId: ImportBrowserId
 ): CookieKeyDerivationResult {
-  if (process.platform === 'darwin') {
-    const candidates: Array<{ service: string; account?: string }> =
-      browserId === 'arc'
-        ? [
-            { service: 'Arc Safe Storage', account: 'Arc' },
-            { service: 'Arc Safe Storage' }
-          ]
-        : browserId === 'dia'
-          ? [
-              { service: 'Dia Safe Storage', account: 'Dia' },
-              { service: 'Dia Safe Storage' },
-              { service: 'Chromium Safe Storage' }
-            ]
-          : [
-              { service: 'Chrome Safe Storage', account: 'Chrome' },
-              { service: 'Chrome Safe Storage' },
-              { service: 'Chromium Safe Storage' }
-            ]
+  const candidates = chromiumSafeStorageCandidates(browserId)
+  if (candidates.length === 0) {
+    return { attempted: false, key: null }
+  }
 
+  if (process.platform === 'darwin') {
     for (const cand of candidates) {
       try {
         const args = ['find-generic-password', '-w', '-s', cand.service]

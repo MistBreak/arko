@@ -35,6 +35,7 @@ export interface PersistedTabRecord {
   isFavorite?: boolean
   pinnedUrl?: string | null
   groupId?: string | null
+  pageTone?: 'light' | 'dark'
 }
 
 interface SessionsFile {
@@ -59,6 +60,7 @@ export class PersistenceStore {
   public memories: MemoryItem[] = []
   public threads: ChatThread[] = []
   public extensions: InstalledExtensionItem[] = []
+  public favicons: Record<string, string> = {}
   public savedSession: SessionsFile = {
     activeProfileId: 'work',
     activeTabByProfile: {},
@@ -377,6 +379,72 @@ export class PersistenceStore {
     this.activeProfileId = this.profiles.some((p) => p.id === this.savedSession.activeProfileId)
       ? this.savedSession.activeProfileId
       : this.profiles[0].id
+
+    const rawFavicons = this.readJson<Record<string, unknown>>('favicons', {})
+    this.favicons = {}
+    if (rawFavicons && typeof rawFavicons === 'object') {
+      for (const [k, v] of Object.entries(rawFavicons)) {
+        if (k && typeof v === 'string' && v.startsWith('data:image/')) {
+          this.favicons[k.toLowerCase()] = v
+        }
+      }
+    }
+    // Backfill host cache from existing persisted tabs, bookmarks & history
+    const seedFrom = (url?: string, favicon?: string): void => {
+      if (!url || !favicon || !favicon.startsWith('data:image/')) return
+      const host = PersistenceStore.extractHostKey(url)
+      if (host && !this.favicons[host]) {
+        this.favicons[host] = favicon
+      }
+    }
+    for (const t of this.savedSession.tabs || []) {
+      seedFrom(t.pinnedUrl || t.url, t.favicon)
+      seedFrom(t.url, t.favicon)
+    }
+    for (const b of this.bookmarks) seedFrom(b.url, b.favicon)
+    for (const h of this.history) seedFrom(h.url, h.favicon)
+  }
+
+  public static extractHostKey(urlOrHost?: string | null): string | null {
+    if (!urlOrHost || typeof urlOrHost !== 'string') return null
+    const trimmed = urlOrHost.trim()
+    if (!trimmed) return null
+    if (/^https?:\/\//i.test(trimmed)) {
+      try {
+        const u = new URL(trimmed)
+        return u.hostname ? u.hostname.toLowerCase() : null
+      } catch {
+        return null
+      }
+    }
+    if (!trimmed.includes('/') && !trimmed.includes(':')) {
+      return trimmed.toLowerCase()
+    }
+    return null
+  }
+
+  public getCachedFavicon(urlOrHost?: string | null): string | undefined {
+    const host = PersistenceStore.extractHostKey(urlOrHost)
+    return host ? this.favicons[host] : undefined
+  }
+
+  public setCachedFavicon(urlOrHost: string, dataUrl: string): boolean {
+    if (!dataUrl || !dataUrl.startsWith('data:image/')) return false
+    const host = PersistenceStore.extractHostKey(urlOrHost)
+    if (!host) return false
+    if (this.favicons[host] === dataUrl) return false
+    // Refresh insertion order for simple MRU bounding
+    delete this.favicons[host]
+    this.favicons[host] = dataUrl
+    const keys = Object.keys(this.favicons)
+    if (keys.length > 1500) {
+      const excess = keys.length - 1500
+      for (let i = 0; i < excess; i++) {
+        delete this.favicons[keys[i]]
+      }
+    }
+    this.scheduleWrite('favicons', () => this.favicons)
+    return true
   }
 
   public saveSettings(next: AppSettings): void {

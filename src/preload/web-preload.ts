@@ -576,4 +576,321 @@ if (typeof window !== 'undefined' && window === window.top) {
     },
     { capture: true, passive: true }
   )
+
+  // ==================== Dia Adaptive Top Bar Page Color & Luminance Detector ====================
+  interface RgbaTuple {
+    r: number
+    g: number
+    b: number
+    a: number
+  }
+
+  const parseCssColor = (raw: string | null | undefined): RgbaTuple | null => {
+    if (!raw) return null
+    const str = raw.trim().toLowerCase()
+    if (!str || str === 'transparent' || str === 'none' || str === 'initial' || str === 'inherit') {
+      return null
+    }
+    if (str.startsWith('#')) {
+      const hex = str.slice(1)
+      if (hex.length === 3 || hex.length === 4) {
+        const r = parseInt(hex[0] + hex[0], 16)
+        const g = parseInt(hex[1] + hex[1], 16)
+        const b = parseInt(hex[2] + hex[2], 16)
+        const a = hex.length === 4 ? parseInt(hex[3] + hex[3], 16) / 255 : 1
+        return { r, g, b, a }
+      }
+      if (hex.length === 6 || hex.length === 8) {
+        const r = parseInt(hex.slice(0, 2), 16)
+        const g = parseInt(hex.slice(2, 4), 16)
+        const b = parseInt(hex.slice(4, 6), 16)
+        const a = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1
+        return { r, g, b, a }
+      }
+      return null
+    }
+    const rgbMatch = str.match(
+      /^rgba?\(\s*([\d.]+)\s*(?:,|\s)\s*([\d.]+)\s*(?:,|\s)\s*([\d.]+)(?:\s*(?:,|\/)\s*([\d.%]+))?\s*\)$/
+    )
+    if (rgbMatch) {
+      const r = Math.max(0, Math.min(255, Number(rgbMatch[1])))
+      const g = Math.max(0, Math.min(255, Number(rgbMatch[2])))
+      const b = Math.max(0, Math.min(255, Number(rgbMatch[3])))
+      let a = 1
+      if (rgbMatch[4] !== undefined) {
+        a = rgbMatch[4].endsWith('%')
+          ? Number(rgbMatch[4].slice(0, -1)) / 100
+          : Number(rgbMatch[4])
+      }
+      return { r, g, b, a: Math.max(0, Math.min(1, a)) }
+    }
+    const srgbMatch = str.match(
+      /^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.%]+))?\s*\)$/
+    )
+    if (srgbMatch) {
+      const r = Math.max(0, Math.min(255, Number(srgbMatch[1]) * 255))
+      const g = Math.max(0, Math.min(255, Number(srgbMatch[2]) * 255))
+      const b = Math.max(0, Math.min(255, Number(srgbMatch[3]) * 255))
+      let a = 1
+      if (srgbMatch[4] !== undefined) {
+        a = srgbMatch[4].endsWith('%')
+          ? Number(srgbMatch[4].slice(0, -1)) / 100
+          : Number(srgbMatch[4])
+      }
+      return { r, g, b, a: Math.max(0, Math.min(1, a)) }
+    }
+    return null
+  }
+
+  const rgbToHex = (r: number, g: number, b: number): string => {
+    const clamp = (v: number): string =>
+      Math.max(0, Math.min(255, Math.round(v)))
+        .toString(16)
+        .padStart(2, '0')
+    return `#${clamp(r)}${clamp(g)}${clamp(b)}`.toUpperCase()
+  }
+
+  const relativeLuminance = (r: number, g: number, b: number): number =>
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+  const resolveCanvasBase = (): [number, number, number] => {
+    const docEl = document.documentElement
+    if (!docEl) return [255, 255, 255]
+    try {
+      const cs = (window.getComputedStyle(docEl).colorScheme || '').toLowerCase()
+      if (cs.includes('dark') && (!cs.includes('light') || config.isDark)) {
+        return [18, 18, 20]
+      }
+    } catch {
+      // ignore
+    }
+    const themeAttr = [
+      docEl.getAttribute('data-theme'),
+      docEl.getAttribute('data-color-mode'),
+      docEl.getAttribute('data-bs-theme'),
+      docEl.className,
+      document.body?.className || ''
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+    if (/\b(dark|night|obsidian|black)\b/.test(themeAttr) && !/\blight\b/.test(themeAttr)) {
+      return [18, 18, 20]
+    }
+    return [255, 255, 255]
+  }
+
+  const samplePointColor = (
+    x: number,
+    y: number,
+    canvasBase: [number, number, number]
+  ): { rgb: [number, number, number]; hasMedia: boolean; painted: boolean } => {
+    const layers: RgbaTuple[] = []
+    let hasMedia = false
+    let cur: Element | null = null
+    try {
+      cur = document.elementFromPoint(x, y)
+    } catch {
+      cur = null
+    }
+    if (!cur || cur === hostEl) {
+      cur = document.body || document.documentElement
+    }
+
+    let depth = 0
+    while (cur && depth < 18) {
+      depth++
+      if (cur !== hostEl) {
+        const tag = cur.tagName.toLowerCase()
+        if (tag === 'canvas' || tag === 'video' || tag === 'img' || tag === 'svg') {
+          const rect = cur.getBoundingClientRect()
+          if (rect.width >= window.innerWidth * 0.45 && rect.height >= 120) {
+            hasMedia = true
+          }
+        }
+        try {
+          const st = window.getComputedStyle(cur)
+          if (st.backgroundImage && st.backgroundImage !== 'none') {
+            const rect = cur.getBoundingClientRect()
+            if (rect.width >= window.innerWidth * 0.45 && rect.height >= 90) {
+              hasMedia = true
+            }
+          }
+          const parsed = parseCssColor(st.backgroundColor)
+          if (parsed && parsed.a > 0.01) {
+            const elOpacity = Number(st.opacity)
+            const effA = parsed.a * (Number.isFinite(elOpacity) ? elOpacity : 1)
+            if (effA > 0.01) {
+              layers.push({ ...parsed, a: effA })
+              if (effA >= 0.985) break
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+      cur = cur.parentElement
+    }
+
+    let r = canvasBase[0]
+    let g = canvasBase[1]
+    let b = canvasBase[2]
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const l = layers[i]
+      r = l.r * l.a + r * (1 - l.a)
+      g = l.g * l.a + g * (1 - l.a)
+      b = l.b * l.a + b * (1 - l.a)
+    }
+    return { rgb: [r, g, b], hasMedia, painted: layers.length > 0 }
+  }
+
+  const readMetaThemeColor = (): RgbaTuple | null => {
+    const metas = Array.from(
+      document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"][content]')
+    )
+    for (const m of metas) {
+      const media = m.getAttribute('media')?.trim()
+      if (media) {
+        try {
+          if (!window.matchMedia(media).matches) continue
+        } catch {
+          continue
+        }
+      }
+      const parsed = parseCssColor(m.content)
+      if (parsed && parsed.a > 0.2) return parsed
+    }
+    return null
+  }
+
+  let lastSentAppearanceKey = ''
+  let appearanceTimer: ReturnType<typeof setTimeout> | null = null
+
+  const evaluatePageAppearance = (): void => {
+    if (!document.documentElement) return
+    const w = Math.max(320, window.innerWidth || 1024)
+    const h = Math.max(240, window.innerHeight || 720)
+    const canvasBase = resolveCanvasBase()
+
+    const topPoints: Array<[number, number]> = [
+      [Math.round(w * 0.16), 10],
+      [Math.round(w * 0.5), 10],
+      [Math.round(w * 0.84), 10]
+    ]
+    const bodyPoints: Array<[number, number, number]> = [
+      [Math.round(w * 0.16), Math.round(h * 0.18), 1.1],
+      [Math.round(w * 0.5), Math.round(h * 0.18), 1.2],
+      [Math.round(w * 0.84), Math.round(h * 0.18), 1.1],
+      [Math.round(w * 0.2), Math.round(h * 0.45), 1.3],
+      [Math.round(w * 0.5), Math.round(h * 0.45), 1.4],
+      [Math.round(w * 0.8), Math.round(h * 0.45), 1.3],
+      [Math.round(w * 0.3), Math.round(h * 0.72), 1.0],
+      [Math.round(w * 0.7), Math.round(h * 0.72), 1.0]
+    ]
+
+    let topR = 0
+    let topG = 0
+    let topB = 0
+    let anyMedia = false
+    let anyPainted = false
+
+    for (const [x, y] of topPoints) {
+      const res = samplePointColor(x, y, canvasBase)
+      topR += res.rgb[0]
+      topG += res.rgb[1]
+      topB += res.rgb[2]
+      if (res.hasMedia) anyMedia = true
+      if (res.painted) anyPainted = true
+    }
+    topR /= topPoints.length
+    topG /= topPoints.length
+    topB /= topPoints.length
+
+    let weightedLight = 0
+    let weightedTotal = 0
+
+    const topLum = relativeLuminance(topR, topG, topB)
+    weightedTotal += 1.2
+    if (topLum >= 0.48) weightedLight += 1.2
+
+    for (const [x, y, weight] of bodyPoints) {
+      const res = samplePointColor(x, y, canvasBase)
+      if (res.hasMedia) anyMedia = true
+      if (res.painted) anyPainted = true
+      const lum = relativeLuminance(res.rgb[0], res.rgb[1], res.rgb[2])
+      weightedTotal += weight
+      if (lum >= 0.48) {
+        weightedLight += weight
+      }
+    }
+
+    let tone: 'light' | 'dark' = weightedLight >= weightedTotal * 0.5 ? 'light' : 'dark'
+    let topHex = rgbToHex(topR, topG, topB)
+
+    if (!anyPainted) {
+      const metaColor = readMetaThemeColor()
+      if (metaColor) {
+        const metaLum = relativeLuminance(metaColor.r, metaColor.g, metaColor.b)
+        tone = metaLum >= 0.48 ? 'light' : 'dark'
+        topHex = rgbToHex(metaColor.r, metaColor.g, metaColor.b)
+      }
+    }
+
+    const key = `${tone}|${topHex}|${anyMedia ? 1 : 0}`
+    if (key === lastSentAppearanceKey) return
+    lastSentAppearanceKey = key
+    ipcRenderer.send('arko-web:page-appearance', {
+      tone,
+      topColor: topHex,
+      hasMediaBg: anyMedia
+    })
+  }
+
+  const scheduleAppearanceProbe = (delayMs = 60): void => {
+    if (appearanceTimer) clearTimeout(appearanceTimer)
+    appearanceTimer = setTimeout(() => {
+      appearanceTimer = null
+      evaluatePageAppearance()
+    }, delayMs)
+  }
+
+  const attachAppearanceObservers = (): void => {
+    evaluatePageAppearance()
+    try {
+      const mo = new MutationObserver(() => scheduleAppearanceProbe(75))
+      if (document.documentElement) {
+        mo.observe(document.documentElement, {
+          attributes: true,
+          attributeFilter: [
+            'class',
+            'style',
+            'data-theme',
+            'data-color-mode',
+            'data-bs-theme',
+            'data-scheme'
+          ]
+        })
+      }
+      if (document.body) {
+        mo.observe(document.body, {
+          attributes: true,
+          attributeFilter: ['class', 'style', 'data-theme', 'data-color-mode', 'data-bs-theme']
+        })
+      }
+      if (document.head) {
+        mo.observe(document.head, { childList: true, subtree: true })
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', attachAppearanceObservers, { once: true })
+  } else {
+    attachAppearanceObservers()
+  }
+  window.addEventListener('load', () => scheduleAppearanceProbe(80), { passive: true })
+  window.addEventListener('pageshow', () => scheduleAppearanceProbe(40), { passive: true })
+  window.addEventListener('scroll', () => scheduleAppearanceProbe(200), { passive: true })
 }

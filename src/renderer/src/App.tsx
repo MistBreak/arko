@@ -16,6 +16,7 @@ import {
   PanelLeft,
   PenLine,
   Plug,
+  Puzzle,
   RotateCw,
   Search,
   ShieldAlert,
@@ -68,6 +69,7 @@ import { FaviconIcon } from './components/FaviconIcon'
 import { ConnectToolsModal, ToolBrandIcon } from './components/ConnectToolsModal'
 import { SpaceEditorPopover, type SpacePopoverRequest } from './components/SpaceEditorPopover'
 import { OnboardingImportModal } from './components/OnboardingImportModal'
+import { ExtensionsPopover } from './components/ExtensionsPopover'
 
 /**
  * Keeps boolean-controlled overlays mounted briefly during their CSS exit animation
@@ -127,6 +129,61 @@ function useAnimatedValue<T>(
   }
 }
 
+function formatDiaBarParts(
+  tab: TabState | undefined,
+  lang?: AppSettings['language']
+): {
+  domain: string
+  subtitle: string
+  isPlaceholder: boolean
+} {
+  if (!tab || !tab.url || tab.url === NEW_TAB_URL) {
+    return {
+      domain: '',
+      subtitle: tr(
+        lang,
+        'Search, enter a URL, or ask anything…',
+        '搜索网页、输入网址，或直接提问…'
+      ),
+      isPlaceholder: true
+    }
+  }
+  if (isChatTabUrl(tab.url)) {
+    return {
+      domain: 'Arko',
+      subtitle: tab.title || tr(lang, 'Chat', '对话'),
+      isPlaceholder: false
+    }
+  }
+  try {
+    const parsed = new URL(tab.url)
+    const domain = parsed.hostname.replace(/^www\./i, '') || parsed.protocol.replace(':', '')
+    const rawTitle = (tab.title || '').trim()
+    const isMeaningfulTitle =
+      Boolean(rawTitle) &&
+      rawTitle !== tab.url &&
+      rawTitle.toLowerCase() !== domain.toLowerCase() &&
+      rawTitle.toLowerCase() !== parsed.hostname.toLowerCase()
+    let subtitle = ''
+    if (isMeaningfulTitle) {
+      subtitle = rawTitle
+    } else if (parsed.pathname && parsed.pathname !== '/') {
+      try {
+        subtitle = decodeURIComponent(`${parsed.pathname}${parsed.search}`).replace(/^\//, '')
+      } catch {
+        subtitle = `${parsed.pathname}${parsed.search}`.replace(/^\//, '')
+      }
+    }
+    return { domain, subtitle, isPlaceholder: false }
+  } catch {
+    return {
+      domain: tab.title || tab.url,
+      subtitle: '',
+      isPlaceholder: false
+    }
+  }
+}
+
 export const App: React.FC = () => {
   const [state, setState] = useState<BrowserSnapshotState | null>(null)
   const [updateState, setUpdateState] = useState<AppUpdateState | undefined>(undefined)
@@ -140,6 +197,7 @@ export const App: React.FC = () => {
   const [omniboxFocusSeq, setOmniboxFocusSeq] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [connectToolsOpen, setConnectToolsOpen] = useState(false)
+  const [extensionsAnchor, setExtensionsAnchor] = useState<{ x: number; y: number } | null>(null)
   const [importModalMode, setImportModalMode] = useState<'onboarding' | 'standalone' | null>(null)
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabId>('ai')
   const [libraryOpen, setLibraryOpen] = useState(false)
@@ -222,6 +280,7 @@ export const App: React.FC = () => {
   const omniboxAnim = useAnimatedBool(omniboxOpen, 130)
   const settingsAnim = useAnimatedBool(settingsOpen, 140)
   const connectToolsAnim = useAnimatedBool(connectToolsOpen, 140)
+  const extensionsAnim = useAnimatedValue(extensionsAnchor, 130)
   const importModalAnim = useAnimatedValue(importModalMode, 140)
   const libraryAnim = useAnimatedBool(libraryOpen, 140)
   const downloadsAnim = useAnimatedBool(downloadsOpen, 125)
@@ -405,6 +464,9 @@ export const App: React.FC = () => {
         setSettingsOpen(true)
       } else if (cmd === 'open-connect-tools') {
         setConnectToolsOpen(true)
+      } else if (cmd === 'open-extensions') {
+        setSettingsInitialTab('extensions')
+        setSettingsOpen(true)
       } else if (cmd === 'open-import-data') {
         setSettingsOpen(false)
         setImportModalMode('standalone')
@@ -459,6 +521,7 @@ export const App: React.FC = () => {
     omniboxAnim.mounted ||
     settingsAnim.mounted ||
     connectToolsAnim.mounted ||
+    Boolean(extensionsAnim.rendered) ||
     Boolean(importModalAnim.rendered) ||
     libraryAnim.mounted ||
     downloadsAnim.mounted ||
@@ -656,6 +719,12 @@ export const App: React.FC = () => {
     : null
   const activeTab = state.tabs.find((t) => t.id === state.activeTabId) || state.tabs[0]
   const isInternalActive = !activeTab || isInternalArkoUrl(activeTab.url)
+  const isTopBarDark = isInternalActive
+    ? isDark
+    : (activeTab.pageTone ?? (isDark ? 'dark' : 'light')) === 'dark'
+  const diaBarParts = formatDiaBarParts(activeTab, lang)
+  const enabledExtensions = (state.extensions || []).filter((x) => x.enabled)
+  const activeZoomPct = Math.round((activeTab?.zoomFactor || 1) * 100)
 
   const splitView = state.splitView
   const effectiveRatio = liveSplitRatio ?? splitView.ratio ?? 0.5
@@ -1294,9 +1363,25 @@ export const App: React.FC = () => {
     onToggleGroupCollapsed: (gid: string) => void window.arko.toggleTabGroupCollapsed(gid),
     onAssignTabToGroup: (tid: string, gid: string | null) =>
       void window.arko.assignTabToGroup(tid, gid),
+    onCreateTabGroup: (
+      title: string,
+      color: TabGroupColor,
+      tabIds?: string[],
+      options?: {
+        parentId?: string | null
+        profileId?: string
+        zone?: 'pinned' | 'unpinned'
+        keepEmpty?: boolean
+      }
+    ) => window.arko.createTabGroup(title, color, tabIds, options),
     onUpdateTabGroup: (
       gid: string,
-      partial: Partial<{ title: string; color: TabGroupColor; collapsed: boolean }>
+      partial: Partial<{
+        title: string
+        color: TabGroupColor
+        collapsed: boolean
+        parentId: string | null
+      }>
     ) => void window.arko.updateTabGroup(gid, partial),
     onDeleteTabGroup: (gid: string) => void window.arko.deleteTabGroup(gid),
     onOrganizeTabs: () => void handleOrganizeTabs(),
@@ -1359,6 +1444,10 @@ export const App: React.FC = () => {
           externalDragLink={externalDragLink}
           updateState={currentUpdateState}
           accountState={state.accountState}
+          extensions={state.extensions}
+          onOpenExtensions={(pos) =>
+            setExtensionsAnchor((cur) => (cur ? null : pos))
+          }
           onSwitchLayout={() =>
             void handleUpdateSettings({ layoutMode: 'vertical', sidebarCollapsed: false })
           }
@@ -1516,692 +1605,946 @@ export const App: React.FC = () => {
             isVertical
               ? `${isSidebarCollapsed ? 'pl-[6px]' : 'pl-0'} ${
                   state.aiSidebarOpen ? 'pr-0' : 'pr-[6px]'
-                } pb-[6px]`
+                } pt-[5px] pb-[6px]`
               : 'px-[6px] pb-[6px] pt-[5px]'
           }`}
         >
-          {/* Dia-Style Unified Top Bar in Vertical Mode */}
-          {isVertical && (
-            <div
-              className={`relative app-drag h-[46px] flex items-center justify-between gap-3 shrink-0 ${
-                state.platform === 'darwin' && isSidebarCollapsed
-                  ? 'pl-[86px] pr-2.5'
-                  : state.platform !== 'darwin' && !state.aiSidebarOpen
-                    ? 'pl-2 pr-[142px]'
-                    : 'pl-1.5 pr-2.5'
-              }`}
-            >
-              {/* Left Navigation Cluster: (Profile Pill when collapsed) [Sidebar Toggle] [<] [>] [↻] */}
-              <div className="app-no-drag flex items-center gap-1 shrink-0">
-                {isSidebarCollapsed && (
+          <div
+            style={
+              isVertical && !splitView.enabled
+                ? {
+                    backgroundColor:
+                      !isInternalActive && activeTab?.pageTopColor
+                        ? activeTab.pageTopColor
+                        : isTopBarDark
+                          ? '#111113'
+                          : '#FFFFFF'
+                  }
+                : undefined
+            }
+            className={`flex-1 flex flex-col min-w-0 min-h-0 ${
+              isVertical
+                ? !splitView.enabled
+                  ? `rounded-[10px] overflow-hidden transition-colors duration-200 ${
+                      isDark
+                        ? 'ring-1 ring-white/[0.09] shadow-[0_4px_20px_rgba(0,0,0,0.36)]'
+                        : 'ring-1 ring-black/[0.075] shadow-[0_2px_14px_rgba(15,23,42,0.07)]'
+                    }`
+                  : 'gap-1.5'
+                : ''
+            }`}
+          >
+            {/* Dia-Style Adaptive Top Menu Navigation Bar in Vertical Mode */}
+            {isVertical && (
+              <div
+                style={{
+                  backgroundColor: isTopBarDark ? '#111113' : '#FFFFFF',
+                  borderBottomColor: isTopBarDark
+                    ? 'rgba(255, 255, 255, 0.08)'
+                    : 'rgba(0, 0, 0, 0.065)'
+                }}
+                className={`relative app-drag h-[38px] border-b flex items-center gap-1 shrink-0 select-none transition-colors duration-200 ${
+                  splitView.enabled
+                    ? `rounded-[10px] border ${
+                        isTopBarDark
+                          ? 'border-white/[0.09] shadow-sm'
+                          : 'border-black/[0.075] shadow-2xs'
+                      }`
+                    : ''
+                } ${isTopBarDark ? 'text-[#F4F4F5]' : 'text-[#18181B]'} ${
+                  state.platform === 'darwin' && isSidebarCollapsed
+                    ? 'pl-[80px] pr-2'
+                    : state.platform !== 'darwin' && !state.aiSidebarOpen
+                      ? 'pl-2 pr-[140px]'
+                      : 'pl-2 pr-2'
+                }`}
+              >
+                {/* Left Navigation Cluster: (Profile Pill when collapsed) [◧] [<] [>] [↻] */}
+                <div className="app-no-drag flex items-center gap-0.5 shrink-0">
+                  {isSidebarCollapsed && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setSpacePopoverReq((cur) =>
+                          cur && cur.mode === 'menu'
+                            ? null
+                            : {
+                                mode: 'menu',
+                                profileId: activeProfile.id,
+                                anchor: {
+                                  x: Math.max(8, rect.left - 2),
+                                  y: rect.bottom + 5,
+                                  placement: 'bottom-left'
+                                }
+                              }
+                        )
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault()
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setSpacePopoverReq({
+                          mode: 'edit',
+                          profileId: activeProfile.id,
+                          anchor: {
+                            x: Math.max(8, rect.left - 2),
+                            y: rect.bottom + 5,
+                            placement: 'bottom-left'
+                          }
+                        })
+                      }}
+                      onWheel={(e) => {
+                        if (pillSwipeResetTimerRef.current !== null) {
+                          window.clearTimeout(pillSwipeResetTimerRef.current)
+                        }
+                        pillSwipeResetTimerRef.current = window.setTimeout(() => {
+                          pillSwipeLockedRef.current = false
+                        }, 180)
+                        if (
+                          !pillSwipeLockedRef.current &&
+                          Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.4 &&
+                          Math.abs(e.deltaX) > 16
+                        ) {
+                          pillSwipeLockedRef.current = true
+                          pendingSpaceDirRef.current = e.deltaX > 0 ? 'right' : 'left'
+                          void window.arko.cycleProfile(e.deltaX > 0 ? 1 : -1)
+                        }
+                      }}
+                      title={tr(
+                        lang,
+                        `${activeProfile.name} — Click to switch Profile · Right-click for Profile Settings`,
+                        `${activeProfile.name} — 点击切换个人资料 · 右键打开资料设置`
+                      )}
+                      className={`arc-pressable mr-1 h-[24px] max-w-[100px] px-2.5 rounded-full flex items-center gap-1.5 text-[11.5px] font-medium tracking-[-0.01em] leading-none truncate shrink-0 ${
+                        isTopBarDark
+                          ? 'bg-white/[0.09] text-zinc-100 hover:bg-white/[0.15]'
+                          : 'bg-black/[0.05] text-zinc-800 hover:bg-black/[0.09]'
+                      }`}
+                    >
+                      <span
+                        className="w-2 h-2 rounded-full shrink-0"
+                        style={{ backgroundColor: activeSpaceTheme.accentHex }}
+                      />
+                      <span className="truncate">{activeProfile.name}</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleUpdateSettings({ sidebarCollapsed: !isSidebarCollapsed })
+                    }
+                    title={
+                      isSidebarCollapsed
+                        ? tr(lang, 'Show Sidebar (⇧⌘S)', '展开侧边栏 (⇧⌘S)')
+                        : tr(lang, 'Hide Sidebar (⇧⌘S)', '收起侧边栏 (⇧⌘S)')
+                    }
+                    className={`arc-pressable w-7 h-7 flex items-center justify-center rounded-[7px] ${
+                      isTopBarDark
+                        ? 'text-zinc-300 hover:text-white hover:bg-white/[0.08]'
+                        : 'text-zinc-600 hover:text-zinc-950 hover:bg-black/[0.05]'
+                    }`}
+                  >
+                    <PanelLeft size={15} strokeWidth={1.65} />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void window.arko.goBack()}
+                    disabled={!activeTab?.canGoBack}
+                    title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
+                    className={`arc-pressable w-7 h-7 flex items-center justify-center rounded-[7px] disabled:opacity-25 disabled:pointer-events-none ${
+                      isTopBarDark
+                        ? 'text-zinc-200 hover:text-white hover:bg-white/[0.08]'
+                        : 'text-zinc-700 hover:text-zinc-950 hover:bg-black/[0.05]'
+                    }`}
+                  >
+                    <ChevronLeft size={16.5} strokeWidth={1.65} />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void window.arko.goForward()}
+                    disabled={!activeTab?.canGoForward}
+                    title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
+                    className={`arc-pressable w-7 h-7 flex items-center justify-center rounded-[7px] disabled:opacity-25 disabled:pointer-events-none ${
+                      isTopBarDark
+                        ? 'text-zinc-200 hover:text-white hover:bg-white/[0.08]'
+                        : 'text-zinc-700 hover:text-zinc-950 hover:bg-black/[0.05]'
+                    }`}
+                  >
+                    <ChevronRight size={16.5} strokeWidth={1.65} />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => void window.arko.reload()}
+                    disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
+                    title={tr(lang, 'Reload (⌘R)', '刷新页面 (⌘R)')}
+                    className={`arc-pressable w-7 h-7 flex items-center justify-center rounded-[7px] disabled:opacity-25 disabled:pointer-events-none ${
+                      isTopBarDark
+                        ? 'text-zinc-300 hover:text-white hover:bg-white/[0.08]'
+                        : 'text-zinc-700 hover:text-zinc-950 hover:bg-black/[0.05]'
+                    }`}
+                  >
+                    <RotateCw
+                      size={14}
+                      strokeWidth={1.7}
+                      className={activeTab?.isLoading ? 'animate-spin' : ''}
+                    />
+                  </button>
+                </div>
+
+                {/* Dia Left-Aligned Breadcrumb Address Bar: domain / Page Title */}
+                <div
+                  data-arko-urlbar-anchor="true"
+                  data-arko-urlbar-align="left"
+                  onClick={handleOpenOmniboxCurrentTab}
+                  className={`app-no-drag group relative flex-1 min-w-0 h-[28px] px-2 rounded-[7px] flex items-center gap-1.5 text-[13px] tracking-[-0.008em] cursor-text overflow-hidden transition-colors ${
+                    omniboxAnim.mounted ? 'opacity-0 pointer-events-none' : ''
+                  } ${
+                    isTopBarDark
+                      ? 'hover:bg-white/[0.065]'
+                      : 'hover:bg-black/[0.04]'
+                  }`}
+                >
+                  {activeTab?.isSensitive && (
+                    <ShieldAlert size={13} className="text-amber-500 shrink-0" />
+                  )}
+
+                  {diaBarParts.isPlaceholder ? (
+                    <div className="flex-1 min-w-0 flex items-center gap-1.5">
+                      <Search
+                        size={13}
+                        className={`shrink-0 ${isTopBarDark ? 'text-zinc-500' : 'text-zinc-400'}`}
+                      />
+                      <span
+                        className={`truncate ${isTopBarDark ? 'text-zinc-500' : 'text-zinc-400'}`}
+                      >
+                        {diaBarParts.subtitle}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="flex-1 min-w-0 flex items-baseline gap-1 overflow-hidden">
+                      <span
+                        className={`font-medium truncate max-w-[48%] shrink-0 ${
+                          isTopBarDark ? 'text-[#F4F4F5]' : 'text-[#18181B]'
+                        }`}
+                      >
+                        {diaBarParts.domain}
+                      </span>
+                      {diaBarParts.subtitle && (
+                        <>
+                          <span
+                            className={`select-none shrink-0 font-normal ${
+                              isTopBarDark ? 'text-[#636366]' : 'text-[#B0B0B8]'
+                            }`}
+                          >
+                            /
+                          </span>
+                          <span
+                            className={`truncate min-w-0 font-normal ${
+                              isTopBarDark ? 'text-[#8E8E98]' : 'text-[#9CA3AF]'
+                            }`}
+                          >
+                            {diaBarParts.subtitle}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {activeZoomPct !== 100 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void window.arko.setPageZoom('reset').then(() =>
+                          showToast(tr(lang, 'Page zoom reset to 100%', '网页缩放已恢复 100%'))
+                        )
+                      }}
+                      title={tr(lang, 'Reset zoom to 100% (⌘0)', '点击恢复 100% 网页缩放 (⌘0)')}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0 ${
+                        isTopBarDark
+                          ? 'bg-white/10 text-zinc-300 hover:bg-white/18'
+                          : 'bg-black/[0.06] text-zinc-600 hover:bg-black/10'
+                      }`}
+                    >
+                      {activeZoomPct}%
+                    </button>
+                  )}
+
+                  {activeTab && !isInternalArkoUrl(activeTab.url) && (
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="hidden group-hover:flex items-center gap-0.5 pl-1 shrink-0"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(activeTab.url)
+                          setCopiedTopUrl(true)
+                          window.setTimeout(() => setCopiedTopUrl(false), 1300)
+                        }}
+                        title={tr(lang, 'Copy URL', '复制网址')}
+                        className={`p-1 rounded-[5px] ${
+                          isTopBarDark
+                            ? 'text-zinc-400 hover:text-zinc-100 hover:bg-white/10'
+                            : 'text-zinc-500 hover:text-zinc-900 hover:bg-black/8'
+                        }`}
+                      >
+                        {copiedTopUrl ? (
+                          <Check size={12} className="text-emerald-500" />
+                        ) : (
+                          <Copy size={12} />
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleOpenReader()}
+                        title={tr(lang, 'Reader View (⇧⌘R)', '沉浸阅读视图 (⇧⌘R)')}
+                        className={`p-1 rounded-[5px] ${
+                          isTopBarDark
+                            ? 'text-zinc-400 hover:text-zinc-100 hover:bg-white/10'
+                            : 'text-zinc-500 hover:text-zinc-900 hover:bg-black/8'
+                        }`}
+                      >
+                        <BookOpen size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleOpenInlineWrite()}
+                        title={tr(lang, 'Inline Write (⌘J)', '网页内联帮写 (⌘J)')}
+                        className={`p-1 rounded-[5px] ${
+                          isTopBarDark
+                            ? 'text-zinc-400 hover:text-zinc-100 hover:bg-white/10'
+                            : 'text-zinc-500 hover:text-zinc-900 hover:bg-black/8'
+                        }`}
+                      >
+                        <PenLine size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleToggleBookmarkCurrent}
+                        title={tr(lang, 'Bookmark (⌘D)', '收藏网页 (⌘D)')}
+                        className={`p-1 rounded-[5px] ${
+                          isCurrentBookmarked
+                            ? 'text-amber-500'
+                            : isTopBarDark
+                              ? 'text-zinc-400 hover:text-zinc-100 hover:bg-white/10'
+                              : 'text-zinc-500 hover:text-zinc-900 hover:bg-black/8'
+                        }`}
+                      >
+                        <Bookmark
+                          size={12}
+                          fill={isCurrentBookmarked ? 'currentColor' : 'none'}
+                        />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Right Dia Toolbar Cluster: Inline Extensions · Tools/Split · Avatar · Blue Chat Pill */}
+                <div className="app-no-drag flex items-center gap-1 shrink-0">
+                  {connectedChromeTools.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setConnectToolsOpen(true)}
+                      title={tr(
+                        lang,
+                        `${connectedChromeTools.length} Connected Tools`,
+                        `已连接 ${connectedChromeTools.length} 个常用工具`
+                      )}
+                      className={`arc-pressable h-[26px] px-1.5 rounded-[6px] flex items-center gap-1 ${
+                        isTopBarDark ? 'hover:bg-white/[0.08]' : 'hover:bg-black/[0.05]'
+                      }`}
+                    >
+                      {connectedChromeTools.slice(0, 2).map((t) => (
+                        <ToolBrandIcon key={t.id} id={t.id} size={13.5} />
+                      ))}
+                    </button>
+                  )}
+
+                  {/* Inline Pinned Extension Icons (Dia-style) */}
+                  {enabledExtensions.slice(0, 5).map((ext) => (
+                    <button
+                      key={ext.id}
+                      type="button"
+                      onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        void window.arko
+                          .openExtensionPopup(ext.id, {
+                            x: Math.round(rect.right),
+                            y: Math.round(rect.bottom + 4)
+                          })
+                          .then((res) => {
+                            if (!res.ok) {
+                              setExtensionsAnchor({ x: rect.right, y: rect.bottom })
+                            }
+                          })
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault()
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setExtensionsAnchor({ x: rect.right, y: rect.bottom })
+                      }}
+                      title={`${ext.name} — ${tr(
+                        lang,
+                        'Click to open · Right-click to manage',
+                        '左键打开扩展 · 右键管理插件'
+                      )}`}
+                      className={`arc-pressable w-[26px] h-[26px] rounded-[6px] flex items-center justify-center shrink-0 ${
+                        isTopBarDark ? 'hover:bg-white/[0.08]' : 'hover:bg-black/[0.05]'
+                      }`}
+                    >
+                      {ext.iconDataUrl ? (
+                        <img
+                          src={ext.iconDataUrl}
+                          alt={ext.name}
+                          className="w-[15.5px] h-[15.5px] object-contain rounded-[3px]"
+                        />
+                      ) : (
+                        <Puzzle
+                          size={13.5}
+                          className={isTopBarDark ? 'text-zinc-300' : 'text-zinc-600'}
+                        />
+                      )}
+                    </button>
+                  ))}
+
                   <button
                     type="button"
                     onClick={(e) => {
                       const rect = e.currentTarget.getBoundingClientRect()
-                      setSpacePopoverReq((cur) =>
-                        cur && cur.mode === 'menu'
-                          ? null
-                          : {
-                              mode: 'menu',
-                              profileId: activeProfile.id,
-                              anchor: {
-                                x: Math.max(8, rect.left - 2),
-                                y: rect.bottom + 5,
-                                placement: 'bottom-left'
-                              }
-                            }
+                      setExtensionsAnchor((cur) =>
+                        cur ? null : { x: rect.right, y: rect.bottom }
                       )
-                    }}
-                    onContextMenu={(e) => {
-                      e.preventDefault()
-                      const rect = e.currentTarget.getBoundingClientRect()
-                      setSpacePopoverReq({
-                        mode: 'edit',
-                        profileId: activeProfile.id,
-                        anchor: {
-                          x: Math.max(8, rect.left - 2),
-                          y: rect.bottom + 5,
-                          placement: 'bottom-left'
-                        }
-                      })
-                    }}
-                    onWheel={(e) => {
-                      if (pillSwipeResetTimerRef.current !== null) {
-                        window.clearTimeout(pillSwipeResetTimerRef.current)
-                      }
-                      pillSwipeResetTimerRef.current = window.setTimeout(() => {
-                        pillSwipeLockedRef.current = false
-                      }, 180)
-                      if (
-                        !pillSwipeLockedRef.current &&
-                        Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.4 &&
-                        Math.abs(e.deltaX) > 16
-                      ) {
-                        pillSwipeLockedRef.current = true
-                        pendingSpaceDirRef.current = e.deltaX > 0 ? 'right' : 'left'
-                        void window.arko.cycleProfile(e.deltaX > 0 ? 1 : -1)
-                      }
                     }}
                     title={tr(
                       lang,
-                      `${activeProfile.name} — Click to switch Profile · Right-click for Profile Settings`,
-                      `${activeProfile.name} — 点击切换个人资料 · 右键打开资料设置`
+                      `Manage Extensions (${enabledExtensions.length} active)`,
+                      `管理扩展插件 (${enabledExtensions.length} 个已启用)`
                     )}
-                    className={`dia-liquid-pill arc-pressable mr-1 h-[25px] max-w-[104px] px-2.5 rounded-full flex items-center justify-center text-[12px] font-medium tracking-[-0.01em] leading-none truncate shrink-0 ${
-                      spacePopoverReq
-                        ? isDark
-                          ? 'bg-white/[0.16] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_1px_4px_rgba(0,0,0,0.25)]'
-                          : 'bg-white/88 text-zinc-950 shadow-[inset_0_1px_0_#fff,0_0_0_0.5px_rgba(15,23,42,0.08),0_2px_6px_rgba(15,23,42,0.06)]'
-                        : isDark
-                          ? 'bg-white/[0.075] text-zinc-100/90 shadow-[inset_0_1px_0_rgba(255,255,255,0.14)] hover:bg-white/[0.14] hover:text-white'
-                          : 'bg-white/55 text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.90),0_0_0_0.5px_rgba(15,23,42,0.055),0_1px_2px_rgba(15,23,42,0.03)] hover:bg-white/85 hover:text-zinc-950'
+                    className={`arc-pressable relative w-[26px] h-[26px] rounded-[6px] flex items-center justify-center ${
+                      extensionsAnchor
+                        ? isTopBarDark
+                          ? 'bg-white/[0.12] text-white'
+                          : 'bg-black/[0.08] text-zinc-950'
+                        : isTopBarDark
+                          ? 'text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08]'
+                          : 'text-zinc-500 hover:text-zinc-900 hover:bg-black/[0.05]'
                     }`}
                   >
-                    <span className="truncate">{activeProfile.name}</span>
+                    <Puzzle size={13.5} strokeWidth={1.7} />
                   </button>
-                )}
 
-                <button
-                  type="button"
-                  onClick={() =>
-                    void handleUpdateSettings({ sidebarCollapsed: !isSidebarCollapsed })
-                  }
-                  title={
-                    isSidebarCollapsed
-                      ? tr(lang, 'Show Sidebar (⇧⌘S)', '展开侧边栏 (⇧⌘S)')
-                      : tr(lang, 'Hide Sidebar (⇧⌘S)', '收起侧边栏 (⇧⌘S)')
-                  }
-                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-60 hover:opacity-100 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
-                >
-                  <PanelLeft size={15} />
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => void window.arko.goBack()}
-                  disabled={!activeTab?.canGoBack}
-                  title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
-                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
-                >
-                  <ChevronLeft size={15.5} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void window.arko.goForward()}
-                  disabled={!activeTab?.canGoForward}
-                  title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
-                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
-                >
-                  <ChevronRight size={15.5} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void window.arko.reload()}
-                  disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
-                  title={tr(lang, 'Reload (⌘R)', '刷新页面 (⌘R)')}
-                  className="arc-pressable w-7 h-7 flex items-center justify-center rounded-lg opacity-55 hover:opacity-100 disabled:opacity-20 hover:bg-black/[0.055] dark:hover:bg-white/[0.08]"
-                >
-                  <RotateCw size={13.5} className={activeTab?.isLoading ? 'animate-spin' : ''} />
-                </button>
-              </div>
-
-              {/* Center Dia Smart URL Bar (Expands In-Place on Click / ⌘L) */}
-              <div
-                data-arko-urlbar-anchor="true"
-                onClick={handleOpenOmniboxCurrentTab}
-                className={`app-no-drag dia-liquid-pill arc-pressable group relative max-w-[600px] flex-1 mx-auto h-[31px] px-3.5 rounded-[11px] border flex items-center gap-2 text-[12.5px] cursor-text overflow-hidden transition-all ${
-                  omniboxAnim.mounted ? 'opacity-0 pointer-events-none' : ''
-                } ${
-                  isDark
-                    ? 'bg-white/[0.06] hover:bg-white/[0.10] border-white/[0.08] hover:border-white/[0.15] shadow-[inset_0_1px_0_rgba(255,255,255,0.09)] text-zinc-200'
-                    : 'bg-white/58 hover:bg-white/88 border-black/[0.05] hover:border-black/[0.10] shadow-[inset_0_1px_0_rgba(255,255,255,0.92),0_1px_2px_rgba(15,23,42,0.03)] text-zinc-800'
-                }`}
-              >
-                {activeTab?.isSensitive ? (
-                  <ShieldAlert size={12.5} className="text-amber-500 shrink-0" />
-                ) : activeTab && isChatTabUrl(activeTab.url) ? (
-                  <Sparkles size={12.5} className="opacity-65 shrink-0" />
-                ) : activeTab && !isInternalArkoUrl(activeTab.url) ? (
-                  <Lock size={11.5} className="opacity-40 shrink-0" />
-                ) : (
-                  <Search size={12.5} className="opacity-45 shrink-0" />
-                )}
-
-                {activeTab && activeTab.url !== NEW_TAB_URL ? (
-                  <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                    <span className="truncate opacity-85 group-hover:hidden font-medium">
-                      {activeTab.title || activeTab.url}
-                    </span>
-                    <span className="hidden group-hover:inline truncate opacity-90 font-normal">
-                      {activeTab.url.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '')}
-                    </span>
-                  </div>
-                ) : (
-                  <span className="truncate flex-1 opacity-45 group-hover:opacity-75">
-                    {tr(
-                      lang,
-                      'Search, enter a URL, or ask anything…',
-                      '搜索网页、输入网址，或直接提问…'
-                    )}
-                  </span>
-                )}
-
-                {activeTab && !isInternalArkoUrl(activeTab.url) ? (
-                  <div
-                    onClick={(e) => e.stopPropagation()}
-                    className="hidden group-hover:flex items-center gap-0.5 pl-1 shrink-0"
+                  <button
+                    type="button"
+                    onClick={handleToggleSplitView}
+                    title={tr(lang, 'Split View (⌘⇧\\)', '左右分屏 (⌘⇧\\)')}
+                    className={`arc-pressable w-[26px] h-[26px] rounded-[6px] flex items-center justify-center ${
+                      splitView.enabled
+                        ? isTopBarDark
+                          ? 'bg-white/[0.13] text-white'
+                          : 'bg-black/[0.08] text-zinc-950'
+                        : isTopBarDark
+                          ? 'text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08]'
+                          : 'text-zinc-500 hover:text-zinc-900 hover:bg-black/[0.05]'
+                    }`}
                   >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void navigator.clipboard.writeText(activeTab.url)
-                        setCopiedTopUrl(true)
-                        window.setTimeout(() => setCopiedTopUrl(false), 1300)
-                      }}
-                      title={tr(lang, 'Copy URL', '复制网址')}
-                      className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/10"
-                    >
-                      {copiedTopUrl ? (
-                        <Check size={11.5} className="text-emerald-500" />
-                      ) : (
-                        <Copy size={11.5} />
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleOpenReader()}
-                      title={tr(lang, 'Reader View (⇧⌘R)', '沉浸阅读视图 (⇧⌘R)')}
-                      className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/10"
-                    >
-                      <BookOpen size={11.5} />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleOpenInlineWrite()}
-                      title={tr(lang, 'Inline Write (⌘J)', '网页内联帮写 (⌘J)')}
-                      className="p-1 rounded-md opacity-65 hover:opacity-100 hover:bg-black/8 dark:hover:bg-white/10"
-                    >
-                      <PenLine size={11.5} />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleToggleBookmarkCurrent}
-                      title={tr(lang, 'Bookmark (⌘D)', '收藏网页 (⌘D)')}
-                      className={`p-1 rounded-md hover:bg-black/8 dark:hover:bg-white/10 ${
-                        isCurrentBookmarked ? 'text-amber-500 opacity-100' : 'opacity-65 hover:opacity-100'
-                      }`}
-                    >
-                      <Bookmark
-                        size={11.5}
-                        fill={isCurrentBookmarked ? 'currentColor' : 'none'}
+                    <Columns2 size={13.5} strokeWidth={1.7} />
+                  </button>
+
+                  {/* Circular User Avatar Badge (matching Dia toolbar avatar) */}
+                  <button
+                    type="button"
+                    onClick={() => handleOpenSettingsAt('account')}
+                    title={
+                      state.accountState?.authenticated && state.accountState.user
+                        ? `${
+                            state.accountState.user.displayName ||
+                            state.accountState.user.email ||
+                            state.accountState.user.username
+                          } · ${
+                            state.accountState.user.effectiveUnlimited
+                              ? '∞'
+                              : `$${(state.accountState.user.remainingUsd ?? 0).toFixed(2)}`
+                          }`
+                        : tr(lang, 'Profile & Account', '账号与个人中心')
+                    }
+                    className="arc-pressable relative w-[26px] h-[26px] rounded-full flex items-center justify-center shrink-0"
+                  >
+                    {state.accountState?.authenticated && state.accountState.user ? (
+                      <span
+                        className="w-[20px] h-[20px] rounded-full flex items-center justify-center text-[10.5px] font-semibold text-white shadow-2xs"
+                        style={{ backgroundColor: activeSpaceTheme.accentHex }}
+                      >
+                        {(
+                          state.accountState.user.displayName ||
+                          state.accountState.user.username ||
+                          state.accountState.user.email ||
+                          'U'
+                        )
+                          .trim()
+                          .charAt(0)
+                          .toUpperCase()}
+                      </span>
+                    ) : (
+                      <span
+                        className={`w-[20px] h-[20px] rounded-full flex items-center justify-center overflow-hidden border ${
+                          isTopBarDark
+                            ? 'bg-zinc-800 border-white/15 text-zinc-200'
+                            : 'bg-zinc-200/85 border-black/10 text-zinc-700'
+                        }`}
+                      >
+                        <UserRound size={12.5} strokeWidth={2} className="translate-y-[1px]" />
+                      </span>
+                    )}
+                    {state.accountState?.authenticated && (
+                      <span
+                        className={`absolute bottom-0.5 right-0.5 w-[6px] h-[6px] rounded-full bg-emerald-500 ring-[1.5px] ${
+                          isTopBarDark ? 'ring-[#111113]' : 'ring-white'
+                        }`}
                       />
-                    </button>
-                  </div>
-                ) : (
-                  <span className="text-[10.5px] font-mono opacity-40 shrink-0">⌘L</span>
-                )}
+                    )}
+                  </button>
+
+                  {/* Signature Dia Blue Bubble "Chat" Pill */}
+                  <button
+                    type="button"
+                    onClick={() => void window.arko.setAISidebarOpen(!state.aiSidebarOpen)}
+                    title={tr(lang, 'Toggle Chat Sidebar (⌘E)', '切换右侧对话侧栏 (⌘E)')}
+                    className={`arc-pressable ml-0.5 h-[27px] px-2.5 rounded-[8px] text-[12.5px] font-medium tracking-[-0.01em] flex items-center gap-1.5 transition-colors ${
+                      state.aiSidebarOpen
+                        ? isTopBarDark
+                          ? 'bg-[#0A84FF]/22 text-[#64D2FF] ring-1 ring-[#0A84FF]/40'
+                          : 'bg-[#0088FF]/12 text-[#0066CC] ring-1 ring-[#0088FF]/25'
+                        : isTopBarDark
+                          ? 'bg-white/[0.10] hover:bg-white/[0.16] text-[#F4F4F5]'
+                          : 'bg-[#F1F3F5] hover:bg-[#E5E8EC] text-[#18181B]'
+                    }`}
+                  >
+                    <svg
+                      width="13"
+                      height="13"
+                      viewBox="0 0 16 16"
+                      fill="none"
+                      className="shrink-0"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M8 1.75C4.272 1.75 1.25 4.39 1.25 7.65c0 1.66.786 3.16 2.055 4.23-.14.82-.53 1.66-1.12 2.24a.38.38 0 0 0 .29.65c1.38-.06 2.68-.54 3.59-1.15.61.15 1.26.23 1.935.23 3.728 0 6.75-2.64 6.75-5.9S11.728 1.75 8 1.75Z"
+                        fill={isTopBarDark ? '#0A84FF' : '#0088FF'}
+                      />
+                    </svg>
+                    <span>Chat</span>
+                  </button>
+                </div>
 
                 {activeTab?.isLoading && <div className="dia-loading-bar" />}
               </div>
+            )}
 
-              {/* Right utility cluster and Chat pill */}
-              <div className="app-no-drag flex items-center gap-1 shrink-0">
+            {/* Optional Find-in-Page Bar (⌘F) */}
+            {findBarOpen && !isInternalActive && (
+              <div
+                style={
+                  isVertical && !splitView.enabled
+                    ? {
+                        backgroundColor: isTopBarDark ? '#161619' : '#FAFAFC',
+                        borderBottomColor: isTopBarDark
+                          ? 'rgba(255, 255, 255, 0.08)'
+                          : 'rgba(0, 0, 0, 0.065)'
+                      }
+                    : undefined
+                }
+                className={`arc-bar-enter h-9 px-3 flex items-center gap-2 text-xs shrink-0 ${
+                  isVertical && !splitView.enabled
+                    ? `border-b ${isTopBarDark ? 'text-zinc-100' : 'text-zinc-800'}`
+                    : `mb-1.5 rounded-xl border ${
+                        isDark
+                          ? 'bg-[#232328]/95 border-white/10 text-zinc-100 backdrop-blur-md'
+                          : 'bg-white/95 border-black/8 text-zinc-800 shadow-2xs backdrop-blur-md'
+                      }`
+                }`}
+              >
+                <Search size={13} className="opacity-50" />
+                <input
+                  ref={findInputRef}
+                  value={findText}
+                  onChange={(e) => {
+                    const val = e.target.value
+                    setFindText(val)
+                    if (val.trim()) {
+                      void window.arko.findInPage(val, true)
+                    } else {
+                      setFindMatchInfo(null)
+                      void window.arko.stopFindInPage()
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      void window.arko.findInPage(findText, !e.shiftKey)
+                    } else if (e.key === 'Escape') {
+                      setFindBarOpen(false)
+                      setFindMatchInfo(null)
+                      void window.arko.stopFindInPage()
+                    }
+                  }}
+                  placeholder={tr(lang, 'Find in page…', '在页面中查找…')}
+                  className="flex-1 bg-transparent outline-none"
+                />
+                {findText.trim() && findMatchInfo && (
+                  <span
+                    className={`px-2 py-0.5 rounded-md font-mono text-[11px] ${
+                      findMatchInfo.matches === 0
+                        ? 'bg-rose-500/15 text-rose-500 font-medium'
+                        : isTopBarDark
+                          ? 'opacity-70 bg-white/10'
+                          : 'opacity-65 bg-black/5'
+                    }`}
+                  >
+                    {findMatchInfo.matches === 0
+                      ? tr(lang, 'No matches', '无匹配')
+                      : `${findMatchInfo.activeMatchOrdinal} / ${findMatchInfo.matches}`}
+                  </span>
+                )}
                 <button
-                  type="button"
-                  onClick={() => setConnectToolsOpen(true)}
-                  title={tr(
-                    lang,
-                    connectedChromeTools.length > 0
-                      ? `${connectedChromeTools.length} Connected Tools`
-                      : 'Connect Tools',
-                    connectedChromeTools.length > 0
-                      ? `已连接 ${connectedChromeTools.length} 个常用工具`
-                      : '连接常用工具'
-                  )}
-                  className="arc-pressable p-1.5 rounded-lg opacity-70 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07] flex items-center"
-                >
-                  {connectedChromeTools.length > 0 ? (
-                    <span className="flex items-center gap-1">
-                      {connectedChromeTools.slice(0, 3).map((t) => (
-                        <ToolBrandIcon key={t.id} id={t.id} size={13} />
-                      ))}
-                    </span>
-                  ) : (
-                    <Plug size={13.5} />
-                  )}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleToggleSplitView}
-                  title={tr(lang, 'Split View (⌘⇧\\)', '左右分屏 (⌘⇧\\)')}
-                  className={`arc-pressable p-1.5 rounded-lg ${
-                    splitView.enabled
-                      ? 'opacity-100 bg-black/[0.07] dark:bg-white/[0.11]'
-                      : 'opacity-55 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
+                  onClick={() => void window.arko.findInPage(findText, false)}
+                  className={`p-1 rounded ${
+                    isTopBarDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
                   }`}
+                  title={tr(lang, 'Previous (⇧Enter)', '上一个 (⇧Enter)')}
                 >
-                  <Columns2 size={14} />
+                  <ChevronUp size={14} />
                 </button>
-
                 <button
-                  type="button"
-                  onClick={() => handleOpenSettingsAt('account')}
-                  title={
-                    state.accountState?.authenticated && state.accountState.user
-                      ? `${state.accountState.user.email || state.accountState.user.username} · ${
-                          state.accountState.user.effectiveUnlimited
-                            ? '∞'
-                            : `$${(state.accountState.user.remainingUsd ?? 0).toFixed(2)}`
-                        }`
-                      : tr(lang, 'Arko Account (Sign in / Register)', 'Arko 账号（邮箱登录 / 注册）')
-                  }
-                  className={`arc-pressable relative p-1.5 rounded-lg ${
-                    state.accountState?.authenticated
-                      ? 'opacity-90 hover:opacity-100 text-indigo-400 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
-                      : 'opacity-55 hover:opacity-100 hover:bg-black/[0.05] dark:hover:bg-white/[0.07]'
+                  onClick={() => void window.arko.findInPage(findText, true)}
+                  className={`p-1 rounded ${
+                    isTopBarDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
                   }`}
+                  title={tr(lang, 'Next (Enter)', '下一个 (Enter)')}
                 >
-                  <UserRound size={14} />
-                  {state.accountState?.authenticated && (
-                    <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  )}
+                  <ChevronDown size={14} />
                 </button>
-
                 <button
-                  type="button"
-                  onClick={() => void window.arko.setAISidebarOpen(!state.aiSidebarOpen)}
-                  title={tr(lang, 'Toggle Chat Sidebar (⌘E)', '切换右侧对话侧栏 (⌘E)')}
-                  className={`dia-liquid-pill arc-pressable h-[28px] px-2.5 rounded-[9px] text-[12px] font-medium flex items-center gap-1.5 border transition ${
-                    state.aiSidebarOpen
-                      ? isDark
-                        ? 'bg-zinc-100 text-zinc-900 border-white/20'
-                        : 'bg-zinc-900 text-white border-black/20'
-                      : isDark
-                        ? 'bg-white/[0.07] hover:bg-white/[0.13] border-white/[0.09] shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] text-zinc-200'
-                        : 'bg-white/65 hover:bg-white/92 border-black/[0.06] shadow-[inset_0_1px_0_#fff,0_1px_2px_rgba(15,23,42,0.035)] text-zinc-800'
-                  }`}
-                >
-                  <MessageSquare size={12} className="fill-current opacity-85" />
-                  <span>{tr(lang, 'Chat', '对话')}</span>
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Optional Find-in-Page Bar (⌘F) */}
-          {findBarOpen && !isInternalActive && (
-            <div
-              className={`arc-bar-enter mb-1.5 h-9 px-3 rounded-xl border flex items-center gap-2 text-xs shrink-0 ${
-                isDark
-                  ? 'bg-[#232328]/95 border-white/10 text-zinc-100 backdrop-blur-md'
-                  : 'bg-white/95 border-black/8 text-zinc-800 shadow-2xs backdrop-blur-md'
-              }`}
-            >
-              <Search size={13} className="opacity-50" />
-              <input
-                ref={findInputRef}
-                value={findText}
-                onChange={(e) => {
-                  const val = e.target.value
-                  setFindText(val)
-                  if (val.trim()) {
-                    void window.arko.findInPage(val, true)
-                  } else {
-                    setFindMatchInfo(null)
-                    void window.arko.stopFindInPage()
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    void window.arko.findInPage(findText, !e.shiftKey)
-                  } else if (e.key === 'Escape') {
+                  onClick={() => {
                     setFindBarOpen(false)
                     setFindMatchInfo(null)
                     void window.arko.stopFindInPage()
-                  }
-                }}
-                placeholder={tr(lang, 'Find in page…', '在页面中查找…')}
-                className="flex-1 bg-transparent outline-none"
-              />
-              {findText.trim() && findMatchInfo && (
-                <span
-                  className={`px-2 py-0.5 rounded-md font-mono text-[11px] ${
-                    findMatchInfo.matches === 0
-                      ? 'bg-rose-500/15 text-rose-500 font-medium'
-                      : 'opacity-65 bg-black/5 dark:bg-white/8'
+                  }}
+                  className={`p-1 rounded ${
+                    isTopBarDark ? 'hover:bg-white/10' : 'hover:bg-black/6'
                   }`}
                 >
-                  {findMatchInfo.matches === 0
-                    ? tr(lang, 'No matches', '无匹配')
-                    : `${findMatchInfo.activeMatchOrdinal} / ${findMatchInfo.matches}`}
-                </span>
-              )}
-              <button
-                onClick={() => void window.arko.findInPage(findText, false)}
-                className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10"
-                title={tr(lang, 'Previous (⇧Enter)', '上一个 (⇧Enter)')}
-              >
-                <ChevronUp size={14} />
-              </button>
-              <button
-                onClick={() => void window.arko.findInPage(findText, true)}
-                className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10"
-                title={tr(lang, 'Next (Enter)', '下一个 (Enter)')}
-              >
-                <ChevronDown size={14} />
-              </button>
-              <button
-                onClick={() => {
-                  setFindBarOpen(false)
-                  setFindMatchInfo(null)
-                  void window.arko.stopFindInPage()
-                }}
-                className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10"
-              >
-                <X size={14} />
-              </button>
-            </div>
-          )}
+                  <X size={14} />
+                </button>
+              </div>
+            )}
 
-          {splitView.enabled && leftSplitTab && rightSplitTab ? (
-            /* ==================== Split View Dual Viewport ==================== */
-            <div
-              ref={splitContainerRef}
-              className="flex-1 flex min-w-0 min-h-0 select-none"
-            >
-              {/* Left Split Pane */}
+            {splitView.enabled && leftSplitTab && rightSplitTab ? (
+              /* ==================== Split View Dual Viewport ==================== */
               <div
-                style={{ width: `calc(${effectiveRatio * 100}% - 5px)` }}
-                className="flex flex-col min-w-0 min-h-0"
+                ref={splitContainerRef}
+                className="flex-1 flex min-w-0 min-h-0 select-none"
               >
+                {/* Left Split Pane */}
                 <div
-                  onClick={() => void window.arko.setSplitActivePane('left')}
-                  className={`h-7 mb-1 px-2.5 rounded-lg border flex items-center justify-between gap-2 text-[11px] cursor-pointer transition ${
-                    splitView.activePane === 'left'
-                      ? isDark
-                        ? 'bg-[#25252A]/90 border-white/16 text-zinc-100'
-                        : 'bg-white/95 border-black/14 text-zinc-900 shadow-2xs'
-                      : isDark
-                        ? 'bg-black/25 border-white/6 text-zinc-400 hover:text-zinc-200'
-                        : 'bg-white/60 border-black/6 text-zinc-500 hover:text-zinc-800'
-                  }`}
+                  style={{ width: `calc(${effectiveRatio * 100}% - 5px)` }}
+                  className="flex flex-col min-w-0 min-h-0"
                 >
-                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                        splitView.activePane === 'left'
-                          ? isDark
-                            ? 'bg-zinc-200'
-                            : 'bg-zinc-800'
-                          : 'bg-zinc-500/35'
-                      }`}
-                    />
-                    <FaviconIcon url={leftSplitTab.url} favicon={leftSplitTab.favicon} size={12} />
-                    <span className="truncate font-medium">
-                      {leftSplitTab.title || tr(lang, 'Left Tab', '左侧标签页')}
-                    </span>
+                  <div
+                    onClick={() => void window.arko.setSplitActivePane('left')}
+                    className={`h-7 mb-1 px-2.5 rounded-lg border flex items-center justify-between gap-2 text-[11px] cursor-pointer transition ${
+                      splitView.activePane === 'left'
+                        ? isDark
+                          ? 'bg-[#25252A]/90 border-white/16 text-zinc-100'
+                          : 'bg-white/95 border-black/14 text-zinc-900 shadow-2xs'
+                        : isDark
+                          ? 'bg-black/25 border-white/6 text-zinc-400 hover:text-zinc-200'
+                          : 'bg-white/60 border-black/6 text-zinc-500 hover:text-zinc-800'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                          splitView.activePane === 'left'
+                            ? isDark
+                              ? 'bg-zinc-200'
+                              : 'bg-zinc-800'
+                            : 'bg-zinc-500/35'
+                        }`}
+                      />
+                      <FaviconIcon url={leftSplitTab.url} favicon={leftSplitTab.favicon} size={12} />
+                      <span className="truncate font-medium">
+                        {leftSplitTab.title || tr(lang, 'Left Tab', '左侧标签页')}
+                      </span>
+                    </div>
+
+                    <div
+                      className="flex items-center gap-0.5 shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        onClick={() => {
+                          void window.arko.setSplitActivePane('left')
+                          handleOpenOmniboxCurrentTab()
+                        }}
+                        title={tr(lang, 'Navigate left pane', '导航左侧页面')}
+                        className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
+                      >
+                        <Search size={11} />
+                      </button>
+                      <button
+                        onClick={() => void window.arko.swapSplitPanes()}
+                        title={tr(lang, 'Swap left & right panes', '互换左右分屏位置')}
+                        className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
+                      >
+                        <ArrowLeftRight size={11} />
+                      </button>
+                      <button
+                        onClick={() => void window.arko.closeSplitView('right')}
+                        title={tr(lang, 'Close left pane (keep right)', '关闭左侧分屏（保留右侧）')}
+                        className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
                   </div>
 
                   <div
-                    className="flex items-center gap-0.5 shrink-0"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <button
-                      onClick={() => {
+                    ref={leftViewportRef}
+                    onMouseDown={() => {
+                      if (splitView.activePane !== 'left') {
                         void window.arko.setSplitActivePane('left')
-                        handleOpenOmniboxCurrentTab()
-                      }}
-                      title={tr(lang, 'Navigate left pane', '导航左侧页面')}
-                      className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
-                    >
-                      <Search size={11} />
-                    </button>
-                    <button
-                      onClick={() => void window.arko.swapSplitPanes()}
-                      title={tr(lang, 'Swap left & right panes', '互换左右分屏位置')}
-                      className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
-                    >
-                      <ArrowLeftRight size={11} />
-                    </button>
-                    <button
-                      onClick={() => void window.arko.closeSplitView('right')}
-                      title={tr(lang, 'Close left pane (keep right)', '关闭左侧分屏（保留右侧）')}
-                      className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
-                    >
-                      <X size={12} />
-                    </button>
+                      }
+                    }}
+                    className={`relative flex-1 rounded-[10px] overflow-hidden border transition ${
+                      splitView.activePane === 'left'
+                        ? isDark
+                          ? 'bg-[#19191B] border-white/16 shadow-sm'
+                          : 'bg-white border-black/14 shadow-sm'
+                        : isDark
+                          ? 'bg-[#19191B] border-white/8'
+                          : 'bg-white border-black/8'
+                    }`}
+                  >
+                    {renderViewportPaneContent(leftSplitTab, snapshots.primary, {
+                      isSplitPane: true,
+                      otherSplitTabId: rightSplitTab.id,
+                      paneSide: 'left'
+                    })}
                   </div>
                 </div>
 
+                {/* Center Draggable Splitter Sash */}
                 <div
-                  ref={leftViewportRef}
-                  onMouseDown={() => {
-                    if (splitView.activePane !== 'left') {
-                      void window.arko.setSplitActivePane('left')
-                    }
-                  }}
-                  className={`relative flex-1 rounded-[10px] overflow-hidden border transition ${
-                    splitView.activePane === 'left'
-                      ? isDark
-                        ? 'bg-[#19191B] border-white/16 shadow-sm'
-                        : 'bg-white border-black/14 shadow-sm'
-                      : isDark
-                        ? 'bg-[#19191B] border-white/8'
-                        : 'bg-white border-black/8'
-                  }`}
+                  onMouseDown={handleStartSplitResize}
+                  onDoubleClick={() => void window.arko.setSplitRatio(0.5)}
+                  title={tr(
+                    lang,
+                    'Drag to resize Split View · Double-click for 50:50',
+                    '拖拽调节左右分屏宽度 · 双击恢复 50:50'
+                  )}
+                  className="w-[10px] shrink-0 flex items-center justify-center cursor-col-resize group"
                 >
-                  {renderViewportPaneContent(leftSplitTab, snapshots.primary, {
-                    isSplitPane: true,
-                    otherSplitTabId: rightSplitTab.id,
-                    paneSide: 'left'
-                  })}
+                  <div
+                    className={`w-1 h-12 rounded-full transition-all flex items-center justify-center ${
+                      draggingSplit
+                        ? isDark
+                          ? 'bg-zinc-200 h-20'
+                          : 'bg-zinc-800 h-20'
+                        : isDark
+                          ? 'bg-white/14 group-hover:bg-white/40'
+                          : 'bg-black/14 group-hover:bg-black/40'
+                    }`}
+                  >
+                    <GripVertical size={10} className="opacity-0 group-hover:opacity-70 text-white" />
+                  </div>
                 </div>
-              </div>
 
-              {/* Center Draggable Splitter Sash */}
-              <div
-                onMouseDown={handleStartSplitResize}
-                onDoubleClick={() => void window.arko.setSplitRatio(0.5)}
-                title={tr(
-                  lang,
-                  'Drag to resize Split View · Double-click for 50:50',
-                  '拖拽调节左右分屏宽度 · 双击恢复 50:50'
-                )}
-                className="w-[10px] shrink-0 flex items-center justify-center cursor-col-resize group"
-              >
-                <div
-                  className={`w-1 h-12 rounded-full transition-all flex items-center justify-center ${
-                    draggingSplit
-                      ? isDark
-                        ? 'bg-zinc-200 h-20'
-                        : 'bg-zinc-800 h-20'
-                      : isDark
-                        ? 'bg-white/14 group-hover:bg-white/40'
-                        : 'bg-black/14 group-hover:bg-black/40'
-                  }`}
-                >
-                  <GripVertical size={10} className="opacity-0 group-hover:opacity-70 text-white" />
-                </div>
-              </div>
+                {/* Right Split Pane */}
+                <div className="flex-1 flex flex-col min-w-0 min-h-0">
+                  <div
+                    onClick={() => void window.arko.setSplitActivePane('right')}
+                    className={`h-7 mb-1 px-2.5 rounded-lg border flex items-center justify-between gap-2 text-[11px] cursor-pointer transition ${
+                      splitView.activePane === 'right'
+                        ? isDark
+                          ? 'bg-[#25252A]/90 border-white/16 text-zinc-100'
+                          : 'bg-white/95 border-black/14 text-zinc-900 shadow-2xs'
+                        : isDark
+                          ? 'bg-black/25 border-white/6 text-zinc-400 hover:text-zinc-200'
+                          : 'bg-white/60 border-black/6 text-zinc-500 hover:text-zinc-800'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                          splitView.activePane === 'right'
+                            ? isDark
+                              ? 'bg-zinc-200'
+                              : 'bg-zinc-800'
+                            : 'bg-zinc-500/35'
+                        }`}
+                      />
+                      <FaviconIcon
+                        url={rightSplitTab.url}
+                        favicon={rightSplitTab.favicon}
+                        size={12}
+                      />
+                      <span className="truncate font-medium">
+                        {rightSplitTab.title || tr(lang, 'Right Tab', '右侧标签页')}
+                      </span>
+                    </div>
 
-              {/* Right Split Pane */}
-              <div className="flex-1 flex flex-col min-w-0 min-h-0">
-                <div
-                  onClick={() => void window.arko.setSplitActivePane('right')}
-                  className={`h-7 mb-1 px-2.5 rounded-lg border flex items-center justify-between gap-2 text-[11px] cursor-pointer transition ${
-                    splitView.activePane === 'right'
-                      ? isDark
-                        ? 'bg-[#25252A]/90 border-white/16 text-zinc-100'
-                        : 'bg-white/95 border-black/14 text-zinc-900 shadow-2xs'
-                      : isDark
-                        ? 'bg-black/25 border-white/6 text-zinc-400 hover:text-zinc-200'
-                        : 'bg-white/60 border-black/6 text-zinc-500 hover:text-zinc-800'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                        splitView.activePane === 'right'
-                          ? isDark
-                            ? 'bg-zinc-200'
-                            : 'bg-zinc-800'
-                          : 'bg-zinc-500/35'
-                      }`}
-                    />
-                    <FaviconIcon
-                      url={rightSplitTab.url}
-                      favicon={rightSplitTab.favicon}
-                      size={12}
-                    />
-                    <span className="truncate font-medium">
-                      {rightSplitTab.title || tr(lang, 'Right Tab', '右侧标签页')}
-                    </span>
+                    <div
+                      className="flex items-center gap-1 shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {!isInternalArkoUrl(leftSplitTab.url) &&
+                        !isInternalArkoUrl(rightSplitTab.url) && (
+                          <button
+                            onClick={() =>
+                              void handleAskAIFromBar(
+                                tr(
+                                  lang,
+                                  'Compare the core content, key differences, and strengths of the two pages open in Split View.',
+                                  '请详细对比我当前左右分屏中打开的这两个网页的核心内容、关键异同点与各自优势。'
+                                )
+                              )
+                            }
+                            title={tr(
+                              lang,
+                              'Compare both panes with AI',
+                              '让 AI 同时读取并对比左右两页'
+                            )}
+                            className={`px-1.5 py-0.5 rounded font-medium inline-flex items-center gap-1 transition ${
+                              isDark
+                                ? 'bg-white/8 text-zinc-200 hover:bg-white/15'
+                                : 'bg-black/6 text-zinc-800 hover:bg-black/10'
+                            }`}
+                          >
+                            <Sparkles size={10} />
+                            <span>{tr(lang, 'Compare', '对比双屏')}</span>
+                          </button>
+                        )}
+                      <button
+                        onClick={() => {
+                          void window.arko.setSplitActivePane('right')
+                          handleOpenOmniboxCurrentTab()
+                        }}
+                        title={tr(lang, 'Navigate right pane', '导航右侧页面')}
+                        className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
+                      >
+                        <Search size={11} />
+                      </button>
+                      <button
+                        onClick={() => void window.arko.closeSplitView('left')}
+                        title={tr(lang, 'Close right pane (keep left)', '关闭右侧分屏（保留左侧）')}
+                        className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
                   </div>
 
                   <div
-                    className="flex items-center gap-1 shrink-0"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {!isInternalArkoUrl(leftSplitTab.url) &&
-                      !isInternalArkoUrl(rightSplitTab.url) && (
-                        <button
-                          onClick={() =>
-                            void handleAskAIFromBar(
-                              tr(
-                                lang,
-                                'Compare the core content, key differences, and strengths of the two pages open in Split View.',
-                                '请详细对比我当前左右分屏中打开的这两个网页的核心内容、关键异同点与各自优势。'
-                              )
-                            )
-                          }
-                          title={tr(
-                            lang,
-                            'Compare both panes with AI',
-                            '让 AI 同时读取并对比左右两页'
-                          )}
-                          className={`px-1.5 py-0.5 rounded font-medium inline-flex items-center gap-1 transition ${
-                            isDark
-                              ? 'bg-white/8 text-zinc-200 hover:bg-white/15'
-                              : 'bg-black/6 text-zinc-800 hover:bg-black/10'
-                          }`}
-                        >
-                          <Sparkles size={10} />
-                          <span>{tr(lang, 'Compare', '对比双屏')}</span>
-                        </button>
-                      )}
-                    <button
-                      onClick={() => {
+                    ref={rightViewportRef}
+                    onMouseDown={() => {
+                      if (splitView.activePane !== 'right') {
                         void window.arko.setSplitActivePane('right')
-                        handleOpenOmniboxCurrentTab()
-                      }}
-                      title={tr(lang, 'Navigate right pane', '导航右侧页面')}
-                      className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
-                    >
-                      <Search size={11} />
-                    </button>
-                    <button
-                      onClick={() => void window.arko.closeSplitView('left')}
-                      title={tr(lang, 'Close right pane (keep left)', '关闭右侧分屏（保留左侧）')}
-                      className="p-1 rounded hover:bg-black/6 dark:hover:bg-white/10 opacity-65 hover:opacity-100"
-                    >
-                      <X size={12} />
-                    </button>
+                      }
+                    }}
+                    className={`relative flex-1 rounded-[10px] overflow-hidden border transition ${
+                      splitView.activePane === 'right'
+                        ? isDark
+                          ? 'bg-[#19191B] border-white/16 shadow-sm'
+                          : 'bg-white border-black/14 shadow-sm'
+                        : isDark
+                          ? 'bg-[#19191B] border-white/8'
+                          : 'bg-white border-black/8'
+                    }`}
+                  >
+                    {renderViewportPaneContent(rightSplitTab, snapshots.secondary, {
+                      isSplitPane: true,
+                      otherSplitTabId: leftSplitTab.id,
+                      paneSide: 'right'
+                    })}
                   </div>
                 </div>
-
-                <div
-                  ref={rightViewportRef}
-                  onMouseDown={() => {
-                    if (splitView.activePane !== 'right') {
-                      void window.arko.setSplitActivePane('right')
-                    }
-                  }}
-                  className={`relative flex-1 rounded-[10px] overflow-hidden border transition ${
-                    splitView.activePane === 'right'
-                      ? isDark
-                        ? 'bg-[#19191B] border-white/16 shadow-sm'
-                        : 'bg-white border-black/14 shadow-sm'
-                      : isDark
-                        ? 'bg-[#19191B] border-white/8'
-                        : 'bg-white border-black/8'
-                  }`}
-                >
-                  {renderViewportPaneContent(rightSplitTab, snapshots.secondary, {
-                    isSplitPane: true,
-                    otherSplitTabId: leftSplitTab.id,
-                    paneSide: 'right'
-                  })}
-                </div>
               </div>
-            </div>
-          ) : (
-            /* ==================== Arc Framed Rounded Single Viewport ==================== */
-            <div
-              ref={singleViewportRef}
-              id="browser-viewport"
-              className={`relative flex-1 rounded-[10px] overflow-hidden ${
-                isDark
-                  ? 'bg-[#19191B] ring-1 ring-white/[0.09] shadow-[0_4px_20px_rgba(0,0,0,0.34)]'
-                  : 'bg-[#FAFAFB] ring-1 ring-black/[0.075] shadow-[0_2px_14px_rgba(15,23,42,0.07)]'
-              }`}
-            >
+            ) : (
+              /* ==================== Single Browser Viewport ==================== */
               <div
-                key={`vp-${state.activeProfileId}-${spaceSwitchHud?.seq ?? 0}`}
-                className={`w-full h-full ${
-                  spaceSwitchHud
-                    ? spaceSwitchHud.dir === 'right'
-                      ? 'dia-space-slide-right'
-                      : 'dia-space-slide-left'
-                    : ''
+                ref={singleViewportRef}
+                id="browser-viewport"
+                className={`relative flex-1 overflow-hidden ${
+                  isVertical
+                    ? ''
+                    : `rounded-[10px] ${
+                        isDark
+                          ? 'bg-[#19191B] ring-1 ring-white/[0.09] shadow-[0_4px_20px_rgba(0,0,0,0.34)]'
+                          : 'bg-[#FAFAFB] ring-1 ring-black/[0.075] shadow-[0_2px_14px_rgba(15,23,42,0.07)]'
+                      }`
                 }`}
               >
-                {renderViewportPaneContent(activeTab, snapshots.primary)}
-              </div>
-
-              {/* Drag-Tab-to-Split-View Right Drop Zone */}
-              {draggingTabId && draggingTabId !== activeTab?.id && (
                 <div
-                  onDragOver={(e) => {
-                    e.preventDefault()
-                    setSplitDropHover(true)
-                  }}
-                  onDragLeave={() => setSplitDropHover(false)}
-                  onDrop={(e) => {
-                    e.preventDefault()
-                    const srcId =
-                      e.dataTransfer.getData('application/x-dia-tab-id') || draggingTabId
-                    setSplitDropHover(false)
-                    setDraggingTabId(null)
-                    if (srcId && srcId !== activeTab?.id) {
-                      void window.arko.openSplitView(srcId)
-                      showToast(
-                        tr(
-                          lang,
-                          'Opened tab in Right Split View',
-                          '已在右侧并排分屏中打开标签页'
-                        )
-                      )
-                    }
-                  }}
-                  className={`arc-modal-enter absolute top-3 bottom-3 right-3 w-[44%] rounded-2xl border border-dashed z-30 flex flex-col items-center justify-center gap-2 transition-all backdrop-blur-xs ${
-                    splitDropHover
-                      ? isDark
-                        ? 'bg-white/14 border-white/45 text-zinc-100 scale-[0.99]'
-                        : 'bg-black/8 border-black/35 text-zinc-900 scale-[0.99]'
-                      : isDark
-                        ? 'bg-black/35 border-white/18 text-zinc-300'
-                        : 'bg-white/80 border-black/18 text-zinc-700'
+                  key={`vp-${state.activeProfileId}-${spaceSwitchHud?.seq ?? 0}`}
+                  className={`w-full h-full ${
+                    spaceSwitchHud
+                      ? spaceSwitchHud.dir === 'right'
+                        ? 'dia-space-slide-right'
+                        : 'dia-space-slide-left'
+                      : ''
                   }`}
                 >
-                  <Columns2 size={22} className="opacity-80" />
-                  <span className="text-xs font-medium">
-                    {tr(lang, 'Drop to open in Right Split View', '松开以在右侧并排分屏打开')}
-                  </span>
+                  {renderViewportPaneContent(activeTab, snapshots.primary)}
                 </div>
-              )}
-            </div>
-          )}
+
+                {/* Drag-Tab-to-Split-View Right Drop Zone */}
+                {draggingTabId && draggingTabId !== activeTab?.id && (
+                  <div
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      setSplitDropHover(true)
+                    }}
+                    onDragLeave={() => setSplitDropHover(false)}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      const srcId =
+                        e.dataTransfer.getData('application/x-dia-tab-id') || draggingTabId
+                      setSplitDropHover(false)
+                      setDraggingTabId(null)
+                      if (srcId && srcId !== activeTab?.id) {
+                        void window.arko.openSplitView(srcId)
+                        showToast(
+                          tr(
+                            lang,
+                            'Opened tab in Right Split View',
+                            '已在右侧并排分屏中打开标签页'
+                          )
+                        )
+                      }
+                    }}
+                    className={`arc-modal-enter absolute top-3 bottom-3 right-3 w-[44%] rounded-2xl border border-dashed z-30 flex flex-col items-center justify-center gap-2 transition-all backdrop-blur-xs ${
+                      splitDropHover
+                        ? isDark
+                          ? 'bg-white/14 border-white/45 text-zinc-100 scale-[0.99]'
+                          : 'bg-black/8 border-black/35 text-zinc-900 scale-[0.99]'
+                        : isDark
+                          ? 'bg-black/35 border-white/18 text-zinc-300'
+                          : 'bg-white/80 border-black/18 text-zinc-700'
+                    }`}
+                  >
+                    <Columns2 size={22} className="opacity-80" />
+                    <span className="text-xs font-medium">
+                      {tr(lang, 'Drop to open in Right Split View', '松开以在右侧并排分屏打开')}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </main>
 
         {/* Smooth Sliding Right Docked Arko AI Sidebar (⌘E) */}
@@ -2468,7 +2811,7 @@ export const App: React.FC = () => {
           key={`${omniboxMode}-${state.activeTabId || 'none'}`}
           mode={omniboxMode}
           focusTrigger={omniboxFocusSeq}
-          isDark={isDark}
+          isDark={omniboxMode === 'current-tab' ? isTopBarDark : isDark}
           lang={lang}
           isClosing={omniboxAnim.isClosing}
           activeTabId={state.activeTabId}
@@ -2524,6 +2867,70 @@ export const App: React.FC = () => {
         />
       )}
 
+      {extensionsAnim.rendered && (
+        <ExtensionsPopover
+          isDark={isDark}
+          lang={lang}
+          isClosing={extensionsAnim.isClosing}
+          spaceName={activeProfile.name}
+          anchor={extensionsAnim.rendered}
+          extensions={state.extensions || []}
+          activeTabUrl={activeTab?.url}
+          activeTabTitle={activeTab?.title}
+          onOpenPopup={async (extId, pos) => {
+            const res = await window.arko.openExtensionPopup(extId, pos)
+            if (!res.ok && res.error) {
+              showToast(res.error)
+            }
+          }}
+          onOpenOptions={async (extId) => {
+            await window.arko.openExtensionOptions(extId)
+          }}
+          onToggleExtension={async (extId, en) => {
+            await window.arko.toggleExtension(extId, en)
+          }}
+          onRemoveExtension={async (extId) => {
+            await window.arko.removeExtension(extId)
+            showToast(tr(lang, 'Removed extension', '已移除扩展插件'))
+          }}
+          onInstallUnpacked={async () => {
+            const res = await window.arko.installUnpackedExtension()
+            if (res.ok && res.extension) {
+              showToast(
+                tr(
+                  lang,
+                  `🧩 Installed "${res.extension.name}"`,
+                  `🧩 已安装扩展「${res.extension.name}」`
+                )
+              )
+            } else if (res.error) {
+              showToast(res.error)
+            }
+          }}
+          onInstallWebStore={async (urlOrId) => {
+            const res = await window.arko.installWebStoreExtension(urlOrId)
+            if (res.ok && res.extension) {
+              showToast(
+                tr(
+                  lang,
+                  `🧩 Installed "${res.extension.name}" from Chrome Web Store`,
+                  `🧩 已从商店安装「${res.extension.name}」`
+                )
+              )
+              return true
+            }
+            if (res.error) {
+              showToast(res.error)
+            }
+            return false
+          }}
+          onOpenWebStoreHome={() => void window.arko.createTab('https://chromewebstore.google.com')}
+          onOpenBrowserImport={() => setImportModalMode('standalone')}
+          onOpenFullSettings={() => handleOpenSettingsAt('extensions')}
+          onClose={() => setExtensionsAnchor(null)}
+        />
+      )}
+
       {settingsAnim.mounted && (
         <SettingsModal
           isDark={isDark}
@@ -2532,9 +2939,59 @@ export const App: React.FC = () => {
           settings={state.settings}
           memories={state.memories}
           connectedTools={state.connectedTools}
+          extensions={state.extensions}
+          activeTabUrl={activeTab?.url}
+          activeTabTitle={activeTab?.title}
           accountState={state.accountState}
           updateState={currentUpdateState}
           onUpdateSettings={handleUpdateSettings}
+          onOpenExtensionPopup={async (extId) => {
+            const res = await window.arko.openExtensionPopup(extId)
+            if (!res.ok && res.error) {
+              showToast(res.error)
+            }
+          }}
+          onOpenExtensionOptions={async (extId) => {
+            await window.arko.openExtensionOptions(extId)
+          }}
+          onToggleExtension={async (extId, en) => {
+            await window.arko.toggleExtension(extId, en)
+          }}
+          onRemoveExtension={async (extId) => {
+            await window.arko.removeExtension(extId)
+            showToast(tr(lang, 'Removed extension', '已移除扩展插件'))
+          }}
+          onInstallUnpackedExtension={async () => {
+            const res = await window.arko.installUnpackedExtension()
+            if (res.ok && res.extension) {
+              showToast(
+                tr(
+                  lang,
+                  `🧩 Installed "${res.extension.name}"`,
+                  `🧩 已安装扩展「${res.extension.name}」`
+                )
+              )
+            } else if (res.error) {
+              showToast(res.error)
+            }
+          }}
+          onInstallWebStoreExtension={async (urlOrId) => {
+            const res = await window.arko.installWebStoreExtension(urlOrId)
+            if (res.ok && res.extension) {
+              showToast(
+                tr(
+                  lang,
+                  `🧩 Installed "${res.extension.name}"`,
+                  `🧩 已安装扩展「${res.extension.name}」`
+                )
+              )
+              return true
+            }
+            if (res.error) {
+              showToast(res.error)
+            }
+            return false
+          }}
           onConnectTool={async (tid) => {
             const res = await window.arko.connectTool(tid)
             if (res.openedLoginTab) {
@@ -2616,6 +3073,7 @@ export const App: React.FC = () => {
           settings={state.settings}
           onUpdateSettings={handleUpdateSettings}
           onShowToast={showToast}
+          onOpenExtensions={() => handleOpenSettingsAt('extensions')}
           onClose={() => setImportModalMode(null)}
         />
       )}

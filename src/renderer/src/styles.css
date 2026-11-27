@@ -336,6 +336,38 @@
 }
 
 /* Tactile Arc press micro-interactions */
+@property --dia-title-end-alpha {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 1;
+}
+
+@keyframes diaTabTitleFadeOnOverflow {
+  from,
+  to {
+    --dia-title-end-alpha: 0;
+  }
+}
+
+/* Arc / Dia full-bleed tab title: crisp when fitting, soft right-edge fade when overflowing */
+.dia-tab-title {
+  overflow-x: hidden;
+  white-space: nowrap;
+  --dia-title-end-alpha: 1;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    #000 calc(100% - 18px),
+    rgba(0, 0, 0, var(--dia-title-end-alpha)) 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    #000 calc(100% - 18px),
+    rgba(0, 0, 0, var(--dia-title-end-alpha)) 100%
+  );
+  animation: diaTabTitleFadeOnOverflow linear both;
+  animation-timeline: scroll(self inline);
+}
+
 .arc-pressable {
   transition:
     transform 140ms var(--arc-spring),
@@ -364,63 +396,15 @@
   transform: scale(0.95);
 }
 
-/* Dia / macOS Tahoe Liquid Glass Favorites Card & Capsule Pill */
-.dia-liquid-card {
-  position: relative;
-  isolation: isolate;
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+.dia-pin-tile {
+  transition:
+    transform 130ms var(--arc-spring),
+    background-color 140ms ease,
+    box-shadow 140ms ease;
 }
 
-.dia-liquid-card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  padding: 1px;
-  background: linear-gradient(
-    165deg,
-    rgba(255, 255, 255, 0.95) 0%,
-    rgba(255, 255, 255, 0.34) 48%,
-    rgba(255, 255, 255, 0.72) 100%
-  );
-  -webkit-mask:
-    linear-gradient(#fff 0 0) content-box,
-    linear-gradient(#fff 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  pointer-events: none;
-  transition: opacity 160ms ease;
-}
-
-.dark .dia-liquid-card::before {
-  background: linear-gradient(
-    165deg,
-    rgba(255, 255, 255, 0.26) 0%,
-    rgba(255, 255, 255, 0.05) 50%,
-    rgba(255, 255, 255, 0.14) 100%
-  );
-}
-
-.dia-liquid-card:not([data-active="true"]):hover {
-  background:
-    radial-gradient(125% 100% at 50% 0%, rgba(255, 255, 255, 0.88) 0%, rgba(255, 255, 255, 0) 72%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.74) 0%, rgba(255, 255, 255, 0.42) 100%) !important;
-  box-shadow:
-    0 5px 14px -3px rgba(15, 23, 42, 0.08),
-    0 1px 3px rgba(15, 23, 42, 0.04),
-    0 0 0 0.5px rgba(15, 23, 42, 0.06),
-    inset 0 1px 0.5px #ffffff !important;
-}
-
-.dark .dia-liquid-card:not([data-active="true"]):hover {
-  background:
-    radial-gradient(125% 100% at 50% 0%, rgba(255, 255, 255, 0.20) 0%, rgba(255, 255, 255, 0) 72%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0.06) 100%) !important;
-  box-shadow:
-    0 6px 16px -3px rgba(0, 0, 0, 0.38),
-    0 1px 3px rgba(0, 0, 0, 0.24),
-    inset 0 1px 0.5px rgba(255, 255, 255, 0.24) !important;
+.dia-pin-tile:active {
+  transform: scale(0.96);
 }
 
 .dia-liquid-pill {
@@ -628,4 +612,101 @@
 
 .dark .dia-prose a {
   color: #f4f4f5;
+}
+
+/* ==================== Cinematic Browser Migration Progress Animations ==================== */
+@keyframes arkoOrbitSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes arkoOrbitReverse {
+  0% { transform: rotate(360deg); }
+  100% { transform: rotate(0deg); }
+}
+
+@keyframes arkoAuroraFloat {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 0.55;
+  }
+  50% {
+    transform: translate3d(14px, -10px, 0) scale(1.12);
+    opacity: 0.85;
+  }
+}
+
+@keyframes arkoStreamDash {
+  0% {
+    stroke-dashoffset: 180;
+    opacity: 0.25;
+  }
+  45% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 0.25;
+  }
+}
+
+@keyframes arkoPulseRing {
+  0% {
+    transform: scale(0.92);
+    opacity: 0.75;
+  }
+  100% {
+    transform: scale(1.48);
+    opacity: 0;
+  }
+}
+
+@keyframes arkoShimmerSweep {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes arkoCelebratePop {
+  0% {
+    transform: scale(0.84);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.06);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.arko-orbit-cw {
+  animation: arkoOrbitSpin 9s linear infinite;
+}
+
+.arko-orbit-ccw {
+  animation: arkoOrbitReverse 13s linear infinite;
+}
+
+.arko-aurora-blob {
+  animation: arkoAuroraFloat 5.2s ease-in-out infinite;
+}
+
+.arko-stream-beam {
+  stroke-dasharray: 28 152;
+  animation: arkoStreamDash 1.55s cubic-bezier(0.35, 0, 0.25, 1) infinite;
+}
+
+.arko-pulse-ring {
+  animation: arkoPulseRing 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.arko-shimmer-bar {
+  background-size: 200% 100%;
+  animation: arkoShimmerSweep 2.1s linear infinite;
+}
+
+.arko-celebrate-pop {
+  animation: arkoCelebratePop 420ms var(--arc-spring-bouncy) both;
 }

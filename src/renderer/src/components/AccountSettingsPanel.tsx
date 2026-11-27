@@ -167,7 +167,8 @@ export const AccountSettingsPanel: React.FC<Props> = ({
   const [twoFactorToken, setTwoFactorToken] = useState<string | null>(null)
   const [twoFactorCode, setTwoFactorCode] = useState('')
 
-  // 注册表单状态
+  // 注册表单状态（两步式：第 1 步「邮箱 + 图形验证码 -> 发邮件验证码」；第 2 步「邮件验证码 + 密码 -> 完成注册」）
+  const [regStep, setRegStep] = useState<1 | 2>(1)
   const [regEmail, setRegEmail] = useState('')
   const [regUsername, setRegUsername] = useState('')
   const [regUsernameTouched, setRegUsernameTouched] = useState(false)
@@ -177,6 +178,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
   const [regCaptchaCode, setRegCaptchaCode] = useState('')
   const [emailCodeCountdown, setEmailCodeCountdown] = useState(0)
   const [sendingEmailCode, setSendingEmailCode] = useState(false)
+  const [showResendCaptcha, setShowResendCaptcha] = useState(false)
 
   // 密码重置状态
   const [resetEmail, setResetEmail] = useState('')
@@ -374,34 +376,64 @@ export const AccountSettingsPanel: React.FC<Props> = ({
   }
 
   /**
-   * 发送注册邮箱一次性 6 位验证码。
+   * 校验图形安全验证码并向目标邮箱发送一次性 6 位注册验证码，成功后进入第 2 步。
+   * @param e 可选表单提交事件
    */
-  const handleSendEmailCode = async (): Promise<void> => {
+  const handleSendEmailCode = async (e?: React.FormEvent): Promise<void> => {
+    e?.preventDefault()
     setFeedback(null)
-    if (!regEmail.trim()) {
+
+    const cleanEmail = regEmail.trim().toLowerCase()
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
       setFeedback({
         kind: 'err',
-        text: tr(lang, 'Please enter your email address first.', '请先填写邮箱地址')
+        text: tr(lang, 'Please enter a valid email address.', '请输入有效的邮箱地址')
       })
       return
     }
+
+    const needCaptcha = capabilities.registerCaptchaEnabled && captcha?.enabled !== false
+    if (needCaptcha && (!captcha?.captchaId || !regCaptchaCode.trim())) {
+      if (!captcha?.captchaId) {
+        void loadCaptcha()
+      }
+      setFeedback({
+        kind: 'err',
+        text: tr(lang, 'Please enter the image verification code.', '请先输入右侧图形安全验证码')
+      })
+      return
+    }
+
     setSendingEmailCode(true)
-    const res = await window.arko.sendEmailVerificationCode(regEmail.trim())
+    const res = await window.arko.sendEmailVerificationCode({
+      email: cleanEmail,
+      captchaId: needCaptcha ? captcha?.captchaId : undefined,
+      captchaCode: needCaptcha ? regCaptchaCode.trim() : undefined
+    })
     setSendingEmailCode(false)
+
     if (res.ok) {
       setEmailCodeCountdown(60)
+      setShowResendCaptcha(false)
+      setRegStep(2)
+      if (capabilities.registerCaptchaEnabled) {
+        void loadCaptcha()
+      }
       setFeedback({
         kind: 'ok',
         text: tr(
           lang,
-          'Verification code sent! Please check your inbox.',
-          '验证码已发送至您的邮箱，请注意查收'
+          `Verification code sent to ${cleanEmail}! Please check your inbox.`,
+          `邮件验证码已发送至 ${cleanEmail}，请查收并完成注册`
         )
       })
     } else {
+      if (capabilities.registerCaptchaEnabled) {
+        void loadCaptcha()
+      }
       setFeedback({
         kind: 'err',
-        text: res.error || tr(lang, 'Failed to send verification code', '验证码发送失败')
+        text: res.error || tr(lang, 'Failed to send verification code', '邮件验证码发送失败')
       })
     }
   }
@@ -500,7 +532,7 @@ export const AccountSettingsPanel: React.FC<Props> = ({
   }
 
   /**
-   * 处理新账号邮箱注册并直接登录激活内置云端模型。
+   * 第 2 步：核验 6 位邮箱验证码与密码，完成真实邮箱绑定注册并自动登录激活内置云端模型。
    * @param e 表单事件
    */
   const handleRegisterSubmit = async (e: React.FormEvent): Promise<void> => {
@@ -509,9 +541,17 @@ export const AccountSettingsPanel: React.FC<Props> = ({
 
     const cleanEmail = regEmail.trim().toLowerCase()
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(cleanEmail)) {
+      setRegStep(1)
       setFeedback({
         kind: 'err',
         text: tr(lang, 'Please enter a valid email address.', '请输入有效的邮箱地址')
+      })
+      return
+    }
+    if (!regEmailCode.trim()) {
+      setFeedback({
+        kind: 'err',
+        text: tr(lang, 'Please enter the email verification code.', '请输入邮件中的 6 位验证码')
       })
       return
     }
@@ -529,51 +569,35 @@ export const AccountSettingsPanel: React.FC<Props> = ({
       })
       return
     }
-    if (capabilities.emailVerificationRequired && !regEmailCode.trim()) {
-      setFeedback({
-        kind: 'err',
-        text: tr(lang, 'Please enter the email verification code.', '请输入邮箱验证码')
-      })
-      return
-    }
-    if (capabilities.registerCaptchaEnabled && captcha?.enabled && !regCaptchaCode.trim()) {
-      setFeedback({
-        kind: 'err',
-        text: tr(lang, 'Please enter the image verification code.', '请输入图形安全验证码')
-      })
-      return
-    }
 
     setSubmitting(true)
     const res = await window.arko.registerAccount({
       email: cleanEmail,
       username: cleanEmail.length > 20 ? regUsername.trim() || undefined : undefined,
       password: regPassword,
-      verificationCode: regEmailCode.trim() || undefined,
-      captchaId: captcha?.captchaId,
-      captchaCode: regCaptchaCode.trim() || undefined
+      verificationCode: regEmailCode.trim()
     })
     setSubmitting(false)
 
     if (res.ok) {
       setRegPassword('')
       setRegConfirmPassword('')
+      setRegEmailCode('')
       setRegCaptchaCode('')
+      setShowResendCaptcha(false)
+      setRegStep(1)
       setFeedback({
         kind: 'ok',
         text: tr(
           lang,
-          'Account created & signed in! Arko Cloud AI is ready to use.',
-          '注册成功并已自动登录！Arko 云端 AI 已即刻可用'
+          'Email verified & account created! Arko Cloud AI is ready to use.',
+          '邮箱核验通过并已完成注册登录！Arko 云端 AI 已即刻可用'
         )
       })
     } else {
-      if (capabilities.registerCaptchaEnabled) {
-        void loadCaptcha()
-      }
       setFeedback({
         kind: 'err',
-        text: res.error || tr(lang, 'Registration failed', '注册失败，请检查填写内容')
+        text: res.error || tr(lang, 'Registration failed', '注册失败，请检查邮件验证码或填写内容')
       })
     }
   }
@@ -1664,170 +1688,351 @@ export const AccountSettingsPanel: React.FC<Props> = ({
             )}
           </form>
         ) : mode === 'register' ? (
-          <form
-            onSubmit={(e) => void handleRegisterSubmit(e)}
+          <div
             className={`p-4 sm:p-5 rounded-2xl border space-y-3.5 ${
               isDark ? 'bg-white/[0.02] border-white/8' : 'bg-zinc-50/70 border-black/7'
             }`}
           >
-            <div className="space-y-1">
-              <label className="opacity-70 block">{tr(lang, 'Email Address', '电子邮箱')}</label>
-              <div className="relative flex items-center">
-                <Mail size={13.5} className="absolute left-3 opacity-45 pointer-events-none" />
-                <input
-                  autoFocus
-                  type="email"
-                  value={regEmail}
-                  onChange={(e) => handleEmailChange(e.target.value)}
-                  placeholder="name@example.com"
-                  className={`${inputCls} pl-8`}
-                />
+            {/* 两步引导进度条 */}
+            <div className="flex items-center gap-2 text-[11px]">
+              <div
+                className={`flex-1 px-2.5 py-1.5 rounded-xl border font-medium flex items-center gap-1.5 transition ${
+                  regStep === 1
+                    ? 'border-indigo-500/40 bg-indigo-500/12 text-indigo-600 dark:text-indigo-300'
+                    : isDark
+                      ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300'
+                      : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                }`}
+              >
+                <span className="w-4 h-4 rounded-full text-[10px] font-bold inline-flex items-center justify-center bg-current/15 shrink-0">
+                  {regStep > 1 ? '✓' : '1'}
+                </span>
+                <span className="truncate">{tr(lang, 'Verify Email', '安全校验并发信')}</span>
+              </div>
+
+              <div
+                className={`flex-1 px-2.5 py-1.5 rounded-xl border font-medium flex items-center gap-1.5 transition ${
+                  regStep === 2
+                    ? 'border-indigo-500/40 bg-indigo-500/12 text-indigo-600 dark:text-indigo-300'
+                    : isDark
+                      ? 'border-white/8 bg-white/[0.02] opacity-50'
+                      : 'border-black/8 bg-white/60 opacity-50'
+                }`}
+              >
+                <span className="w-4 h-4 rounded-full text-[10px] font-bold inline-flex items-center justify-center bg-current/15 shrink-0">
+                  2
+                </span>
+                <span className="truncate">{tr(lang, 'Confirm & Setup', '邮件确认并设密码')}</span>
               </div>
             </div>
 
-            {regEmail.trim().length > 20 && (
-              <div className="space-y-1">
-                <label className="opacity-70 block">
-                  {tr(
-                    lang,
-                    'Account ID (1–20 chars, can also be used to sign in)',
-                    '账号短标识（20 字符内，可用于跨设备快捷登录）'
-                  )}
-                </label>
-                <input
-                  value={regUsername}
-                  maxLength={20}
-                  onChange={(e) => {
-                    setRegUsernameTouched(true)
-                    setRegUsername(e.target.value)
-                  }}
-                  placeholder={tr(lang, 'Up to 20 characters', '最多 20 个字符')}
-                  className={`${inputCls} font-mono`}
-                />
-              </div>
-            )}
-
-            {capabilities.emailVerificationRequired && (
-              <div className="space-y-1">
-                <label className="opacity-70 block">
-                  {tr(lang, 'Email Verification Code', '邮箱验证码')}
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    value={regEmailCode}
-                    onChange={(e) => setRegEmailCode(e.target.value)}
-                    placeholder={tr(lang, '6-digit code', '输入邮件中的验证码')}
-                    className={`${inputCls} flex-1 font-mono min-w-0`}
-                  />
-                  <button
-                    type="button"
-                    disabled={sendingEmailCode || emailCodeCountdown > 0 || !regEmail.trim()}
-                    onClick={() => void handleSendEmailCode()}
-                    className={`h-9 px-3 rounded-xl border font-medium shrink-0 transition disabled:opacity-50 whitespace-nowrap ${
-                      isDark
-                        ? 'border-white/12 bg-white/5 hover:bg-white/10 text-zinc-100'
-                        : 'border-black/10 bg-white hover:bg-zinc-100 text-zinc-800'
-                    }`}
-                  >
-                    {sendingEmailCode ? (
-                      <Loader2 size={13} className="animate-spin" />
-                    ) : emailCodeCountdown > 0 ? (
-                      `${emailCodeCountdown}s`
-                    ) : (
-                      tr(lang, 'Send Code', '获取验证码')
-                    )}
-                  </button>
+            {regStep === 1 ? (
+              <form onSubmit={(e) => void handleSendEmailCode(e)} className="space-y-3.5">
+                <div className="space-y-1">
+                  <label className="opacity-70 block">{tr(lang, 'Email Address', '电子邮箱')}</label>
+                  <div className="relative flex items-center">
+                    <Mail size={13.5} className="absolute left-3 opacity-45 pointer-events-none" />
+                    <input
+                      autoFocus
+                      type="email"
+                      value={regEmail}
+                      onChange={(e) => handleEmailChange(e.target.value)}
+                      placeholder="name@example.com"
+                      className={`${inputCls} pl-8`}
+                    />
+                  </div>
                 </div>
-              </div>
-            )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              <div className="space-y-1">
-                <label className="opacity-70 block">
-                  {tr(lang, 'Password (8+ chars)', '设置密码（至少 8 位）')}
-                </label>
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  value={regPassword}
-                  onChange={(e) => setRegPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className={inputCls}
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="opacity-70 block">
-                  {tr(lang, 'Confirm Password', '确认密码')}
-                </label>
-                <div className="relative flex items-center">
-                  <input
-                    type={showPassword ? 'text' : 'password'}
-                    value={regConfirmPassword}
-                    onChange={(e) => setRegConfirmPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className={`${inputCls} pr-8`}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-2.5 opacity-55 hover:opacity-100"
-                  >
-                    {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {capabilities.registerCaptchaEnabled && (
-              <div className="space-y-1">
-                <label className="opacity-70 block">
-                  {tr(lang, 'Security Verification', '安全图形验证码（点击图片可刷新）')}
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    value={regCaptchaCode}
-                    onChange={(e) => setRegCaptchaCode(e.target.value.toUpperCase())}
-                    placeholder={tr(lang, 'Enter characters', '输入右侧字符')}
-                    className={`${inputCls} flex-1 font-mono tracking-wider uppercase min-w-0`}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void loadCaptcha()}
-                    title={tr(lang, 'Click to refresh code', '点击换一张验证码')}
-                    className={`h-9 w-28 rounded-xl border overflow-hidden flex items-center justify-center shrink-0 transition ${
-                      isDark ? 'border-white/12 bg-white/95' : 'border-black/12 bg-slate-50'
-                    }`}
-                  >
-                    {loadingCaptcha ? (
-                      <Loader2 size={14} className="animate-spin text-zinc-500" />
-                    ) : captcha?.captchaImage ? (
-                      <img
-                        src={captcha.captchaImage}
-                        alt={tr(lang, 'Verification Code', '图形验证码')}
-                        className="w-full h-full object-cover select-none"
+                {capabilities.registerCaptchaEnabled && captcha?.enabled !== false && (
+                  <div className="space-y-1">
+                    <label className="opacity-70 block">
+                      {tr(lang, 'Security Verification', '安全图形验证码（点击图片可刷新）')}
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={regCaptchaCode}
+                        onChange={(e) => setRegCaptchaCode(e.target.value.toUpperCase())}
+                        placeholder={tr(lang, 'Enter characters', '输入右侧图形字符')}
+                        className={`${inputCls} flex-1 font-mono tracking-wider uppercase min-w-0`}
                       />
-                    ) : (
-                      <span className="text-[11px] text-zinc-600 px-1">
-                        {tr(lang, 'Reload', '点击加载')}
-                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void loadCaptcha()}
+                        title={tr(lang, 'Click to refresh code', '点击换一张验证码')}
+                        className={`h-9 w-28 rounded-xl border overflow-hidden flex items-center justify-center shrink-0 transition ${
+                          isDark ? 'border-white/12 bg-white/95' : 'border-black/12 bg-slate-50'
+                        }`}
+                      >
+                        {loadingCaptcha ? (
+                          <Loader2 size={14} className="animate-spin text-zinc-500" />
+                        ) : captcha?.captchaImage ? (
+                          <img
+                            src={captcha.captchaImage}
+                            alt={tr(lang, 'Verification Code', '图形验证码')}
+                            className="w-full h-full object-cover select-none"
+                          />
+                        ) : (
+                          <span className="text-[11px] text-zinc-600 px-1">
+                            {tr(lang, 'Reload', '点击加载')}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={sendingEmailCode || emailCodeCountdown > 0 || !regEmail.trim()}
+                  className="w-full h-9 mt-1 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-500 transition disabled:opacity-50 inline-flex items-center justify-center gap-1.5 shadow-sm"
+                >
+                  {sendingEmailCode ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <Mail size={14} />
+                  )}
+                  <span>
+                    {emailCodeCountdown > 0
+                      ? tr(
+                          lang,
+                          `Code Sent (${emailCodeCountdown}s)`,
+                          `邮件验证码已发送（${emailCodeCountdown}s）`
+                        )
+                      : tr(lang, 'Send Email Verification Code', '验证并发送邮件验证码')}
+                  </span>
+                </button>
+
+                {emailCodeCountdown > 0 && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(regEmail.trim()) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFeedback(null)
+                      setRegStep(2)
+                    }}
+                    className="w-full text-center text-[11px] text-indigo-500 hover:underline pt-0.5"
+                  >
+                    {tr(
+                      lang,
+                      'Already received your email code? Continue to Step 2 →',
+                      '已收到邮件验证码？直接进入第 2 步填写 →'
                     )}
                   </button>
+                )}
+              </form>
+            ) : (
+              <form onSubmit={(e) => void handleRegisterSubmit(e)} className="space-y-3.5">
+                {/* 已验证目标邮箱摘要栏 */}
+                <div
+                  className={`px-3 py-2 rounded-xl border flex items-center justify-between gap-2 ${
+                    isDark ? 'bg-[#16161C] border-white/10' : 'bg-white border-black/10'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Mail size={13} className="text-indigo-500 shrink-0" />
+                    <span className="font-medium truncate">{regEmail.trim().toLowerCase()}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRegStep(1)
+                      setShowResendCaptcha(false)
+                      setFeedback(null)
+                    }}
+                    className="text-[11px] text-indigo-500 hover:underline shrink-0"
+                  >
+                    {tr(lang, 'Change Email', '修改邮箱')}
+                  </button>
                 </div>
-              </div>
-            )}
 
-            <button
-              type="submit"
-              disabled={submitting}
-              className="w-full h-9 mt-1 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-500 transition disabled:opacity-50 inline-flex items-center justify-center gap-1.5 shadow-sm"
-            >
-              {submitting ? (
-                <Loader2 size={14} className="animate-spin" />
-              ) : (
-                <CheckCircle2 size={14} />
-              )}
-              <span>{tr(lang, 'Create Account & Start Using AI', '创建邮箱账号并即刻启用 AI')}</span>
-            </button>
-          </form>
+                <div className="space-y-1">
+                  <label className="opacity-70 block">
+                    {tr(lang, 'Email Verification Code', '邮件验证码（6 位）')}
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      autoFocus
+                      maxLength={8}
+                      autoComplete="one-time-code"
+                      value={regEmailCode}
+                      onChange={(e) => setRegEmailCode(e.target.value)}
+                      placeholder={tr(lang, 'Enter 6-digit code from email', '输入邮件中的 6 位验证码')}
+                      className={`${inputCls} flex-1 font-mono tracking-widest min-w-0`}
+                    />
+                    <button
+                      type="button"
+                      disabled={sendingEmailCode || emailCodeCountdown > 0}
+                      onClick={() => {
+                        const needCaptcha =
+                          capabilities.registerCaptchaEnabled && captcha?.enabled !== false
+                        if (needCaptcha && !showResendCaptcha) {
+                          setShowResendCaptcha(true)
+                          setFeedback(null)
+                          if (!captcha?.captchaId) {
+                            void loadCaptcha()
+                          }
+                          return
+                        }
+                        void handleSendEmailCode()
+                      }}
+                      className={`h-9 px-3 rounded-xl border font-medium shrink-0 transition disabled:opacity-50 whitespace-nowrap ${
+                        isDark
+                          ? 'border-white/12 bg-white/5 hover:bg-white/10 text-zinc-100'
+                          : 'border-black/10 bg-white hover:bg-zinc-100 text-zinc-800'
+                      }`}
+                    >
+                      {sendingEmailCode ? (
+                        <Loader2 size={13} className="animate-spin" />
+                      ) : emailCodeCountdown > 0 ? (
+                        `${emailCodeCountdown}s`
+                      ) : (
+                        tr(lang, 'Resend Code', '重新发送')
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* 倒计时结束后如需重发邮件验证码，内联核验新图形码而无需丢失已填密码 */}
+                {showResendCaptcha &&
+                  emailCodeCountdown === 0 &&
+                  capabilities.registerCaptchaEnabled &&
+                  captcha?.enabled !== false && (
+                    <div
+                      className={`p-3 rounded-xl border space-y-2 ${
+                        isDark ? 'bg-[#16161C] border-white/10' : 'bg-white border-black/10'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-[11px]">
+                        <span className="opacity-75">
+                          {tr(
+                            lang,
+                            'Enter security code to resend verification email',
+                            '输入新图形验证码以重新发送邮件'
+                          )}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setShowResendCaptcha(false)}
+                          className="opacity-60 hover:opacity-100"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={regCaptchaCode}
+                          onChange={(e) => setRegCaptchaCode(e.target.value.toUpperCase())}
+                          placeholder={tr(lang, 'Enter characters', '输入图形字符')}
+                          className={`${inputCls} flex-1 font-mono tracking-wider uppercase min-w-0`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void loadCaptcha()}
+                          title={tr(lang, 'Click to refresh code', '点击换一张验证码')}
+                          className={`h-9 w-28 rounded-xl border overflow-hidden flex items-center justify-center shrink-0 transition ${
+                            isDark ? 'border-white/12 bg-white/95' : 'border-black/12 bg-slate-50'
+                          }`}
+                        >
+                          {loadingCaptcha ? (
+                            <Loader2 size={14} className="animate-spin text-zinc-500" />
+                          ) : captcha?.captchaImage ? (
+                            <img
+                              src={captcha.captchaImage}
+                              alt={tr(lang, 'Verification Code', '图形验证码')}
+                              className="w-full h-full object-cover select-none"
+                            />
+                          ) : (
+                            <span className="text-[11px] text-zinc-600 px-1">
+                              {tr(lang, 'Reload', '点击加载')}
+                            </span>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={sendingEmailCode || !regCaptchaCode.trim()}
+                          onClick={() => void handleSendEmailCode()}
+                          className="h-9 px-3 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-500 transition disabled:opacity-50 shrink-0"
+                        >
+                          {tr(lang, 'Send', '发送')}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                {regEmail.trim().length > 20 && (
+                  <div className="space-y-1">
+                    <label className="opacity-70 block">
+                      {tr(
+                        lang,
+                        'Account ID (1–20 chars, optional handle)',
+                        '账号短标识（20 字符内，可选）'
+                      )}
+                    </label>
+                    <input
+                      value={regUsername}
+                      maxLength={20}
+                      onChange={(e) => {
+                        setRegUsernameTouched(true)
+                        setRegUsername(e.target.value)
+                      }}
+                      placeholder={tr(lang, 'Up to 20 characters', '最多 20 个字符')}
+                      className={`${inputCls} font-mono`}
+                    />
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div className="space-y-1">
+                    <label className="opacity-70 block">
+                      {tr(lang, 'Password (8+ chars)', '设置密码（至少 8 位）')}
+                    </label>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={regPassword}
+                      onChange={(e) => setRegPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className={inputCls}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="opacity-70 block">
+                      {tr(lang, 'Confirm Password', '确认密码')}
+                    </label>
+                    <div className="relative flex items-center">
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        value={regConfirmPassword}
+                        onChange={(e) => setRegConfirmPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className={`${inputCls} pr-8`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-2.5 opacity-55 hover:opacity-100"
+                      >
+                        {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={submitting}
+                  className="w-full h-9 mt-1 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-500 transition disabled:opacity-50 inline-flex items-center justify-center gap-1.5 shadow-sm"
+                >
+                  {submitting ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <CheckCircle2 size={14} />
+                  )}
+                  <span>
+                    {tr(lang, 'Verify & Create Account', '确认无误并完成注册')}
+                  </span>
+                </button>
+              </form>
+            )}
+          </div>
         ) : (
           <form
             onSubmit={(e) => void handleResetSubmit(e)}

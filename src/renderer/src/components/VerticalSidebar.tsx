@@ -4,10 +4,12 @@ import {
   ChevronDown,
   Clock,
   Columns2,
+  CornerLeftUp,
   Download,
   Folder,
   FolderKanban,
   FolderOpen,
+  FolderPlus,
   Link2,
   Loader2,
   PanelLeft,
@@ -19,7 +21,6 @@ import {
   RotateCcw,
   Settings,
   SlidersHorizontal,
-  Star,
   Trash2,
   UserRound,
   Volume2,
@@ -38,6 +39,7 @@ import type {
   DownloadItemState,
   SplitViewState,
   TabGroup,
+  TabGroupColor,
   TabPinMode,
   TabState
 } from '@shared/types'
@@ -102,9 +104,20 @@ interface Props {
   onTabContextMenu: (tab: TabState, pos: { x: number; y: number }) => void
   onToggleGroupCollapsed: (groupId: string) => void
   onAssignTabToGroup?: (tabId: string, groupId: string | null) => void
+  onCreateTabGroup?: (
+    title: string,
+    color: TabGroupColor,
+    tabIds?: string[],
+    options?: {
+      parentId?: string | null
+      profileId?: string
+      zone?: 'pinned' | 'unpinned'
+      keepEmpty?: boolean
+    }
+  ) => Promise<TabGroup>
   onUpdateTabGroup?: (
     groupId: string,
-    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed'>>
+    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed' | 'parentId'>>
   ) => void
   onDeleteTabGroup?: (groupId: string) => void
   onOrganizeTabs: () => void
@@ -131,18 +144,19 @@ const MIN_SIDEBAR_WIDTH = 188
 const MAX_SIDEBAR_WIDTH = 420
 
 // Dia / Arc tactile Space swipe & critically-damped rubber-band physics
-const SWIPE_LOCK_X_PX = 5
-const SWIPE_LOCK_Y_PX = 6.5
-const SWIPE_AXIS_RATIO = 1.35
-const SWIPE_TRACKING_GAIN = 0.86
-const SWIPE_SNAP_RATIO = 0.34
-const SWIPE_PROJECTION_SEC = 0.14
-const SWIPE_FLICK_MIN_DIST_RATIO = 0.16
+const SWIPE_LOCK_X_PX = 10
+const SWIPE_LOCK_Y_PX = 7.5
+const SWIPE_AXIS_RATIO = 1.6
+const SWIPE_TRACKING_GAIN = 0.92
+const SWIPE_SNAP_RATIO = 0.28
+const SWIPE_PROJECTION_SEC = 0.16
+const SWIPE_FLICK_MIN_DIST_RATIO = 0.095
+const SWIPE_FLICK_MIN_VELOCITY = 140
 const SWIPE_MAX_REF_WIDTH = 260
 
-// Taut NSScrollView-style boundary rubber-band (< 18px asymptotic ceiling so pills never clip)
-const BOUNDARY_RUBBER_MAX_PX = 18
-const BOUNDARY_RUBBER_COEFF = 0.48
+// Taut NSScrollView-style boundary rubber-band (clear tactile edge feedback without clipping)
+const BOUNDARY_RUBBER_MAX_PX = 15
+const BOUNDARY_RUBBER_COEFF = 0.45
 
 // Critically-damped harmonic oscillator (zeta = 1.0 -> zero overshoot, zero multi-bounce)
 const SPRING_OMEGA_BOUNDARY = 25
@@ -225,9 +239,169 @@ function getFavColCount(itemCount: number, sidebarWidth: number): number {
   if (itemCount <= 1) return 1
   if (itemCount === 2) return 2
   if (itemCount === 3) return 3
-  if (sidebarWidth >= 320 && itemCount >= 5) return 5
-  if (sidebarWidth < 196 && itemCount >= 4) return 3
+  if (sidebarWidth >= 340 && itemCount >= 5) return 5
   return 4
+}
+
+interface FaviconBrandSample {
+  kind: 'opaque-brand' | 'glyph-brand' | 'neutral'
+  rgb: [number, number, number]
+}
+
+const faviconBrandCache = new Map<string, FaviconBrandSample>()
+const faviconBrandPending = new Set<string>()
+
+function mixRgbTuple(
+  a: [number, number, number],
+  b: [number, number, number],
+  weightB: number
+): [number, number, number] {
+  const w = Math.max(0, Math.min(1, weightB))
+  return [
+    Math.round(a[0] * (1 - w) + b[0] * w),
+    Math.round(a[1] * (1 - w) + b[1] * w),
+    Math.round(a[2] * (1 - w) + b[2] * w)
+  ]
+}
+
+function rgbCss([r, g, b]: [number, number, number], alpha = 1): string {
+  return alpha >= 0.999 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
+function extractFaviconBrandSampleFromImage(img: HTMLImageElement): FaviconBrandSample {
+  try {
+    const size = 32
+    const canvas = document.createElement('canvas')
+    canvas.width = size
+    canvas.height = size
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return { kind: 'neutral', rgb: [128, 128, 128] }
+    ctx.clearRect(0, 0, size, size)
+    ctx.drawImage(img, 0, 0, size, size)
+    const data = ctx.getImageData(0, 0, size, size).data
+
+    // 1. Sample inset perimeter bands (safely inside rounded-square & circle favicons, outside center glyph)
+    const edgeCoords: Array<[number, number]> = []
+    for (let i = 10; i <= 21; i += 2) {
+      edgeCoords.push([i, 4], [i, 27], [4, i], [27, i])
+    }
+
+    const opaqueEdges: Array<[number, number, number]> = []
+    for (const [x, y] of edgeCoords) {
+      const idx = (y * size + x) * 4
+      const a = data[idx + 3]
+      if (a >= 205) {
+        opaqueEdges.push([data[idx], data[idx + 1], data[idx + 2]])
+      }
+    }
+
+    if (opaqueEdges.length >= Math.ceil(edgeCoords.length * 0.72)) {
+      let sumR = 0
+      let sumG = 0
+      let sumB = 0
+      for (const [r, g, b] of opaqueEdges) {
+        sumR += r
+        sumG += g
+        sumB += b
+      }
+      const meanR = sumR / opaqueEdges.length
+      const meanG = sumG / opaqueEdges.length
+      const meanB = sumB / opaqueEdges.length
+
+      let consistentCount = 0
+      for (const [r, g, b] of opaqueEdges) {
+        const dist = Math.abs(r - meanR) + Math.abs(g - meanG) + Math.abs(b - meanB)
+        if (dist <= 48) consistentCount++
+      }
+
+      if (consistentCount >= Math.ceil(opaqueEdges.length * 0.8)) {
+        const r = Math.round(meanR)
+        const g = Math.round(meanG)
+        const b = Math.round(meanB)
+        const maxC = Math.max(r, g, b)
+        const minC = Math.min(r, g, b)
+        const sat = maxC > 0 ? (maxC - minC) / maxC : 0
+        const val = maxC / 255
+        if (sat >= 0.16 && val >= 0.18 && val <= 0.95) {
+          return { kind: 'opaque-brand', rgb: [r, g, b] }
+        }
+      }
+    }
+
+    // 2. Otherwise inspect chromatic foreground glyph pixels on transparent/multi-tone icons
+    let wSum = 0
+    let wR = 0
+    let wG = 0
+    let wB = 0
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3]
+      if (a < 120) continue
+      const r = data[i]
+      const g = data[i + 1]
+      const b = data[i + 2]
+      const maxC = Math.max(r, g, b)
+      const minC = Math.min(r, g, b)
+      const sat = maxC > 0 ? (maxC - minC) / maxC : 0
+      const val = maxC / 255
+      if (sat < 0.26 || val < 0.22 || val > 0.98) continue
+      const w = sat * (a / 255)
+      wSum += w
+      wR += r * w
+      wG += g * w
+      wB += b * w
+    }
+
+    if (wSum >= 10) {
+      return {
+        kind: 'glyph-brand',
+        rgb: [Math.round(wR / wSum), Math.round(wG / wSum), Math.round(wB / wSum)]
+      }
+    }
+  } catch {
+    // Tainted canvas or decode failure -> calm neutral fallback
+  }
+  return { kind: 'neutral', rgb: [128, 128, 128] }
+}
+
+function getDiaActivePinStyle(
+  sample: FaviconBrandSample | undefined,
+  isDark: boolean
+): React.CSSProperties {
+  if (sample?.kind === 'opaque-brand') {
+    const borderRgb = mixRgbTuple(sample.rgb, [255, 255, 255], 0.56)
+    return {
+      backgroundColor: rgbCss(sample.rgb),
+      boxShadow: `inset 0 0 0 2px ${rgbCss(borderRgb)}`
+    }
+  }
+
+  if (sample?.kind === 'glyph-brand') {
+    if (isDark) {
+      const fillRgb = mixRgbTuple([44, 45, 48], sample.rgb, 0.34)
+      const borderRgb = mixRgbTuple(sample.rgb, [255, 255, 255], 0.48)
+      return {
+        backgroundColor: rgbCss(fillRgb),
+        boxShadow: `inset 0 0 0 2px ${rgbCss(borderRgb, 0.88)}`
+      }
+    }
+    const fillRgb = mixRgbTuple([246, 246, 248], sample.rgb, 0.2)
+    const borderRgb = mixRgbTuple(sample.rgb, [255, 255, 255], 0.12)
+    return {
+      backgroundColor: rgbCss(fillRgb),
+      boxShadow: `inset 0 0 0 2px ${rgbCss(borderRgb, 0.62)}`
+    }
+  }
+
+  if (isDark) {
+    return {
+      backgroundColor: 'rgba(255, 255, 255, 0.16)',
+      boxShadow: 'inset 0 0 0 2px rgba(255, 255, 255, 0.46)'
+    }
+  }
+  return {
+    backgroundColor: 'rgba(255, 255, 255, 0.94)',
+    boxShadow: 'inset 0 0 0 2px rgba(24, 24, 27, 0.24)'
+  }
 }
 
 function getFavGridColsClass(cols: number): string {
@@ -287,6 +461,7 @@ interface WheelGestureState {
   intentAbsY: number
   rawDragPx: number
   velocityPx: number
+  peakVelocityPx: number
   lastEventAt: number
   lastDxSign: 1 | -1 | 0
   rawAbsWindow: number[]
@@ -298,7 +473,7 @@ interface WheelGestureState {
   absorbEnteredAt: number
   minAbsorbedMed: number
   reengageStreak: number
-  oppositeStreak: number
+  absorbOppositePx: number
   dragIdleTimer: number | null
   streamEndTimer: number | null
 }
@@ -331,6 +506,7 @@ function resetWheelGestureToIdle(g: WheelGestureState): void {
   g.intentAbsY = 0
   g.rawDragPx = 0
   g.velocityPx = 0
+  g.peakVelocityPx = 0
   g.lastDxSign = 0
   g.rawAbsWindow = []
   g.prevMedAbsX = 0
@@ -341,7 +517,7 @@ function resetWheelGestureToIdle(g: WheelGestureState): void {
   g.absorbEnteredAt = 0
   g.minAbsorbedMed = Infinity
   g.reengageStreak = 0
-  g.oppositeStreak = 0
+  g.absorbOppositePx = 0
 }
 
 function areSidebarPropsEqual(prev: Props, next: Props): boolean {
@@ -399,6 +575,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
   onTabContextMenu,
   onToggleGroupCollapsed,
   onAssignTabToGroup,
+  onCreateTabGroup,
   onUpdateTabGroup,
   onDeleteTabGroup,
   onOrganizeTabs,
@@ -432,10 +609,41 @@ const VerticalSidebarInner: React.FC<Props> = ({
     zone: TabPinMode
   } | null>(null)
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null)
+  const [draggingGroupId, setDraggingGroupId] = useState<string | null>(null)
   const [dropZoneHover, setDropZoneHover] = useState<TabPinMode | null>(null)
   const [favPreviewIndex, setFavPreviewIndex] = useState<number | null>(null)
   const [pinnedPreviewIndex, setPinnedPreviewIndex] = useState<number | null>(null)
   const [isExternalLinkHovering, setIsExternalLinkHovering] = useState(false)
+  const [, bumpFaviconBrandVersion] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    for (const t of allTabs) {
+      if (!(t.isFavorite || t.isPinned) || t.groupId || !t.favicon) continue
+      const src = t.favicon
+      if (faviconBrandCache.has(src) || faviconBrandPending.has(src)) continue
+      faviconBrandPending.add(src)
+      const img = new Image()
+      if (!src.startsWith('data:')) {
+        img.crossOrigin = 'anonymous'
+      }
+      img.onload = () => {
+        faviconBrandPending.delete(src)
+        faviconBrandCache.set(src, extractFaviconBrandSampleFromImage(img))
+        if (!cancelled) {
+          bumpFaviconBrandVersion((v) => v + 1)
+        }
+      }
+      img.onerror = () => {
+        faviconBrandPending.delete(src)
+        faviconBrandCache.set(src, { kind: 'neutral', rgb: [128, 128, 128] })
+      }
+      img.src = src
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [allTabs])
 
   const asideRef = useRef<HTMLElement | null>(null)
   const trackRef = useRef<HTMLDivElement | null>(null)
@@ -467,6 +675,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
     intentAbsY: 0,
     rawDragPx: 0,
     velocityPx: 0,
+    peakVelocityPx: 0,
     lastEventAt: 0,
     lastDxSign: 0,
     rawAbsWindow: [],
@@ -478,7 +687,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
     absorbEnteredAt: 0,
     minAbsorbedMed: Infinity,
     reengageStreak: 0,
-    oppositeStreak: 0,
+    absorbOppositePx: 0,
     dragIdleTimer: null,
     streamEndTimer: null
   })
@@ -700,12 +909,15 @@ const VerticalSidebarInner: React.FC<Props> = ({
       const projected = offset + releaseVelocityPx * SWIPE_PROJECTION_SEC
       const step: 1 | -1 = offset < 0 ? 1 : -1
       const candidateIdx = curIdx + step
-      const movedEnoughForFlick = Math.abs(offset) >= gestureWidth * SWIPE_FLICK_MIN_DIST_RATIO
+      const movedEnoughForFlick =
+        Math.abs(offset) >= gestureWidth * SWIPE_FLICK_MIN_DIST_RATIO &&
+        Math.abs(releaseVelocityPx) >= SWIPE_FLICK_MIN_VELOCITY
       const shouldSwitch =
         candidateIdx >= 0 &&
         candidateIdx < curProfiles.length &&
         (Math.abs(offset) >= gestureWidth * SWIPE_SNAP_RATIO ||
           (movedEnoughForFlick &&
+            Math.sign(releaseVelocityPx) === Math.sign(offset) &&
             Math.sign(projected) === Math.sign(offset) &&
             Math.abs(projected) >= gestureWidth * SWIPE_SNAP_RATIO))
 
@@ -792,6 +1004,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
   const resetAllDragPreviews = useCallback(() => {
     setDragOverHint(null)
     setDragOverGroupId(null)
+    setDraggingGroupId(null)
     setDropZoneHover(null)
     setFavPreviewIndex(null)
     setPinnedPreviewIndex(null)
@@ -844,31 +1057,51 @@ const VerticalSidebarInner: React.FC<Props> = ({
       g.absorbEnteredAt = now
       g.minAbsorbedMed = curMed
       g.reengageStreak = 0
-      g.oppositeStreak = 0
+      g.absorbOppositePx = 0
     }
 
-    const scheduleStreamEnd = (g: WheelGestureState, delayMs = 170): void => {
+    const scheduleStreamEnd = (g: WheelGestureState, delayMs = 165): void => {
       if (g.streamEndTimer !== null) window.clearTimeout(g.streamEndTimer)
       g.streamEndTimer = window.setTimeout(() => {
         resetWheelGestureToIdle(g)
       }, delayMs)
     }
 
-    const beginDraggingFromCurrentOffset = (g: WheelGestureState, initialRawStepPx: number): void => {
+    const beginDraggingFromCurrentOffset = (
+      g: WheelGestureState,
+      initialRawStepPx: number,
+      snapBaseToZero = false
+    ): void => {
       const { profiles: curProfiles, width: curWidth } = latestPropsRef.current
       const p = physicsRef.current
       stopSpringLoop()
+      if (snapBaseToZero) {
+        p.offsetPx = 0
+        p.velocityPx = 0
+      }
       g.phase = 'dragging'
       g.rawDragPx =
         visualOffsetToRawDrag(p.offsetPx, p.baseIndex, curProfiles.length, curWidth) +
         initialRawStepPx
       g.velocityPx = 0
+      g.peakVelocityPx = 0
       g.decayRatios = []
       g.decayStreak = 0
       g.peakMedAbsX = 0
       setCarouselMovingSync(true)
       p.offsetPx = rawDragToVisualOffset(g.rawDragPx, p.baseIndex, curProfiles.length, curWidth)
       applyVisualFrame(p.offsetPx, p.baseIndex)
+    }
+
+    const armDragIdleRelease = (g: WheelGestureState, refTime: number): void => {
+      if (g.dragIdleTimer !== null) window.clearTimeout(g.dragIdleTimer)
+      g.dragIdleTimer = window.setTimeout(() => {
+        if (g.phase === 'dragging') {
+          releaseDragIntoSpring(0)
+          enterAbsorbing(g, g.lastDxSign, refTime + 115, 0)
+          scheduleStreamEnd(g, 165)
+        }
+      }, 115)
     }
 
     const onWheel = (e: WheelEvent): void => {
@@ -885,7 +1118,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
         curDraggingTab ||
         curResizing ||
         curRenaming ||
-        curProfiles.length === 0
+        curProfiles.length <= 1
       ) {
         return
       }
@@ -901,7 +1134,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
       const dtMs = g.lastEventAt > 0 ? now - g.lastEventAt : 10
       g.lastEventAt = now
 
-      if (dtMs > 175 || dtMs < 0) {
+      if (dtMs > 170 || dtMs < 0) {
         resetWheelGestureToIdle(g)
       }
 
@@ -911,7 +1144,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
       g.rawAbsWindow.push(normAbsX)
       if (g.rawAbsWindow.length > 3) g.rawAbsWindow.shift()
       const medAbsX = median3(g.rawAbsWindow)
-      const dxSign: 1 | -1 | 0 = dx > 0.05 ? 1 : dx < -0.05 ? -1 : 0
+      const dxSign: 1 | -1 | 0 = dx > 0.06 ? 1 : dx < -0.06 ? -1 : 0
 
       if (g.phase === 'idle') {
         g.phase = 'undecided'
@@ -919,31 +1152,31 @@ const VerticalSidebarInner: React.FC<Props> = ({
         g.intentAbsY = 0
       }
 
-      // Post-release momentum shield: swallow all inertial coasting frames so long swipes never bounce twice
+      // Post-release momentum shield:
+      // - Swallows passive inertial tail so 1 flick switches strictly 1 Space without bouncing twice
+      // - Ignores tiny finger-lift reverse roll-off (< 15px) so settling springs never ping-pong back
+      // - Immediately engages if the user performs a genuine consecutive swipe (same or opposite direction)
       if (g.phase === 'absorbing') {
-        scheduleStreamEnd(g, 180)
+        scheduleStreamEnd(g, 165)
 
         if (absX > absY) {
           e.preventDefault()
         }
 
-        const reversedDir =
-          dxSign !== 0 && g.absorbDir !== 0 && dxSign !== g.absorbDir && absX > absY * 1.3
-        if (reversedDir) {
-          g.oppositeStreak += 1
-        } else {
-          g.oppositeStreak = 0
+        if (dxSign !== 0 && g.absorbDir !== 0 && dxSign !== g.absorbDir && absX > absY * 1.4) {
+          g.absorbOppositePx += -dx
+        } else if (dxSign === g.absorbDir) {
+          g.absorbOppositePx = 0
         }
 
-        // Track genuine sustained finger re-push after inertia has decayed (immune to coalesced spikes)
+        // Detect a genuine fresh finger push in the same direction (velocity accelerates above decaying inertia)
         if (dxSign === g.absorbDir || g.absorbDir === 0) {
-          const threshold = Math.max(g.minAbsorbedMed * 1.8 + 4, 9.5)
+          const threshold = Math.max(g.minAbsorbedMed * 1.55 + 3.5, 8.5)
           if (
-            now - g.absorbEnteredAt >= 135 &&
-            g.minAbsorbedMed < 11 &&
+            now - g.absorbEnteredAt >= 110 &&
             medAbsX > threshold &&
-            medAbsX > g.prevMedAbsX * 1.06 &&
-            absX > absY * 1.4
+            medAbsX > g.prevMedAbsX * 1.12 &&
+            absX > absY * 1.5
           ) {
             g.reengageStreak += 1
           } else {
@@ -957,11 +1190,25 @@ const VerticalSidebarInner: React.FC<Props> = ({
         g.prevMedAbsX = medAbsX
         if (dxSign !== 0) g.lastDxSign = dxSign
 
-        if ((g.oppositeStreak >= 2 && medAbsX >= 2) || g.reengageStreak >= 3) {
+        if (Math.abs(g.absorbOppositePx) >= 15) {
+          const excessOpposite =
+            Math.sign(g.absorbOppositePx) *
+            Math.max(2, Math.abs(g.absorbOppositePx) - 10) *
+            SWIPE_TRACKING_GAIN
           g.rawAbsWindow = [normAbsX]
           g.prevMedAbsX = normAbsX
-          beginDraggingFromCurrentOffset(g, -dx * SWIPE_TRACKING_GAIN)
+          beginDraggingFromCurrentOffset(g, excessOpposite, true)
           g.peakMedAbsX = normAbsX
+          armDragIdleRelease(g, now)
+          return
+        }
+
+        if (g.reengageStreak >= 2) {
+          g.rawAbsWindow = [normAbsX]
+          g.prevMedAbsX = normAbsX
+          beginDraggingFromCurrentOffset(g, -dx * SWIPE_TRACKING_GAIN, true)
+          g.peakMedAbsX = normAbsX
+          armDragIdleRelease(g, now)
           return
         }
 
@@ -969,17 +1216,30 @@ const VerticalSidebarInner: React.FC<Props> = ({
       }
 
       if (g.phase === 'vertical') {
-        scheduleStreamEnd(g, 145)
-        g.prevMedAbsX = medAbsX
-        return
+        // Allow breaking out of vertical inertial coasting if the user initiates a clear horizontal swipe
+        if (absX >= 8.5 && absX > absY * 2.1) {
+          g.phase = 'undecided'
+          g.intentX = 0
+          g.intentAbsY = 0
+        } else {
+          scheduleStreamEnd(g, 150)
+          g.prevMedAbsX = medAbsX
+          return
+        }
       }
 
       if (g.phase === 'undecided') {
-        scheduleStreamEnd(g, 145)
+        scheduleStreamEnd(g, 150)
+
+        if (dxSign !== 0 && g.intentX !== 0 && Math.sign(-dx) !== Math.sign(g.intentX)) {
+          g.intentX = 0
+        }
+
         g.intentX += -dx
         g.intentAbsY += absY
 
-        if ((absY > absX * 1.15 && absY > 2.2) || g.intentAbsY >= SWIPE_LOCK_Y_PX) {
+        // Only lock vertical when vertical travel genuinely dominates horizontal travel
+        if (g.intentAbsY >= SWIPE_LOCK_Y_PX && g.intentAbsY > Math.abs(g.intentX) * 1.15) {
           g.phase = 'vertical'
           g.prevMedAbsX = medAbsX
           return
@@ -987,25 +1247,23 @@ const VerticalSidebarInner: React.FC<Props> = ({
 
         if (
           Math.abs(g.intentX) >= SWIPE_LOCK_X_PX &&
-          Math.abs(g.intentX) >= g.intentAbsY * SWIPE_AXIS_RATIO
+          Math.abs(g.intentX) >= g.intentAbsY * SWIPE_AXIS_RATIO &&
+          absX > absY * 1.25
         ) {
           e.preventDefault()
+          const clampedDtSec = Math.min(0.05, Math.max(0.004, normDtMs / 1000))
           const excessPx =
             Math.sign(g.intentX) *
-            Math.max(0, Math.abs(g.intentX) - SWIPE_LOCK_X_PX) *
+            Math.max(2, Math.abs(g.intentX) - SWIPE_LOCK_X_PX * 0.65) *
             SWIPE_TRACKING_GAIN
           beginDraggingFromCurrentOffset(g, excessPx)
+          const initVx = (-dx * SWIPE_TRACKING_GAIN) / clampedDtSec
+          g.velocityPx = initVx
+          g.peakVelocityPx = initVx
           g.peakMedAbsX = medAbsX
           g.prevMedAbsX = medAbsX
           if (dxSign !== 0) g.lastDxSign = dxSign
-
-          g.dragIdleTimer = window.setTimeout(() => {
-            if (g.phase === 'dragging') {
-              releaseDragIntoSpring(0)
-              enterAbsorbing(g, g.lastDxSign, now + 95, 0)
-              scheduleStreamEnd(g, 165)
-            }
-          }, 95)
+          armDragIdleRelease(g, now)
         } else {
           g.prevMedAbsX = medAbsX
         }
@@ -1013,13 +1271,32 @@ const VerticalSidebarInner: React.FC<Props> = ({
       }
 
       // Active horizontal manipulation ('dragging')
+      const p = physicsRef.current
+      if (Math.abs(p.offsetPx) < 14 && absY > absX * 2.0 && absY > 8) {
+        releaseDragIntoSpring(0)
+        clearGestureTimers(g)
+        g.phase = 'vertical'
+        scheduleStreamEnd(g, 150)
+        g.prevMedAbsX = medAbsX
+        return
+      }
+
       e.preventDefault()
-      scheduleStreamEnd(g, 185)
+      scheduleStreamEnd(g, 180)
 
       const clampedDtSec = Math.min(0.05, Math.max(0.004, normDtMs / 1000))
       const stepX = -dx * SWIPE_TRACKING_GAIN
       const instVx = stepX / clampedDtSec
-      g.velocityPx = g.velocityPx === 0 ? instVx : g.velocityPx * 0.55 + instVx * 0.45
+      g.velocityPx = g.velocityPx === 0 ? instVx : g.velocityPx * 0.52 + instVx * 0.48
+      if (
+        Math.sign(g.velocityPx) !== Math.sign(g.peakVelocityPx) ||
+        Math.abs(g.velocityPx) >= Math.abs(g.peakVelocityPx)
+      ) {
+        g.peakVelocityPx = g.velocityPx
+      } else {
+        // Gently decay peak velocity when user slows fingers deliberately, while preserving flick impulse across 3-4 momentum detection frames
+        g.peakVelocityPx = g.peakVelocityPx * 0.88 + g.velocityPx * 0.12
+      }
 
       // Detect macOS synthetic trackpad momentum onset (fingers lifted off glass)
       const sameSign = dxSign !== 0 && (g.lastDxSign === 0 || dxSign === g.lastDxSign)
@@ -1031,17 +1308,16 @@ const VerticalSidebarInner: React.FC<Props> = ({
         g.peakMedAbsX = medAbsX
         g.decayRatios = []
         g.decayStreak = 0
-      } else if (g.prevMedAbsX > 0.35 && medAbsX <= g.prevMedAbsX * 1.01 + 0.06) {
+      } else if (g.prevMedAbsX > 0.35 && medAbsX <= g.prevMedAbsX * 1.015 + 0.08) {
         const ratio = medAbsX / g.prevMedAbsX
         g.decayStreak += 1
-        if (ratio >= 0.78 && ratio <= 0.985) {
+        if (ratio >= 0.74 && ratio <= 0.985) {
           g.decayRatios.push(ratio)
-          if (g.decayRatios.length > 6) g.decayRatios.shift()
-        } else if (ratio < 0.78) {
+          if (g.decayRatios.length > 5) g.decayRatios.shift()
+        } else if (ratio < 0.74) {
           g.decayRatios = []
         }
-        // Note: ratio in (0.985, 1.01] is a 1-frame median plateau — preserve existing decayRatios
-      } else if (medAbsX > g.prevMedAbsX * 1.06 + 0.4) {
+      } else if (medAbsX > g.prevMedAbsX * 1.08 + 0.4) {
         g.decayRatios = []
         g.decayStreak = 0
       }
@@ -1050,32 +1326,30 @@ const VerticalSidebarInner: React.FC<Props> = ({
       if (dxSign !== 0) g.lastDxSign = dxSign
 
       let enteredSyntheticMomentum = false
-      if (g.decayRatios.length >= 6 && medAbsX <= g.peakMedAbsX * 0.76) {
+      if (g.decayRatios.length >= 4 && medAbsX <= g.peakMedAbsX * 0.78) {
         const maxR = Math.max(...g.decayRatios)
         const minR = Math.min(...g.decayRatios)
-        if (maxR - minR <= 0.052) {
+        if (maxR - minR <= 0.075) {
           enteredSyntheticMomentum = true
         }
       }
 
-      // Secondary catch for custom scroll smoothers or fast Space-switch flicks
-      const p = physicsRef.current
       const gestureWidth = Math.min(curWidth, SWIPE_MAX_REF_WIDTH)
-      const isNonBoundaryFlick =
-        curProfiles.length > 1 &&
-        !((p.baseIndex <= 0 && g.rawDragPx > 0) || (p.baseIndex >= curProfiles.length - 1 && g.rawDragPx < 0)) &&
-        g.peakMedAbsX >= 18 &&
-        Math.abs(g.rawDragPx) >= gestureWidth * 0.28 &&
-        g.decayRatios.length >= 4 &&
-        medAbsX <= g.peakMedAbsX * 0.72
+      const isCleanFlickRelease =
+        g.peakMedAbsX >= 12 &&
+        Math.abs(g.rawDragPx) >= gestureWidth * 0.16 &&
+        g.decayStreak >= 3 &&
+        medAbsX <= g.peakMedAbsX * 0.68
 
       const isLowTailDecay =
-        g.peakMedAbsX >= 4 &&
-        g.decayStreak >= 5 &&
-        medAbsX <= Math.min(1.8, g.peakMedAbsX * 0.28)
+        g.peakMedAbsX >= 3.5 &&
+        g.decayStreak >= 4 &&
+        medAbsX <= Math.min(1.6, g.peakMedAbsX * 0.28)
 
-      if (enteredSyntheticMomentum || isNonBoundaryFlick || isLowTailDecay) {
-        releaseDragIntoSpring(g.velocityPx)
+      if (enteredSyntheticMomentum || isCleanFlickRelease || isLowTailDecay) {
+        const effectiveVx =
+          Math.abs(g.peakVelocityPx) > Math.abs(g.velocityPx) ? g.peakVelocityPx : g.velocityPx
+        releaseDragIntoSpring(effectiveVx)
         enterAbsorbing(g, g.lastDxSign, now, medAbsX)
         return
       }
@@ -1083,16 +1357,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
       g.rawDragPx += stepX
       p.offsetPx = rawDragToVisualOffset(g.rawDragPx, p.baseIndex, curProfiles.length, curWidth)
       applyVisualFrame(p.offsetPx, p.baseIndex)
-
-      if (g.dragIdleTimer !== null) window.clearTimeout(g.dragIdleTimer)
-      g.dragIdleTimer = window.setTimeout(() => {
-        if (g.phase === 'dragging') {
-          releaseDragIntoSpring(0)
-          const ts = e.timeStamp > 0 ? e.timeStamp + 95 : performance.now()
-          enterAbsorbing(g, g.lastDxSign, ts, 0)
-          scheduleStreamEnd(g, 165)
-        }
-      }, 95)
+      armDragIdleRelease(g, e.timeStamp > 0 ? e.timeStamp : now)
     }
 
     el.addEventListener('wheel', onWheel, { passive: false })
@@ -1102,7 +1367,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
   }, [applyVisualFrame, releaseDragIntoSpring, setCarouselMovingSync, stopSpringLoop])
 
   const handleMouseSwipeStart = (e: React.MouseEvent<HTMLElement>): void => {
-    if (e.button !== 0 || draggingTabId || isResizing || renamingSpaceId || profiles.length === 0) {
+    if (e.button !== 0 || draggingTabId || isResizing || renamingSpaceId || profiles.length <= 1) {
       return
     }
     const target = e.target as HTMLElement | null
@@ -1117,6 +1382,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
 
     const startX = e.clientX
     const startY = e.clientY
+    const MOUSE_DEADZONE_PX = 34
     let axis: 'none' | 'horizontal' | 'vertical' = 'none'
     let baseRawPx = 0
     let lastClientX = startX
@@ -1133,12 +1399,12 @@ const VerticalSidebarInner: React.FC<Props> = ({
       lastMoveAt = now
 
       if (axis === 'none') {
-        if (Math.abs(dy) > 9 && Math.abs(dy) > Math.abs(dx) * 0.85) {
+        if (Math.abs(dy) > 7 && Math.abs(dy) >= Math.abs(dx) * 0.8) {
           axis = 'vertical'
           cleanup()
           return
         }
-        if (Math.abs(dx) > SWIPE_LOCK_X_PX + 3 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        if (Math.abs(dx) > MOUSE_DEADZONE_PX && Math.abs(dx) > Math.abs(dy) * 2.5) {
           axis = 'horizontal'
           stopSpringLoop()
           const p = physicsRef.current
@@ -1151,9 +1417,9 @@ const VerticalSidebarInner: React.FC<Props> = ({
 
       if (axis === 'horizontal') {
         const rawPastDeadzone =
-          Math.sign(dx) * Math.max(0, Math.abs(dx) - (SWIPE_LOCK_X_PX + 3)) * SWIPE_TRACKING_GAIN
+          Math.sign(dx) * Math.max(0, Math.abs(dx) - MOUSE_DEADZONE_PX) * SWIPE_TRACKING_GAIN
         const instVx = (stepDx * SWIPE_TRACKING_GAIN) / dtSec
-        vxPxPerSec = vxPxPerSec === 0 ? instVx : vxPxPerSec * 0.55 + instVx * 0.45
+        vxPxPerSec = vxPxPerSec === 0 ? instVx : vxPxPerSec * 0.6 + instVx * 0.4
 
         const p = physicsRef.current
         p.offsetPx = rawDragToVisualOffset(
@@ -1316,8 +1582,8 @@ const VerticalSidebarInner: React.FC<Props> = ({
     const pActiveTabId = activeTabByProfile[profile.id]
     const pSplit = splitByProfile[profile.id] || splitView
 
-    const favoriteTabs = pTabs.filter((t) => t.isFavorite)
-    const pinnedTabs = pTabs.filter((t) => !t.isFavorite && t.isPinned)
+    const favoriteTabs = pTabs.filter((t) => (t.isFavorite || t.isPinned) && !t.groupId)
+    const pinnedTabs = pTabs.filter((t) => t.isPinned && Boolean(t.groupId))
     const todayTabs = pTabs.filter(
       (t) => !t.isFavorite && !t.isPinned && t.url !== NEW_TAB_URL
     )
@@ -1385,8 +1651,11 @@ const VerticalSidebarInner: React.FC<Props> = ({
     const renderTabRow = (
       tab: TabState,
       zone: 'pinned' | 'unpinned',
-      indented = false
+      indentDepth = 0
     ): React.ReactNode => {
+      const clampedIndent = Math.max(0, Math.min(indentDepth, 6))
+      const rowPaddingLeft = 10 + clampedIndent * 14
+      const activeBarLeft = clampedIndent > 0 ? rowPaddingLeft - 10 : 4
       const isActive = !isNewTabPromptOnSlide && tab.id === pActiveTabId
       const isBeingDragged = tab.id === draggingTabId
       const splitRole = pSplit?.enabled
@@ -1476,17 +1745,16 @@ const VerticalSidebarInner: React.FC<Props> = ({
             e.preventDefault()
             onTabContextMenu(tab, { x: e.clientX, y: e.clientY })
           }}
-          style={
-            isActive
+          style={{
+            paddingLeft: rowPaddingLeft,
+            ...(isActive
               ? {
                   backgroundColor: slideTheme.activeTabBg,
                   boxShadow: slideTheme.activeTabShadow
                 }
-              : undefined
-          }
-          className={`arc-pressable group relative flex items-center gap-2.5 h-[32px] ${
-            indented ? 'pl-6 pr-2.5' : 'px-2.5'
-          } rounded-[10px] text-[12.5px] cursor-pointer ${
+              : undefined)
+          }}
+          className={`arc-pressable group relative flex items-center gap-2 h-[32px] pr-2 hover:pr-1.5 rounded-[10px] text-[12.5px] cursor-pointer ${
             isBeingDragged ? 'opacity-45 scale-[0.98]' : ''
           } ${
             dropSide === 'before'
@@ -1518,10 +1786,8 @@ const VerticalSidebarInner: React.FC<Props> = ({
         >
           {isActive && (
             <span
-              style={{ backgroundColor: slideTheme.accentHex }}
-              className={`absolute ${
-                indented ? 'left-2.5' : 'left-1'
-              } top-1/2 -translate-y-1/2 w-[2.5px] h-3.5 rounded-full pointer-events-none`}
+              style={{ backgroundColor: slideTheme.accentHex, left: activeBarLeft }}
+              className="absolute top-1/2 -translate-y-1/2 w-[2.5px] h-3.5 rounded-full pointer-events-none"
             />
           )}
 
@@ -1541,10 +1807,13 @@ const VerticalSidebarInner: React.FC<Props> = ({
             </span>
           )}
 
-          <span className="truncate flex-1">{tab.title || tr(lang, 'New Tab', '新标签页')}</span>
+          <span className="dia-tab-title flex-1 min-w-0">
+            {tab.title || tr(lang, 'New Tab', '新标签页')}
+          </span>
 
           {tab.isAudioPlaying && (
             <button
+              type="button"
               onClick={(e) => {
                 e.stopPropagation()
                 onMuteTab(tab.id)
@@ -1552,16 +1821,17 @@ const VerticalSidebarInner: React.FC<Props> = ({
               title={
                 tab.isMuted ? tr(lang, 'Unmute', '取消静音') : tr(lang, 'Mute tab', '静音此标签页')
               }
-              className="opacity-70 hover:opacity-100 p-0.5 rounded shrink-0"
+              className="opacity-70 hover:opacity-100 w-[18px] h-[18px] flex items-center justify-center rounded-[5px] hover:bg-black/[0.07] dark:hover:bg-white/[0.12] shrink-0"
             >
               {tab.isMuted ? <VolumeX size={11.5} /> : <Volume2 size={11.5} />}
             </button>
           )}
 
           {zone === 'pinned' ? (
-            <div className="flex items-center gap-0.5 shrink-0">
+            <div className="hidden group-hover:flex items-center gap-0.5 shrink-0">
               {hasDriftedFromPinned && (
                 <button
+                  type="button"
                   onClick={(e) => {
                     e.stopPropagation()
                     onResetPinnedTab(tab.id)
@@ -1571,73 +1841,59 @@ const VerticalSidebarInner: React.FC<Props> = ({
                     'Reset to initial pinned URL',
                     '已偏离初始固定页 · 点击还原初始网址'
                   )}
-                  className="opacity-60 hover:opacity-100 p-0.5 rounded"
+                  className="opacity-65 hover:opacity-100 w-[18px] h-[18px] flex items-center justify-center rounded-[5px] hover:bg-black/[0.07] dark:hover:bg-white/[0.12] transition"
                 >
                   <RotateCcw size={11} />
                 </button>
               )}
               <button
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onSetTabPinState(tab.id, 'favorite')
-                }}
-                title={tr(
-                  lang,
-                  'Promote to Top Favorites Grid',
-                  '升格到顶部常驻图标栏 (Favorites)'
-                )}
-                className="opacity-0 group-hover:opacity-55 hover:!opacity-100 p-0.5 rounded transition"
-              >
-                <Star size={11} />
-              </button>
-              <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation()
                   onSetTabPinState(tab.id, 'unpinned')
                 }}
-                title={tr(lang, 'Unpin tab', '取消固定（移回下方临时标签）')}
-                className="opacity-0 group-hover:opacity-60 hover:!opacity-100 p-0.5 rounded transition"
+                title={tr(lang, 'Unpin tab', '取消固定标签页')}
+                className="opacity-65 hover:opacity-100 w-[18px] h-[18px] flex items-center justify-center rounded-[5px] hover:bg-black/[0.07] dark:hover:bg-white/[0.12] transition"
               >
                 <PinOff size={11.5} />
               </button>
             </div>
           ) : (
-            <div className="flex items-center gap-0.5 shrink-0">
+            <div className="hidden group-hover:flex items-center gap-0.5 shrink-0">
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation()
-                  onSetTabPinState(tab.id, 'pinned')
+                  onSetTabPinState(tab.id, 'favorite')
                 }}
-                title={tr(
-                  lang,
-                  'Pin to Space (or drag above divider)',
-                  '固定到上方 Pin 栏（也可向上拖拽）'
-                )}
-                className="opacity-0 group-hover:opacity-55 hover:!opacity-100 p-0.5 rounded transition"
+                title={tr(lang, 'Pin Tab', '固定到顶部 Pin 栏')}
+                className="opacity-60 hover:opacity-100 w-[18px] h-[18px] flex items-center justify-center rounded-[5px] hover:bg-black/[0.07] dark:hover:bg-white/[0.12] transition"
               >
                 <Pin size={11} />
               </button>
 
               {!splitRole && tab.id !== pActiveTabId && (
                 <button
+                  type="button"
                   onClick={(e) => {
                     e.stopPropagation()
                     onOpenTabInSplit(tab.id)
                   }}
                   title={tr(lang, 'Open in Right Split View', '在右侧分屏中打开')}
-                  className="opacity-0 group-hover:opacity-55 hover:!opacity-100 p-0.5 rounded transition"
+                  className="opacity-60 hover:opacity-100 w-[18px] h-[18px] flex items-center justify-center rounded-[5px] hover:bg-black/[0.07] dark:hover:bg-white/[0.12] transition"
                 >
                   <Columns2 size={11} />
                 </button>
               )}
 
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation()
                   onCloseTab(tab.id)
                 }}
                 title={tr(lang, 'Close Tab (⌘W)', '关闭标签 (⌘W)')}
-                className="opacity-0 group-hover:opacity-60 hover:!opacity-100 p-0.5 rounded transition"
+                className="opacity-65 hover:opacity-100 w-[18px] h-[18px] flex items-center justify-center rounded-[5px] hover:bg-black/[0.07] dark:hover:bg-white/[0.12] transition"
               >
                 <X size={13} />
               </button>
@@ -1680,248 +1936,474 @@ const VerticalSidebarInner: React.FC<Props> = ({
       pinnedPreviewIndex !== null &&
       hasAnyIncomingDrag
 
-    const renderFolderBlock = (
-      grp: TabGroup,
-      groupTabs: TabState[],
-      zone: 'pinned' | 'unpinned'
-    ): React.ReactNode => {
-      const isDropTarget = isVisualSlide && dragOverGroupId === grp.id
-      const isRenamingThis = renamingGroupId === grp.id
-      const isTabKeptWhenCollapsed = (t: TabState): boolean =>
-        t.id === pActiveTabId ||
-        Boolean(
-          pSplit?.enabled && (t.id === pSplit.leftTabId || t.id === pSplit.rightTabId)
-        )
-      const hasOpenVisibleInGroup = groupTabs.some(isTabKeptWhenCollapsed)
+    const isTabKeptWhenCollapsed = (t: TabState): boolean =>
+      t.id === pActiveTabId ||
+      Boolean(pSplit?.enabled && (t.id === pSplit.leftTabId || t.id === pSplit.rightTabId))
 
-      return (
-        <div
-          key={`vgrp-${zone}-${grp.id}`}
-          onDragOver={(e) => {
-            const linkDrag = Boolean(externalDragLink) || hasExternalLinkDragPayload(e.dataTransfer)
-            if (!draggingTabId && !linkDrag) return
-            e.preventDefault()
-            e.stopPropagation()
-          }}
-          onDrop={(e) => {
-            e.preventDefault()
-            e.stopPropagation()
-            resetAllDragPreviews()
-            onTabDragStateChange?.(null)
-          }}
-          className={
-            zone === 'unpinned'
-              ? `rounded-xl p-1 my-1 transition-colors ${
-                  isDropTarget
-                    ? isDark
-                      ? 'bg-indigo-500/[0.12] ring-1 ring-indigo-400/45'
-                      : 'bg-indigo-500/[0.08] ring-1 ring-indigo-500/35'
-                    : isDark
-                      ? 'bg-white/[0.035]'
-                      : 'bg-black/[0.03]'
-                }`
-              : `rounded-[10px] transition-colors ${
-                  isDropTarget
-                    ? isDark
-                      ? 'bg-indigo-500/[0.12] ring-1 ring-indigo-400/45'
-                      : 'bg-indigo-500/[0.08] ring-1 ring-indigo-500/35'
-                    : ''
-                }`
-          }
-        >
-          {isRenamingThis ? (
-            <div
-              data-no-swipe="true"
-              className="flex items-center gap-2 h-[31px] px-2.5"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <FolderOpen
-                size={13}
-                strokeWidth={1.75}
-                className="shrink-0 opacity-55"
-              />
-              <input
-                ref={groupRenameInputRef}
-                value={groupRenameDraft}
-                onChange={(e) => setGroupRenameDraft(e.target.value)}
-                onBlur={() => commitGroupRename(grp)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    commitGroupRename(grp)
-                  } else if (e.key === 'Escape') {
-                    e.preventDefault()
-                    setRenamingGroupId(null)
-                  }
-                }}
-                className={`flex-1 min-w-0 h-[24px] px-2 rounded-md text-[12px] font-medium outline-none border ${
-                  isDark
-                    ? 'bg-white/[0.10] border-white/20 text-white'
-                    : 'bg-white/95 border-black/20 text-zinc-900'
-                }`}
-              />
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation()
-                onToggleGroupCollapsed(grp.id)
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault()
-                e.stopPropagation()
-                const asideRect = asideRef.current?.getBoundingClientRect()
-                setFolderMenuState({
-                  group: grp,
-                  zone,
-                  y: asideRect ? e.clientY - asideRect.top : e.clientY
-                })
-              }}
-              onDragOver={(e) => {
-                const linkDrag =
-                  Boolean(externalDragLink) || hasExternalLinkDragPayload(e.dataTransfer)
-                if (!draggingTabId && !linkDrag) return
-                e.preventDefault()
-                e.stopPropagation()
-                if (linkDrag && !isExternalLinkHovering) setIsExternalLinkHovering(true)
-                if (dragOverHint !== null) setDragOverHint(null)
-                if (pinnedPreviewIndex !== null) setPinnedPreviewIndex(null)
-                if (dragOverGroupId !== grp.id) setDragOverGroupId(grp.id)
-              }}
-              onDragLeave={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                  if (dragOverGroupId === grp.id) setDragOverGroupId(null)
-                }
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                e.stopPropagation()
-                const srcId =
-                  e.dataTransfer.getData('application/x-dia-tab-id') || draggingTabId
-                const droppedUrl = !srcId
-                  ? extractDroppedExternalUrl(e.dataTransfer) || externalDragLink?.url
-                  : null
-                resetAllDragPreviews()
-                onTabDragStateChange?.(null)
-                if (srcId) {
-                  onAssignTabToGroup?.(srcId, grp.id)
-                } else if (droppedUrl) {
-                  onDropExternalUrl?.(droppedUrl, zone, null, grp.id)
-                }
-              }}
-              title={tr(
-                lang,
-                `${grp.title} (${groupTabs.length}) — Click to ${grp.collapsed ? 'expand' : 'collapse'} · Right-click for folder options`,
-                `${grp.title}（${groupTabs.length} 个标签）— 点击${grp.collapsed ? '展开' : '收起'} · 右键管理文件夹`
-              )}
-              className={`arc-pressable group/fhdr w-full flex items-center gap-2.5 ${
-                zone === 'pinned'
-                  ? 'h-[32px] px-2.5 rounded-[10px] text-[12.5px]'
-                  : 'h-[30px] px-2 rounded-lg text-[12px]'
-              } font-medium ${
-                isDark
-                  ? 'text-zinc-200/90 hover:bg-white/[0.06]'
-                  : 'text-zinc-700 hover:bg-black/[0.04]'
-              }`}
-            >
-              {grp.collapsed ? (
-                <Folder
-                  size={zone === 'pinned' ? 13.5 : 13}
-                  strokeWidth={1.75}
-                  className={`shrink-0 ${hasOpenVisibleInGroup ? 'opacity-75' : 'opacity-50'}`}
-                />
-              ) : (
-                <FolderOpen
-                  size={zone === 'pinned' ? 13.5 : 13}
-                  strokeWidth={1.75}
-                  className="shrink-0 opacity-55"
-                />
-              )}
-              <span className="truncate flex-1 text-left">{grp.title}</span>
-              {grp.collapsed && (
-                <span
-                  className={`text-[10.5px] tabular-nums px-1.5 py-0.2 rounded-full shrink-0 ${
-                    isDark ? 'bg-white/[0.07] text-zinc-300/80' : 'bg-black/[0.05] text-zinc-600/85'
-                  }`}
-                >
-                  {groupTabs.length}
-                </span>
-              )}
-              <ChevronDown
-                size={12}
-                className={`opacity-45 group-hover/fhdr:opacity-80 shrink-0 transition-transform duration-200 ${
-                  grp.collapsed ? '-rotate-90' : 'rotate-0'
-                }`}
-              />
-            </button>
-          )}
-
-          <div>
-            {groupTabs.map((child) => {
-              const isRowOpen = !grp.collapsed || isTabKeptWhenCollapsed(child)
-              return (
-                <div
-                  key={child.id}
-                  className="arc-collapse-grid"
-                  data-open={isRowOpen}
-                >
-                  <div className="arc-collapse-inner">
-                    <div className="pt-0.5">{renderTabRow(child, zone, true)}</div>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )
+    const groupById = new Map(pGroups.map((g) => [g.id, g]))
+    const isGroupAncestorOf = (ancestorId: string, candidateId: string): boolean => {
+      let cur = groupById.get(candidateId)?.parentId ?? null
+      const seen = new Set<string>()
+      while (cur && !seen.has(cur)) {
+        if (cur === ancestorId) return true
+        seen.add(cur)
+        cur = groupById.get(cur)?.parentId ?? null
+      }
+      return false
     }
 
-    const buildPinnedRows = (sourceTabs: TabState[]): React.ReactNode[] => {
-      const renderedGroupIds = new Set<string>()
+    const buildZoneRows = (
+      sourceTabs: TabState[],
+      zone: 'pinned' | 'unpinned'
+    ): React.ReactNode[] => {
+      const tabIndexById = new Map<string, number>()
+      const directTabsByGroup = new Map<string, TabState[]>()
+      sourceTabs.forEach((t, idx) => {
+        tabIndexById.set(t.id, idx)
+        if (t.groupId && groupById.has(t.groupId)) {
+          const list = directTabsByGroup.get(t.groupId) || []
+          list.push(t)
+          directTabsByGroup.set(t.groupId, list)
+        }
+      })
+
+      const oppositeTabs = zone === 'pinned' ? todayTabs : pinnedTabs
+      const oppositeDirectGroupIds = new Set(
+        oppositeTabs.map((t) => t.groupId).filter(Boolean) as string[]
+      )
+
+      const zoneGroupIds = new Set<string>()
+      for (const g of pGroups) {
+        const hasSourceTabs = (directTabsByGroup.get(g.id)?.length || 0) > 0
+        const hasOppositeTabs = oppositeDirectGroupIds.has(g.id)
+        if (hasSourceTabs || (!hasOppositeTabs && (g.zone || 'pinned') === zone)) {
+          let cur: string | null | undefined = g.id
+          const seen = new Set<string>()
+          while (cur && !seen.has(cur)) {
+            seen.add(cur)
+            const curGrp = groupById.get(cur)
+            if (!curGrp) break
+            if (zone === 'unpinned' && pinnedTabs.some((pt) => pt.groupId === cur)) break
+            zoneGroupIds.add(cur)
+            cur = curGrp.parentId
+          }
+        }
+      }
+
+      // Prune empty ancestor groups that only belonged to the opposite zone
+      let pruned = true
+      while (pruned) {
+        pruned = false
+        for (const gid of [...zoneGroupIds]) {
+          const g = groupById.get(gid)
+          if (!g) {
+            zoneGroupIds.delete(gid)
+            pruned = true
+            continue
+          }
+          const hasDirect = (directTabsByGroup.get(gid)?.length || 0) > 0
+          const hasKeepEmpty = Boolean(g.keepEmpty && (g.zone || 'pinned') === zone)
+          const hasChildInZone = pGroups.some(
+            (cg) => cg.parentId === gid && cg.id !== gid && zoneGroupIds.has(cg.id)
+          )
+          if (!hasDirect && !hasKeepEmpty && !hasChildInZone) {
+            zoneGroupIds.delete(gid)
+            pruned = true
+          }
+        }
+      }
+
+      const effectiveParentById = new Map<string, string | null>()
+      const childrenByParent = new Map<string, TabGroup[]>()
+      const rootGroups: TabGroup[] = []
+
+      for (const g of pGroups) {
+        if (!zoneGroupIds.has(g.id)) continue
+        let parentId =
+          g.parentId && g.parentId !== g.id && zoneGroupIds.has(g.parentId) ? g.parentId : null
+        if (parentId && isGroupAncestorOf(g.id, parentId)) {
+          parentId = null
+        }
+        effectiveParentById.set(g.id, parentId)
+        if (parentId) {
+          const list = childrenByParent.get(parentId) || []
+          list.push(g)
+          childrenByParent.set(parentId, list)
+        } else {
+          rootGroups.push(g)
+        }
+      }
+
+      const groupRankById = new Map(pGroups.map((g, idx) => [g.id, idx]))
+      const subtreeCache = new Map<
+        string,
+        { subtreeTabs: TabState[]; minIdx: number }
+      >()
+
+      const getSubtreeInfo = (
+        gid: string,
+        visiting = new Set<string>()
+      ): { subtreeTabs: TabState[]; minIdx: number } => {
+        const cached = subtreeCache.get(gid)
+        if (cached) return cached
+        if (visiting.has(gid)) {
+          return { subtreeTabs: [], minIdx: 1_000_000 }
+        }
+        visiting.add(gid)
+
+        const direct = directTabsByGroup.get(gid) || []
+        const children = childrenByParent.get(gid) || []
+
+        type CombinedItem =
+          | { kind: 'tab'; tab: TabState; order: number }
+          | { kind: 'child'; tabs: TabState[]; order: number }
+
+        const combined: CombinedItem[] = []
+        let minIdx = 1_000_000 + (groupRankById.get(gid) ?? 0)
+
+        for (const t of direct) {
+          const idx = tabIndexById.get(t.id) ?? minIdx
+          if (idx < minIdx) minIdx = idx
+          combined.push({ kind: 'tab', tab: t, order: idx })
+        }
+        for (const cg of children) {
+          const childInfo = getSubtreeInfo(cg.id, visiting)
+          if (childInfo.minIdx < minIdx) minIdx = childInfo.minIdx
+          combined.push({ kind: 'child', tabs: childInfo.subtreeTabs, order: childInfo.minIdx })
+        }
+
+        combined.sort((a, b) => a.order - b.order)
+        const subtreeTabs: TabState[] = []
+        for (const item of combined) {
+          if (item.kind === 'tab') subtreeTabs.push(item.tab)
+          else subtreeTabs.push(...item.tabs)
+        }
+
+        const result = { subtreeTabs, minIdx }
+        subtreeCache.set(gid, result)
+        return result
+      }
+
+      const getRootGroupForId = (gid: string): TabGroup | undefined => {
+        let cur = gid
+        const seen = new Set<string>()
+        while (cur && !seen.has(cur)) {
+          seen.add(cur)
+          const p = effectiveParentById.get(cur)
+          if (!p) return groupById.get(cur)
+          cur = p
+        }
+        return groupById.get(gid)
+      }
+
+      const renderFolderBlock = (
+        grp: TabGroup,
+        depth: number,
+        ancestorCollapsed: boolean
+      ): React.ReactNode => {
+        const isDropTarget = isVisualSlide && dragOverGroupId === grp.id
+        const isRenamingThis = renamingGroupId === grp.id
+        const isBeingDragged = draggingGroupId === grp.id
+        const directTabs = directTabsByGroup.get(grp.id) || []
+        const childGroups = childrenByParent.get(grp.id) || []
+        const { subtreeTabs } = getSubtreeInfo(grp.id)
+        const totalCount = subtreeTabs.length
+        const keptTabsInSubtree = subtreeTabs.filter(isTabKeptWhenCollapsed)
+        const hasOpenVisibleInGroup = keptTabsInSubtree.length > 0
+
+        const clampedDepth = Math.max(0, Math.min(depth, 5))
+        const headerPaddingLeft = (zone === 'pinned' ? 10 : 8) + clampedDepth * 14
+
+        type FolderChildEntry =
+          | { kind: 'group'; group: TabGroup; order: number }
+          | { kind: 'tab'; tab: TabState; order: number }
+
+        const entries: FolderChildEntry[] = [
+          ...directTabs.map((t) => ({
+            kind: 'tab' as const,
+            tab: t,
+            order: tabIndexById.get(t.id) ?? 0
+          })),
+          ...childGroups.map((cg) => ({
+            kind: 'group' as const,
+            group: cg,
+            order: getSubtreeInfo(cg.id).minIdx
+          }))
+        ].sort((a, b) => a.order - b.order)
+
+        return (
+          <div
+            key={`vgrp-${zone}-${grp.id}`}
+            onDragOver={(e) => {
+              const linkDrag =
+                Boolean(externalDragLink) || hasExternalLinkDragPayload(e.dataTransfer)
+              const folderDrag =
+                draggingGroupId !== null &&
+                draggingGroupId !== grp.id &&
+                !isGroupAncestorOf(draggingGroupId, grp.id)
+              if (!draggingTabId && !folderDrag && !linkDrag) return
+              e.preventDefault()
+              e.stopPropagation()
+            }}
+            onDrop={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              resetAllDragPreviews()
+              onTabDragStateChange?.(null)
+            }}
+            className={`${isBeingDragged ? 'opacity-45' : ''} ${
+              zone === 'unpinned' && depth === 0
+                ? `rounded-xl p-1 my-1 transition-colors ${
+                    isDropTarget
+                      ? isDark
+                        ? 'bg-indigo-500/[0.12] ring-1 ring-indigo-400/45'
+                        : 'bg-indigo-500/[0.08] ring-1 ring-indigo-500/35'
+                      : isDark
+                        ? 'bg-white/[0.035]'
+                        : 'bg-black/[0.03]'
+                  }`
+                : `rounded-[10px] transition-colors ${
+                    isDropTarget
+                      ? isDark
+                        ? 'bg-indigo-500/[0.12] ring-1 ring-indigo-400/45'
+                        : 'bg-indigo-500/[0.08] ring-1 ring-indigo-500/35'
+                      : ''
+                  }`
+            }`}
+          >
+            {isRenamingThis ? (
+              <div
+                data-no-swipe="true"
+                style={{ paddingLeft: headerPaddingLeft }}
+                className="flex items-center gap-2 h-[31px] pr-2.5"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <FolderOpen size={13} strokeWidth={1.75} className="shrink-0 opacity-55" />
+                <input
+                  ref={groupRenameInputRef}
+                  value={groupRenameDraft}
+                  onChange={(e) => setGroupRenameDraft(e.target.value)}
+                  onBlur={() => commitGroupRename(grp)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      commitGroupRename(grp)
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault()
+                      setRenamingGroupId(null)
+                    }
+                  }}
+                  className={`flex-1 min-w-0 h-[24px] px-2 rounded-md text-[12px] font-medium outline-none border ${
+                    isDark
+                      ? 'bg-white/[0.10] border-white/20 text-white'
+                      : 'bg-white/95 border-black/20 text-zinc-900'
+                  }`}
+                />
+              </div>
+            ) : (
+              <button
+                type="button"
+                draggable
+                onDragStart={(e) => {
+                  e.stopPropagation()
+                  e.dataTransfer.setData('application/x-arko-group-id', grp.id)
+                  e.dataTransfer.effectAllowed = 'move'
+                  const draggedGid = grp.id
+                  window.setTimeout(() => setDraggingGroupId(draggedGid), 0)
+                }}
+                onDragEnd={() => {
+                  resetAllDragPreviews()
+                }}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onToggleGroupCollapsed(grp.id)
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  const asideRect = asideRef.current?.getBoundingClientRect()
+                  setFolderMenuState({
+                    group: grp,
+                    zone,
+                    y: asideRect ? e.clientY - asideRect.top : e.clientY
+                  })
+                }}
+                onDragOver={(e) => {
+                  const linkDrag =
+                    Boolean(externalDragLink) || hasExternalLinkDragPayload(e.dataTransfer)
+                  const folderDrag =
+                    draggingGroupId !== null &&
+                    draggingGroupId !== grp.id &&
+                    !isGroupAncestorOf(draggingGroupId, grp.id)
+                  if (!draggingTabId && !folderDrag && !linkDrag) return
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (linkDrag && !isExternalLinkHovering) setIsExternalLinkHovering(true)
+                  if (dragOverHint !== null) setDragOverHint(null)
+                  if (pinnedPreviewIndex !== null) setPinnedPreviewIndex(null)
+                  if (dragOverGroupId !== grp.id) setDragOverGroupId(grp.id)
+                }}
+                onDragLeave={(e) => {
+                  if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                    if (dragOverGroupId === grp.id) setDragOverGroupId(null)
+                  }
+                }}
+                onDrop={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  const srcGroupId =
+                    e.dataTransfer.getData('application/x-arko-group-id') || draggingGroupId
+                  const srcId =
+                    !srcGroupId
+                      ? e.dataTransfer.getData('application/x-dia-tab-id') || draggingTabId
+                      : null
+                  const droppedUrl =
+                    !srcGroupId && !srcId
+                      ? extractDroppedExternalUrl(e.dataTransfer) || externalDragLink?.url
+                      : null
+                  resetAllDragPreviews()
+                  onTabDragStateChange?.(null)
+                  if (
+                    srcGroupId &&
+                    srcGroupId !== grp.id &&
+                    !isGroupAncestorOf(srcGroupId, grp.id)
+                  ) {
+                    onUpdateTabGroup?.(srcGroupId, { parentId: grp.id })
+                  } else if (srcId) {
+                    onAssignTabToGroup?.(srcId, grp.id)
+                  } else if (droppedUrl) {
+                    onDropExternalUrl?.(droppedUrl, zone, null, grp.id)
+                  }
+                }}
+                style={{ paddingLeft: headerPaddingLeft }}
+                title={tr(
+                  lang,
+                  `${grp.title} (${totalCount}) — Click to ${grp.collapsed ? 'expand' : 'collapse'} · Right-click for folder options`,
+                  `${grp.title}（${totalCount} 个标签）— 点击${grp.collapsed ? '展开' : '收起'} · 右键管理文件夹`
+                )}
+                className={`arc-pressable group/fhdr w-full flex items-center gap-2 ${
+                  zone === 'pinned'
+                    ? 'h-[32px] pr-2 rounded-[10px] text-[12.5px]'
+                    : 'h-[30px] pr-2 rounded-lg text-[12px]'
+                } font-medium ${
+                  isDark
+                    ? 'text-zinc-200/90 hover:bg-white/[0.06]'
+                    : 'text-zinc-700 hover:bg-black/[0.04]'
+                }`}
+              >
+                {grp.collapsed ? (
+                  <Folder
+                    size={zone === 'pinned' ? 13.5 : 13}
+                    strokeWidth={1.75}
+                    className={`shrink-0 ${hasOpenVisibleInGroup ? 'opacity-75' : 'opacity-50'}`}
+                  />
+                ) : (
+                  <FolderOpen
+                    size={zone === 'pinned' ? 13.5 : 13}
+                    strokeWidth={1.75}
+                    className="shrink-0 opacity-55"
+                  />
+                )}
+                <span
+                  className={`dia-tab-title min-w-0 text-left ${zone === 'pinned' ? '' : 'flex-1'}`}
+                >
+                  {grp.title}
+                </span>
+                {zone === 'unpinned' && grp.collapsed && (
+                  <span
+                    className={`text-[10.5px] tabular-nums px-1.5 py-0.2 rounded-full shrink-0 ${
+                      isDark
+                        ? 'bg-white/[0.07] text-zinc-300/80'
+                        : 'bg-black/[0.05] text-zinc-600/85'
+                    }`}
+                  >
+                    {totalCount}
+                  </span>
+                )}
+                <ChevronDown
+                  size={12}
+                  className={`shrink-0 transition-transform duration-200 ${
+                    grp.collapsed
+                      ? '-rotate-90 opacity-45 group-hover/fhdr:opacity-80'
+                      : 'rotate-0 opacity-45 group-hover/fhdr:opacity-80'
+                  }`}
+                />
+              </button>
+            )}
+
+            <div className="arc-collapse-grid" data-open={!grp.collapsed}>
+              <div className="arc-collapse-inner">
+                <div>
+                  {entries.map((entry) =>
+                    entry.kind === 'group' ? (
+                      <div key={`sub-${entry.group.id}`} className="pt-0.5">
+                        {renderFolderBlock(
+                          entry.group,
+                          depth + 1,
+                          ancestorCollapsed || grp.collapsed
+                        )}
+                      </div>
+                    ) : (
+                      <div key={entry.tab.id} className="pt-0.5">
+                        {renderTabRow(entry.tab, zone, depth + 1)}
+                      </div>
+                    )
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {keptTabsInSubtree.length > 0 && (
+              <div
+                className="arc-collapse-grid"
+                data-open={grp.collapsed && !ancestorCollapsed}
+              >
+                <div className="arc-collapse-inner">
+                  {keptTabsInSubtree.map((keptTab) => (
+                    <div key={`kept-${grp.id}-${keptTab.id}`} className="pt-0.5">
+                      {renderTabRow(keptTab, zone, depth + 1)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      }
+
+      const renderedRootIds = new Set<string>()
       const nodes: React.ReactNode[] = []
 
       for (const tab of sourceTabs) {
-        const grp = tab.groupId ? pGroups.find((g) => g.id === tab.groupId) : undefined
-        if (grp) {
-          if (renderedGroupIds.has(grp.id)) continue
-          renderedGroupIds.add(grp.id)
-          const groupTabs = sourceTabs.filter((t) => t.groupId === grp.id)
-          nodes.push(renderFolderBlock(grp, groupTabs, 'pinned'))
-          continue
+        if (tab.groupId && zoneGroupIds.has(tab.groupId)) {
+          const rootGrp = getRootGroupForId(tab.groupId)
+          if (rootGrp) {
+            if (!renderedRootIds.has(rootGrp.id)) {
+              renderedRootIds.add(rootGrp.id)
+              nodes.push(renderFolderBlock(rootGrp, 0, false))
+            }
+            continue
+          }
         }
-
-        nodes.push(renderTabRow(tab, 'pinned', false))
+        nodes.push(renderTabRow(tab, zone, 0))
       }
 
-      if (isPinnedLivePreviewActive) {
+      for (const rootGrp of rootGroups) {
+        if (!renderedRootIds.has(rootGrp.id)) {
+          renderedRootIds.add(rootGrp.id)
+          nodes.push(renderFolderBlock(rootGrp, 0, false))
+        }
+      }
+
+      if (zone === 'pinned' && isPinnedLivePreviewActive) {
         nodes.push(renderPinnedPreviewRow())
       }
 
       return nodes
     }
 
-    const buildTodayRows = (sourceTabs: TabState[]): React.ReactNode[] => {
-      const renderedGroupIds = new Set<string>()
-      const nodes: React.ReactNode[] = []
-
-      for (const tab of sourceTabs) {
-        const grp = tab.groupId ? pGroups.find((g) => g.id === tab.groupId) : undefined
-        if (grp) {
-          if (renderedGroupIds.has(grp.id)) continue
-          renderedGroupIds.add(grp.id)
-          const groupTabs = sourceTabs.filter((t) => t.groupId === grp.id)
-          nodes.push(renderFolderBlock(grp, groupTabs, 'unpinned'))
-          continue
-        }
-
-        nodes.push(renderTabRow(tab, 'unpinned', false))
-      }
-      return nodes
-    }
-
-    const pinnedNodes = buildPinnedRows(pinnedTabs)
-    const todayNodes = buildTodayRows(todayTabs)
+    const pinnedNodes = buildZoneRows(pinnedTabs, 'pinned')
+    const todayNodes = buildZoneRows(todayTabs, 'unpinned')
 
     return (
       <div
@@ -2017,18 +2499,18 @@ const VerticalSidebarInner: React.FC<Props> = ({
               onDropExternalUrl?.(droppedUrl, 'favorite', insertBeforeId)
             }
           }}
-          className={`px-3 shrink-0 ${
-            favRenderSlots.length > 0 || hasAnyIncomingDrag ? 'pt-0.5 pb-3' : 'pb-0.5'
+          className={`px-2.5 shrink-0 max-h-[44%] overflow-y-auto overflow-x-hidden overscroll-x-none no-scrollbar ${
+            favRenderSlots.length > 0 || hasAnyIncomingDrag ? 'pt-0.5 pb-2' : 'pb-0.5'
           }`}
         >
           {favRenderSlots.length > 0 ? (
             <div
               ref={isVisualSlide ? favGridRef : undefined}
-              className={`grid ${favGridColsClass} gap-2 rounded-2xl transition-all duration-150 ${
+              className={`grid ${favGridColsClass} gap-1.5 rounded-xl transition-all duration-150 ${
                 isFavLivePreviewActive
                   ? isDark
-                    ? 'p-1 -m-1 ring-1 ring-indigo-400/30 bg-indigo-500/[0.04]'
-                    : 'p-1 -m-1 ring-1 ring-indigo-500/25 bg-indigo-500/[0.03]'
+                    ? 'p-1 -m-1 ring-1 ring-white/20 bg-white/[0.03]'
+                    : 'p-1 -m-1 ring-1 ring-black/15 bg-black/[0.025]'
                   : hasAnyIncomingDrag && isVisualSlide
                     ? isDark
                       ? 'p-0.5 -m-0.5 ring-1 ring-dashed ring-white/15'
@@ -2037,35 +2519,21 @@ const VerticalSidebarInner: React.FC<Props> = ({
               }`}
             >
               {favRenderSlots.map((slot) => {
-                const isCompactFavTile = effectiveFavCols >= 4
-                const tileHeightClass = isCompactFavTile ? 'h-[40px]' : 'h-[44px]'
-                const favIconSize = isCompactFavTile ? 17 : 18
-
                 if (slot.kind === 'preview') {
                   return (
                     <div
                       key="__fav-live-preview__"
-                      className={`relative ${tileHeightClass} rounded-[13px] border border-dashed flex items-center justify-center gap-2 px-2 pointer-events-none transition-all duration-150 ${
+                      className={`relative h-[40px] rounded-[11px] border border-dashed flex items-center justify-center pointer-events-none transition-all duration-150 ${
                         isDark
-                          ? 'border-indigo-400/65 bg-indigo-500/[0.14] text-indigo-100 shadow-xs'
-                          : 'border-indigo-500/55 bg-indigo-500/[0.09] text-indigo-900 shadow-2xs'
+                          ? 'border-white/30 bg-white/[0.08] text-zinc-200'
+                          : 'border-black/25 bg-black/[0.05] text-zinc-700'
                       }`}
                     >
                       {slot.url ? (
-                        <FaviconIcon url={slot.url} favicon={slot.favicon} size={favIconSize} />
+                        <FaviconIcon url={slot.url} favicon={slot.favicon} size={16} />
                       ) : (
-                        <Link2 size={15} className="opacity-80 shrink-0" />
+                        <Link2 size={15} className="opacity-75 shrink-0" />
                       )}
-                      {favRenderSlots.length === 1 && (
-                        <span className="text-[11.5px] font-medium truncate min-w-0">
-                          {slot.title}
-                        </span>
-                      )}
-                      <span
-                        className={`absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full ${
-                          isDark ? 'bg-indigo-300' : 'bg-indigo-500'
-                        }`}
-                      />
                     </div>
                   )
                 }
@@ -2076,6 +2544,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
                   pSplit?.enabled &&
                   (tab.id === pSplit.leftTabId || tab.id === pSplit.rightTabId)
                 const drifted = Boolean(tab.pinnedUrl && tab.url !== tab.pinnedUrl)
+                const brandSample = tab.favicon ? faviconBrandCache.get(tab.favicon) : undefined
 
                 return (
                   <div
@@ -2103,45 +2572,28 @@ const VerticalSidebarInner: React.FC<Props> = ({
                       e.preventDefault()
                       onTabContextMenu(tab, { x: e.clientX, y: e.clientY })
                     }}
-                    title={`${tab.title || tab.url}${drifted ? ' (双击还原初始固定页)' : ''} · 拖拽排序或右键管理`}
-                    style={
-                      isActive
-                        ? {
-                            background: slideTheme.favActiveBg,
-                            boxShadow: slideTheme.favActiveShadow
-                          }
-                        : inSplit
-                          ? undefined
-                          : {
-                              background: slideTheme.favIdleBg,
-                              boxShadow: slideTheme.favIdleShadow
-                            }
-                    }
-                    className={`dia-liquid-card arc-fav-pressable group relative ${tileHeightClass} rounded-[13px] flex items-center justify-center gap-2 px-2.5 cursor-pointer ${
+                    title={`${tab.title || tab.url}${
+                      drifted
+                        ? tr(lang, ' (Double-click to reset URL)', '（双击还原初始固定网址）')
+                        : ''
+                    }`}
+                    style={isActive ? getDiaActivePinStyle(brandSample, isDark) : undefined}
+                    className={`dia-pin-tile group relative h-[40px] rounded-[11px] flex items-center justify-center cursor-pointer ${
                       isActive
                         ? ''
                         : inSplit
                           ? isDark
-                            ? 'bg-white/[0.12] ring-1 ring-white/22'
-                            : 'bg-white/80 ring-1 ring-black/10'
-                          : ''
+                            ? 'bg-white/[0.13] ring-1 ring-inset ring-white/25'
+                            : 'bg-black/[0.08] ring-1 ring-inset ring-black/15'
+                          : isDark
+                            ? 'bg-white/[0.085] hover:bg-white/[0.125]'
+                            : 'bg-black/[0.055] hover:bg-black/[0.09]'
                     }`}
                   >
                     {tab.isLoading ? (
-                      <Loader2 size={16} className="animate-spin opacity-65 shrink-0" />
+                      <Loader2 size={15} className="animate-spin opacity-65 shrink-0" />
                     ) : (
-                      <FaviconIcon
-                        url={tab.url}
-                        favicon={tab.favicon}
-                        size={favIconSize}
-                        className="drop-shadow-[0_1px_2px_rgba(0,0,0,0.08)]"
-                      />
-                    )}
-
-                    {favRenderSlots.length === 1 && (
-                      <span className="text-[12px] font-medium truncate min-w-0">
-                        {tab.title || tr(lang, 'Favorite', '常驻标签')}
-                      </span>
+                      <FaviconIcon url={tab.url} favicon={tab.favicon} size={16} />
                     )}
 
                     {tab.isAudioPlaying && (
@@ -2150,32 +2602,12 @@ const VerticalSidebarInner: React.FC<Props> = ({
                           e.stopPropagation()
                           onMuteTab(tab.id)
                         }}
-                        className={`absolute top-1.5 right-1.5 w-3.5 h-3.5 rounded-full flex items-center justify-center ${
-                          isDark ? 'bg-zinc-200 text-zinc-900' : 'bg-zinc-800 text-white'
+                        className={`absolute top-1 right-1 w-3.5 h-3.5 rounded-full flex items-center justify-center ${
+                          isDark ? 'bg-zinc-900/75 text-white' : 'bg-white/85 text-zinc-900'
                         }`}
                       >
                         {tab.isMuted ? <VolumeX size={8} /> : <Volume2 size={8} />}
                       </span>
-                    )}
-
-                    {drifted && !tab.isAudioPlaying && (
-                      <span
-                        title={tr(
-                          lang,
-                          'Drifted from pinned URL (double-click to reset)',
-                          '已偏离初始固定网址（双击还原）'
-                        )}
-                        className={`absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full ${
-                          isDark ? 'bg-zinc-300/75' : 'bg-zinc-600/75'
-                        }`}
-                      />
-                    )}
-
-                    {isActive && (
-                      <span
-                        style={{ backgroundColor: slideTheme.accentHex }}
-                        className="absolute bottom-1 left-1/2 -translate-x-1/2 w-3 h-[2px] rounded-full opacity-85"
-                      />
                     )}
                   </div>
                 )
@@ -2183,103 +2615,28 @@ const VerticalSidebarInner: React.FC<Props> = ({
             </div>
           ) : hasAnyIncomingDrag ? (
             <div
-              className={`h-[42px] rounded-[13px] border border-dashed flex items-center justify-center gap-2 px-3 text-[11.5px] font-medium transition-all ${
+              className={`h-[40px] rounded-[11px] border border-dashed flex items-center justify-center gap-2 px-3 text-[11.5px] font-medium transition-all ${
                 isDark
-                  ? 'border-white/20 bg-white/[0.03] text-zinc-300'
-                  : 'border-black/15 bg-black/[0.025] text-zinc-600'
+                  ? 'border-white/20 bg-white/[0.04] text-zinc-300'
+                  : 'border-black/15 bg-black/[0.03] text-zinc-600'
               }`}
             >
-              <Star size={12} className="opacity-75 shrink-0" />
+              <Pin size={12} className="opacity-75 shrink-0" />
               <span className="truncate">
-                {tr(lang, 'Drag here to pin to Favorites', '拖至此处固定到顶部常驻')}
+                {tr(lang, 'Drag here to pin tab', '拖至此处固定标签页')}
               </span>
             </div>
           ) : null}
         </div>
 
-        {/* ==================== Zone 2: Pinned Tabs + Hairline Divider + Today Tabs ==================== */}
-        <div className="flex-1 overflow-y-auto px-2.5 pb-2 space-y-1 min-h-0">
-          {(pinnedNodes.length > 0 || hasAnyIncomingDrag) && (
-            <div
-              onDragOver={(e) => {
-                const linkDrag =
-                  Boolean(externalDragLink) || hasExternalLinkDragPayload(e.dataTransfer)
-                if (!draggedTab && !linkDrag) return
-
-                e.preventDefault()
-                e.dataTransfer.dropEffect = draggedTab ? 'move' : 'copy'
-                if (linkDrag && !isExternalLinkHovering) setIsExternalLinkHovering(true)
-                if (dropZoneHover !== 'pinned') setDropZoneHover('pinned')
-                if (favPreviewIndex !== null) setFavPreviewIndex(null)
-                if (
-                  pinnedTabs.length === 0 ||
-                  !draggedTab ||
-                  !draggedTab.isPinned ||
-                  draggedTab.isFavorite ||
-                  Boolean(draggedTab.groupId)
-                ) {
-                  if (pinnedPreviewIndex !== pinnedTabs.length) {
-                    setPinnedPreviewIndex(pinnedTabs.length)
-                  }
-                }
-              }}
-              onDragLeave={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                  if (dropZoneHover === 'pinned') setDropZoneHover(null)
-                  setPinnedPreviewIndex(null)
-                }
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                const srcId =
-                  e.dataTransfer.getData('application/x-dia-tab-id') || draggingTabId
-                const droppedUrl = !srcId
-                  ? extractDroppedExternalUrl(e.dataTransfer) || externalDragLink?.url
-                  : null
-
-                resetAllDragPreviews()
-                onTabDragStateChange?.(null)
-
-                if (srcId) {
-                  const srcTab = pTabs.find((t) => t.id === srcId) || allTabs.find((t) => t.id === srcId)
-                  if (
-                    !srcTab ||
-                    !srcTab.isPinned ||
-                    srcTab.isFavorite ||
-                    Boolean(srcTab.groupId)
-                  ) {
-                    onMoveTabToZone(srcId, 'pinned')
-                  }
-                } else if (droppedUrl) {
-                  onDropExternalUrl?.(droppedUrl, 'pinned', null)
-                }
-              }}
-              className={`space-y-0.5 rounded-xl transition-all ${
-                isPinnedLivePreviewActive
-                  ? isDark
-                    ? 'bg-white/[0.04] ring-1 ring-indigo-400/25 p-1 -mx-1'
-                    : 'bg-black/[0.03] ring-1 ring-indigo-500/20 p-1 -mx-1'
-                  : ''
-              }`}
-            >
-              {pinnedNodes}
-              {pinnedNodes.length === 0 && hasAnyIncomingDrag && !isPinnedLivePreviewActive && (
-                <div
-                  className={`h-7 rounded-lg border border-dashed flex items-center justify-center gap-1.5 text-[10.5px] ${
-                    isDark
-                      ? 'border-white/14 text-zinc-400/80'
-                      : 'border-black/12 text-zinc-500/85'
-                  }`}
-                >
-                  <Pin size={10.5} />
-                  <span>{tr(lang, 'Drop to pin to Space', '拖拽至此固定到本空间列表')}</span>
-                </div>
-              )}
-            </div>
+        {/* ==================== Zone 2: Pinned Folders + Hairline Divider + Today Tabs ==================== */}
+        <div className="flex-1 overflow-y-auto overflow-x-hidden overscroll-x-none px-2 pb-2 space-y-1 min-h-0">
+          {pinnedNodes.length > 0 && (
+            <div className="space-y-0.5 rounded-xl transition-all">{pinnedNodes}</div>
           )}
 
           {/* Subtle Space-Tinted Divider with Hover "Tidy" & "Clear" */}
-          <div className="group/divider flex items-center gap-1.5 px-2 py-1">
+          <div className="group/divider h-[18px] flex items-center gap-1.5 px-2">
             <div
               style={{ borderTopColor: slideTheme.dividerColor }}
               className="flex-1 border-t transition-colors"
@@ -2290,7 +2647,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
                 onClick={onOrganizeTabs}
                 disabled={organizingTabs}
                 title={tr(lang, 'Tidy tabs into folders (/organize)', 'AI 智能整理分组 (/organize)')}
-                className="arc-pressable inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-md opacity-0 group-hover/divider:opacity-65 hover:!opacity-100 hover:bg-black/5 dark:hover:bg-white/10"
+                className="arc-pressable hidden group-hover/divider:inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-md opacity-65 hover:!opacity-100 hover:bg-black/5 dark:hover:bg-white/10 shrink-0"
               >
                 {organizingTabs ? (
                   <Loader2 size={10} className="animate-spin" />
@@ -2309,7 +2666,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
                   'Clear unpinned tabs (⇧⌘T to undo)',
                   '清理下方临时标签页（支持 ⇧⌘T 恢复）'
                 )}
-                className="arc-pressable text-[10px] font-medium px-1.5 py-0.5 rounded-md opacity-0 group-hover/divider:opacity-65 hover:!opacity-100 hover:bg-black/5 dark:hover:bg-white/10"
+                className="arc-pressable hidden group-hover/divider:inline-flex items-center text-[10px] font-medium px-1.5 py-0.5 rounded-md opacity-65 hover:!opacity-100 hover:bg-black/5 dark:hover:bg-white/10 shrink-0"
               >
                 {tr(lang, 'Clear', '清理')}
               </button>
@@ -2372,7 +2729,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
                     }
                   : undefined
               }
-              className={`arc-pressable group/newtab w-full h-[32px] px-2.5 rounded-[10px] flex items-center justify-between gap-2 text-[12.5px] ${
+              className={`arc-pressable group/newtab w-full h-[32px] pl-2.5 pr-2 rounded-[10px] flex items-center justify-between gap-2 text-[12.5px] ${
                 isNewTabRowActive
                   ? isDark
                     ? 'text-white font-medium'
@@ -2382,7 +2739,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
                     : 'text-zinc-500 hover:text-zinc-800 hover:bg-black/[0.04]'
               }`}
             >
-              <span className="flex items-center gap-2.5 truncate">
+              <span className="flex items-center gap-2 min-w-0 flex-1">
                 {isNewTabRowActive && (
                   <span
                     style={{ backgroundColor: slideTheme.accentHex }}
@@ -2393,13 +2750,15 @@ const VerticalSidebarInner: React.FC<Props> = ({
                   size={14}
                   className={isNewTabRowActive ? 'opacity-95 shrink-0' : 'opacity-75 shrink-0'}
                 />
-                <span className="truncate">{tr(lang, 'New Tab', '新建标签页')}</span>
+                <span className="dia-tab-title flex-1 min-w-0">
+                  {tr(lang, 'New Tab', '新建标签页')}
+                </span>
               </span>
               <span
-                className={`text-[10.5px] font-mono transition shrink-0 ${
+                className={`text-[10.5px] font-mono shrink-0 ${
                   isNewTabRowActive
-                    ? 'opacity-55'
-                    : 'opacity-0 group-hover/newtab:opacity-45'
+                    ? 'inline opacity-55'
+                    : 'hidden group-hover/newtab:inline opacity-45'
                 }`}
               >
                 ⌘T
@@ -2431,7 +2790,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
             : '0 20px 48px -10px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(0, 0, 0, 0.06)'
           : undefined
       }}
-      className={`relative shrink-0 h-full flex flex-col select-none overflow-hidden ${
+      className={`relative shrink-0 h-full flex flex-col select-none overflow-hidden overscroll-x-none ${
         isPeekOverlay ? 'rounded-2xl border backdrop-blur-2xl' : ''
       } ${isDark ? 'text-zinc-100' : 'text-zinc-800'}`}
     >
@@ -2508,14 +2867,14 @@ const VerticalSidebarInner: React.FC<Props> = ({
                 `${headerPreviewProfile.name} — Click to switch Profile · Right-click for Profile Settings`,
                 `${headerPreviewProfile.name} — 点击切换个人资料 · 右键打开资料设置`
               )}
-              className={`dia-liquid-pill arc-pressable h-[25px] max-w-[112px] px-2.5 rounded-full flex items-center justify-center text-[12px] font-medium tracking-[-0.01em] leading-none truncate ${
+              className={`arc-pressable h-[25px] max-w-[128px] px-2 -ml-1.5 rounded-md flex items-center justify-center text-[13px] font-semibold tracking-[-0.01em] leading-none truncate ${
                 isProfileMenuOpen
                   ? isDark
-                    ? 'bg-white/[0.16] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_1px_4px_rgba(0,0,0,0.25)]'
-                    : 'bg-white/88 text-zinc-950 shadow-[inset_0_1px_0_#fff,0_0_0_0.5px_rgba(15,23,42,0.08),0_2px_6px_rgba(15,23,42,0.06)]'
+                    ? 'bg-white/[0.12] text-white'
+                    : 'bg-black/[0.07] text-zinc-950'
                   : isDark
-                    ? 'bg-white/[0.075] text-zinc-100/90 shadow-[inset_0_1px_0_rgba(255,255,255,0.14)] hover:bg-white/[0.14] hover:text-white'
-                    : 'bg-white/55 text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.90),0_0_0_0.5px_rgba(15,23,42,0.055),0_1px_2px_rgba(15,23,42,0.03)] hover:bg-white/85 hover:text-zinc-950'
+                    ? 'text-zinc-100/95 hover:bg-white/[0.08] hover:text-white'
+                    : 'text-zinc-800 hover:bg-black/[0.05] hover:text-zinc-950'
               }`}
             >
               <span className="truncate">{headerPreviewProfile.name}</span>
@@ -2615,7 +2974,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
             data-no-swipe="true"
             onClick={(e) => e.stopPropagation()}
             style={{
-              top: Math.max(44, Math.min(folderMenuState.y, 420)),
+              top: Math.max(44, Math.min(folderMenuState.y, 400)),
               transformOrigin: 'top left'
             }}
             className={`arc-popover-enter absolute left-2.5 right-2.5 z-40 rounded-2xl border p-1.5 shadow-2xl backdrop-blur-2xl text-[12px] space-y-0.5 ${
@@ -2625,8 +2984,48 @@ const VerticalSidebarInner: React.FC<Props> = ({
             }`}
           >
             <div className="px-2.5 py-1 text-[11px] font-medium opacity-50 truncate border-b border-black/5 dark:border-white/8 mb-1">
-              {folderMenuState.group.title}
+              {(() => {
+                const byId = new Map(allTabGroups.map((g) => [g.id, g]))
+                const parts: string[] = []
+                let cur: TabGroup | undefined = folderMenuState.group
+                const seen = new Set<string>()
+                while (cur && !seen.has(cur.id)) {
+                  seen.add(cur.id)
+                  parts.unshift(cur.title)
+                  cur = cur.parentId ? byId.get(cur.parentId) : undefined
+                }
+                return parts.join(' / ')
+              })()}
             </div>
+
+            {onCreateTabGroup && (
+              <button
+                type="button"
+                onClick={() => {
+                  const parent = folderMenuState.group
+                  const zone = folderMenuState.zone
+                  setFolderMenuState(null)
+                  const defaultName = tr(lang, 'New Folder', '新建文件夹')
+                  void onCreateTabGroup(defaultName, parent.color, [], {
+                    parentId: parent.id,
+                    profileId: parent.profileId,
+                    zone,
+                    keepEmpty: true
+                  }).then((created) => {
+                    if (created?.id) {
+                      setGroupRenameDraft(created.title)
+                      setRenamingGroupId(created.id)
+                    }
+                  })
+                }}
+                className={`arc-pressable w-full flex items-center gap-2 px-2.5 py-1.5 rounded-xl ${
+                  isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-black/[0.05]'
+                }`}
+              >
+                <FolderPlus size={12.5} className="opacity-65" />
+                <span>{tr(lang, 'New Subfolder…', '新建子文件夹…')}</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -2667,6 +3066,23 @@ const VerticalSidebarInner: React.FC<Props> = ({
               </span>
             </button>
 
+            {folderMenuState.group.parentId && (
+              <button
+                type="button"
+                onClick={() => {
+                  const grp = folderMenuState.group
+                  setFolderMenuState(null)
+                  onUpdateTabGroup?.(grp.id, { parentId: null })
+                }}
+                className={`arc-pressable w-full flex items-center gap-2 px-2.5 py-1.5 rounded-xl ${
+                  isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-black/[0.05]'
+                }`}
+              >
+                <CornerLeftUp size={12.5} className="opacity-65" />
+                <span>{tr(lang, 'Move to Top Level', '移出到顶层目录')}</span>
+              </button>
+            )}
+
             <div className={`my-1 border-t ${isDark ? 'border-white/8' : 'border-black/6'}`} />
 
             <button
@@ -2690,9 +3106,25 @@ const VerticalSidebarInner: React.FC<Props> = ({
                 onClick={() => {
                   const grpId = folderMenuState.group.id
                   setFolderMenuState(null)
-                  const members = allTabs.filter((t) => t.groupId === grpId && !t.isPinned)
+                  const subtreeIds = new Set<string>([grpId])
+                  let grew = true
+                  while (grew) {
+                    grew = false
+                    for (const g of allTabGroups) {
+                      if (g.parentId && subtreeIds.has(g.parentId) && !subtreeIds.has(g.id)) {
+                        subtreeIds.add(g.id)
+                        grew = true
+                      }
+                    }
+                  }
+                  const members = allTabs.filter(
+                    (t) => t.groupId && subtreeIds.has(t.groupId) && !t.isPinned
+                  )
                   for (const m of members) {
                     onCloseTab(m.id)
+                  }
+                  if (members.length === 0) {
+                    onDeleteTabGroup?.(grpId)
                   }
                 }}
                 className="arc-pressable w-full flex items-center gap-2 px-2.5 py-1.5 rounded-xl text-rose-500 hover:bg-rose-500/10"
@@ -2930,7 +3362,7 @@ const VerticalSidebarInner: React.FC<Props> = ({
             )
           })()}
 
-          <div className="flex items-center justify-center gap-0.5 overflow-x-auto no-scrollbar">
+          <div className="flex items-center justify-center gap-0.5 overflow-x-auto overscroll-x-none no-scrollbar">
             {profiles.map((p) => {
               const isSelected = p.id === headerPreviewProfile.id
               return (

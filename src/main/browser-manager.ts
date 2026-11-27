@@ -36,6 +36,7 @@ import type {
   AppUpdateState,
   ArkoAccountState,
   BookmarkItem,
+  BrowserImportProgressPayload,
   BrowserImportRequest,
   BrowserImportResult,
   BrowserProfile,
@@ -49,9 +50,11 @@ import type {
   DownloadItemState,
   DualViewportBounds,
   ImportBrowserId,
+  ImportProgressStage,
   InlineEditableTargetInfo,
   InlineWriteActionPreset,
   InlineWriteStreamPayload,
+  InstalledExtensionItem,
   LocalSkillExecutionResult,
   MemoryItem,
   OverlaySnapshotResult,
@@ -95,8 +98,15 @@ import {
 import {
   detectAllBrowsers,
   inspectBrowserAtPath,
-  parseBrowserDataForImport
+  parseBrowserDataForImport,
+  querySqliteSafely
 } from './browser-importer'
+import { ExtensionEcosystemManager } from './extension-manager'
+import {
+  copyChromiumSiteStorageToPartition,
+  migrateChromiumCookiesToSession,
+  type CookieKeyDerivationResult
+} from './session-migrator'
 import {
   CONNECTED_TOOL_SPECS,
   computeEffectiveToolStatus,
@@ -133,6 +143,214 @@ function createDefaultSplitState(): SplitViewState {
     activePane: 'left',
     ratio: 0.5
   }
+}
+
+const FAVICON_PRELOAD_CONCURRENCY = 4
+const FAVICON_FAIL_COOLDOWN_MS = 10 * 60 * 1000
+const SSO_REDIRECT_HOST_RE =
+  /^(?:accounts\.google\.com|login\.microsoftonline\.com|login\.live\.com|appleid\.apple\.com|[^.]+\.auth0\.com|[^.]+\.okta\.com|[^.]+\.oktapreview\.com)$/i
+const SHARED_HOSTING_SUFFIXES = new Set([
+  'github.io',
+  'gitlab.io',
+  'vercel.app',
+  'netlify.app',
+  'pages.dev',
+  'workers.dev',
+  'web.app',
+  'firebaseapp.com',
+  'herokuapp.com',
+  'onrender.com',
+  'fly.dev',
+  'railway.app'
+])
+const MULTI_PART_TLDS = new Set([
+  'com.cn',
+  'net.cn',
+  'org.cn',
+  'gov.cn',
+  'edu.cn',
+  'co.uk',
+  'org.uk',
+  'co.jp',
+  'ne.jp',
+  'or.jp',
+  'com.hk',
+  'com.tw',
+  'com.sg',
+  'com.au',
+  'com.br',
+  'co.kr',
+  'co.in'
+])
+
+function isPrivateOrLocalHost(host: string): boolean {
+  const lower = host.toLowerCase().trim()
+  if (!lower || lower === 'localhost' || !lower.includes('.')) return true
+  if (lower.startsWith('[') || lower.includes(':')) return true
+  if (/\.(?:local|lan|internal|intranet|corp|home|test|invalid|localhost)$/i.test(lower)) {
+    return true
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(lower)) {
+    return true
+  }
+  return false
+}
+
+function getRegistrableRootDomain(host: string): string | null {
+  const lower = host.toLowerCase().trim().replace(/\.+$/, '')
+  if (isPrivateOrLocalHost(lower)) return null
+  const parts = lower.split('.').filter(Boolean)
+  if (parts.length <= 2) return null
+  const lastTwo = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`
+  if (SHARED_HOSTING_SUFFIXES.has(lastTwo)) return null
+  if (MULTI_PART_TLDS.has(lastTwo)) {
+    if (parts.length <= 3) return null
+    return `${parts[parts.length - 3]}.${lastTwo}`
+  }
+  return lastTwo
+}
+
+function extractHtmlIconCandidates(html: string, baseUrl: string): string[] {
+  const headEnd = html.search(/<\/head\s*>/i)
+  const slice = html.slice(0, headEnd > 0 ? Math.min(headEnd + 7, 131072) : 98304)
+  const linkRe = /<link\b([^>]{1,1000})>/gi
+  const scored: Array<{ url: string; score: number }> = []
+  let match: RegExpExecArray | null
+
+  const getAttr = (attrs: string, name: string): string => {
+    const re = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>"']+))`, 'i')
+    const m = re.exec(attrs)
+    return (m?.[1] ?? m?.[2] ?? m?.[3] ?? '').trim()
+  }
+
+  while ((match = linkRe.exec(slice)) !== null) {
+    const attrs = match[1] || ''
+    const rel = getAttr(attrs, 'rel').toLowerCase()
+    if (!rel || !/(?:^|\s)(?:shortcut\s+icon|icon|apple-touch-icon(?:-precomposed)?|fluid-icon)(?:\s|$)/.test(rel)) {
+      continue
+    }
+    const rawHref = getAttr(attrs, 'href')
+      .replace(/&amp;/g, '&')
+      .trim()
+    if (!rawHref || rawHref.startsWith('javascript:')) continue
+
+    let resolved = ''
+    if (rawHref.startsWith('data:image/')) {
+      resolved = rawHref
+    } else {
+      try {
+        const u = new URL(rawHref, baseUrl)
+        if (u.protocol === 'http:' || u.protocol === 'https:') {
+          resolved = u.toString()
+        }
+      } catch {
+        // ignore malformed href
+      }
+    }
+    if (!resolved) continue
+
+    const sizes = getAttr(attrs, 'sizes').toLowerCase()
+    const type = getAttr(attrs, 'type').toLowerCase()
+    let score = 50
+    if (type.includes('svg') || /\.svg(?:$|\?)/i.test(resolved)) {
+      score += 38
+    } else if (type.includes('png') || /\.png(?:$|\?)/i.test(resolved)) {
+      score += 30
+    } else if (type.includes('webp') || /\.webp(?:$|\?)/i.test(resolved)) {
+      score += 26
+    } else if (/\.ico(?:$|\?)/i.test(resolved)) {
+      score += 12
+    }
+    if (rel.includes('apple-touch-icon')) {
+      score += 18
+    }
+    const sizeMatch = /(\d+)\s*x\s*(\d+)/.exec(sizes)
+    if (sizeMatch) {
+      const w = Number(sizeMatch[1])
+      if (w >= 32 && w <= 192) score += 28
+      else if (w > 192 && w <= 512) score += 16
+      else if (w >= 16) score += 8
+    } else if (sizes === 'any') {
+      score += 24
+    }
+    scored.push({ url: resolved, score })
+  }
+
+  scored.sort((a, b) => b.score - a.score)
+  const unique: string[] = []
+  const seen = new Set<string>()
+  for (const item of scored) {
+    if (!seen.has(item.url)) {
+      seen.add(item.url)
+      unique.push(item.url)
+      if (unique.length >= 5) break
+    }
+  }
+  return unique
+}
+
+function normalizeIconBufferToDataUrl(buf: Buffer, mimeHint?: string): string | null {
+  if (!buf || buf.byteLength === 0 || buf.byteLength > 524288) return null
+  const headUtf8 = buf.subarray(0, Math.min(320, buf.byteLength)).toString('utf-8').trimStart()
+  const lowerHead = headUtf8.toLowerCase()
+  if (
+    lowerHead.startsWith('<!doctype html') ||
+    lowerHead.startsWith('<html') ||
+    lowerHead.startsWith('<head') ||
+    lowerHead.startsWith('<body') ||
+    lowerHead.startsWith('{')
+  ) {
+    return null
+  }
+
+  const isSvg =
+    Boolean(mimeHint && mimeHint.includes('svg')) ||
+    lowerHead.startsWith('<svg') ||
+    (lowerHead.startsWith('<?xml') && lowerHead.includes('<svg'))
+  if (isSvg) {
+    if (buf.byteLength > 98304) return null
+    const fullSvg = buf.toString('utf-8')
+    if (!/<svg[\s>]/i.test(fullSvg) || /<script[\s>]/i.test(fullSvg)) return null
+    return `data:image/svg+xml;base64,${buf.toString('base64')}`
+  }
+
+  try {
+    const img = nativeImage.createFromBuffer(buf)
+    if (!img.isEmpty()) {
+      const sz = img.getSize()
+      if (sz.width > 0 && sz.height > 0) {
+        const targetImg =
+          sz.width > 64 || sz.height > 64
+            ? img.resize({ width: 64, height: 64, quality: 'best' })
+            : img
+        const pngBuf = targetImg.toPNG()
+        if (pngBuf.byteLength > 0 && pngBuf.byteLength <= 98304) {
+          return `data:image/png;base64,${pngBuf.toString('base64')}`
+        }
+      }
+    }
+  } catch {
+    // Fallback to magic-byte inspection below
+  }
+
+  // Fallback for valid multi-entry .ico or .webp files that nativeImage couldn't decode on older OS builds
+  if (buf.byteLength <= 65536) {
+    const hex = buf.subarray(0, 8).toString('hex').toUpperCase()
+    if (hex.startsWith('00000100')) {
+      return `data:image/x-icon;base64,${buf.toString('base64')}`
+    }
+    if (hex.startsWith('52494646')) {
+      return `data:image/webp;base64,${buf.toString('base64')}`
+    }
+    if (hex.startsWith('89504E47')) {
+      return `data:image/png;base64,${buf.toString('base64')}`
+    }
+  }
+  return null
+}
+
+function isCalmErrorPageTitle(title?: string | null): boolean {
+  return title === 'Unable to Open Page' || title === '无法打开页面'
 }
 
 function buildCalmErrorHtml(failedUrl: string, errorDesc: string, lang?: AppLanguage): string {
@@ -210,6 +428,7 @@ export class BrowserManager {
   private mainWindow: BrowserWindow
   public store: PersistenceStore
   public aiService: AIService
+  public extensionManager: ExtensionEcosystemManager
   private getUpdateState?: () => AppUpdateState
   private getAccountState?: () => ArkoAccountState
 
@@ -232,6 +451,11 @@ export class BrowserManager {
   private cookieRefreshTimers = new Map<string, NodeJS.Timeout>()
   private scheduledBroadcastTimer: NodeJS.Timeout | null = null
   private viewEvictionTimer: NodeJS.Timeout | null = null
+  private faviconPreloadTimer: NodeJS.Timeout | null = null
+  private faviconPersistTimer: NodeJS.Timeout | null = null
+  private faviconInFlightHosts = new Set<string>()
+  private faviconFailedHostsUntil = new Map<string, number>()
+  private isWindowClosed = false
   private onNativeThemeUpdated: () => void
   private webIpcRegistered = false
 
@@ -250,6 +474,7 @@ export class BrowserManager {
     this.mainWindow = mainWindow
     this.store = store
     this.aiService = aiService
+    this.extensionManager = new ExtensionEcosystemManager(store)
     this.getUpdateState = getUpdateState
     this.getAccountState = getAccountState
     BrowserManager.activeInstance = this
@@ -257,7 +482,18 @@ export class BrowserManager {
     this.registerWebPreloadIpc()
     this.attachShortcutInterceptor(this.mainWindow.webContents)
     this.restoreTabsFromStore()
+    // Ensure extensions for the active profile partition are loaded on boot
+    const activeBootProfile =
+      this.store.profiles.find((p) => p.id === this.store.activeProfileId) ||
+      this.store.profiles[0]
+    if (activeBootProfile) {
+      const bootSes = this.ensureSessionConfigured(activeBootProfile.partition)
+      void this.extensionManager
+        .ensureExtensionsLoadedForSession(activeBootProfile.partition, bootSes)
+        .then(() => this.broadcastState())
+    }
     void this.refreshConnectedTools(this.store.activeProfileId, true)
+    this.scheduleFaviconPreload(350)
 
     this.onNativeThemeUpdated = () => {
       this.syncAllViewsOverlayConfig()
@@ -269,6 +505,7 @@ export class BrowserManager {
     }, IDLE_VIEW_SWEEP_INTERVAL_MS)
 
     this.mainWindow.on('closed', () => {
+      this.isWindowClosed = true
       if (BrowserManager.activeInstance === this) {
         BrowserManager.activeInstance = null
       }
@@ -280,6 +517,14 @@ export class BrowserManager {
       if (this.scheduledBroadcastTimer) {
         clearTimeout(this.scheduledBroadcastTimer)
         this.scheduledBroadcastTimer = null
+      }
+      if (this.faviconPreloadTimer) {
+        clearTimeout(this.faviconPreloadTimer)
+        this.faviconPreloadTimer = null
+      }
+      if (this.faviconPersistTimer) {
+        clearTimeout(this.faviconPersistTimer)
+        this.faviconPersistTimer = null
       }
       for (const timer of this.cookieRefreshTimers.values()) {
         clearTimeout(timer)
@@ -454,6 +699,42 @@ export class BrowserManager {
     ipcMain.removeAllListeners('arko-web:selection-action')
     ipcMain.removeAllListeners('arko-web:open-inline-write')
     ipcMain.removeAllListeners('arko-web:link-drag-state')
+    ipcMain.removeAllListeners('arko-web:page-appearance')
+
+    ipcMain.on(
+      'arko-web:page-appearance',
+      (
+        event,
+        payload: {
+          tone?: 'light' | 'dark'
+          topColor?: string
+          hasMediaBg?: boolean
+        }
+      ) => {
+        const tab = this.findTabByWebContents(event.sender)
+        if (!tab || isInternalDiaUrl(tab.url)) return
+        let changed = false
+        if ((payload?.tone === 'light' || payload?.tone === 'dark') && tab.pageTone !== payload.tone) {
+          tab.pageTone = payload.tone
+          changed = true
+        }
+        if (typeof payload?.topColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(payload.topColor)) {
+          const normHex = payload.topColor.toUpperCase()
+          if (tab.pageTopColor !== normHex) {
+            tab.pageTopColor = normHex
+            changed = true
+          }
+        }
+        if (changed) {
+          this.persistTabs()
+          this.syncWindowTitleBarOverlay()
+          this.scheduleBroadcast(16)
+        }
+        if (payload?.hasMediaBg) {
+          void this.sampleTabRenderedAppearance(tab.id)
+        }
+      }
+    )
 
     ipcMain.on(
       'arko-web:link-drag-state',
@@ -528,6 +809,24 @@ export class BrowserManager {
     const validGroupIds = new Set(this.tabGroups.map((g) => g.id))
 
     if (Array.isArray(saved.tabs) && saved.tabs.length > 0) {
+      const knownTitleByUrl = new Map<string, string>()
+      for (const b of this.store.bookmarks) {
+        if (b.url && b.title && b.title !== b.url && !isCalmErrorPageTitle(b.title)) {
+          knownTitleByUrl.set(b.url, b.title)
+        }
+      }
+      for (const h of this.store.history) {
+        if (
+          h.url &&
+          h.title &&
+          h.title !== h.url &&
+          !isCalmErrorPageTitle(h.title) &&
+          !knownTitleByUrl.has(h.url)
+        ) {
+          knownTitleByUrl.set(h.url, h.title)
+        }
+      }
+
       this.tabs = saved.tabs.map((t, i) => {
         const url = t.url || NEW_TAB_URL
         const chatThreadId = getChatThreadIdFromUrl(url)
@@ -538,14 +837,26 @@ export class BrowserManager {
         const isPinned = Boolean(t.isPinned || isFavorite)
         const defaultPinnedUrl =
           isPinned && url !== NEW_TAB_URL ? url : null
+        const savedTitle = isCalmErrorPageTitle(t.title)
+          ? knownTitleByUrl.get(url) ||
+            (t.pinnedUrl ? knownTitleByUrl.get(t.pinnedUrl) : undefined) ||
+            PersistenceStore.extractHostKey(url) ||
+            url
+          : t.title
+        const resolvedFavicon =
+          (t.favicon && t.favicon.startsWith('data:image/') ? t.favicon : undefined) ||
+          this.store.getCachedFavicon(url) ||
+          (t.pinnedUrl ? this.store.getCachedFavicon(t.pinnedUrl) : undefined) ||
+          t.favicon
         return {
           id: t.id,
           profileId: t.profileId,
           url,
           title: chatThread
             ? chatThread.title || tr(this.store.settings.language, 'Arko Chat', 'Arko 对话')
-            : t.title || (url === NEW_TAB_URL ? tr(this.store.settings.language, 'New Tab', '新标签页') : url),
-          favicon: t.favicon,
+            : savedTitle ||
+              (url === NEW_TAB_URL ? tr(this.store.settings.language, 'New Tab', '新标签页') : url),
+          favicon: resolvedFavicon,
           isLoading: false,
           canGoBack: false,
           canGoForward: false,
@@ -558,7 +869,8 @@ export class BrowserManager {
           lastAccessedAt: Date.now() - i,
           groupId:
             !isFavorite && t.groupId && validGroupIds.has(t.groupId) ? t.groupId : null,
-          zoomFactor: 1
+          zoomFactor: 1,
+          pageTone: t.pageTone
         }
       })
     }
@@ -631,7 +943,12 @@ export class BrowserManager {
       }
     }
 
+    const migratedGroups = this.migrateLegacyFlattenedGroups()
+    const hydratedIcons = this.hydrateCachedFaviconsSync()
     this.sortProfileTabsByTier()
+    if (migratedGroups || hydratedIcons) {
+      this.persistTabs()
+    }
 
     const curSplit = this.getSplitView()
     if (curSplit.enabled && curSplit.leftTabId && curSplit.rightTabId) {
@@ -647,44 +964,713 @@ export class BrowserManager {
     }
   }
 
+  /**
+   * Ensures `parentId` links never cross profiles, point to missing IDs, or form cycles.
+   */
+  private sanitizeTabGroupHierarchy(): void {
+    const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+    for (const grp of this.tabGroups) {
+      if (!grp.parentId) {
+        grp.parentId = null
+        continue
+      }
+      const parent = byId.get(grp.parentId)
+      if (!parent || parent.id === grp.id || parent.profileId !== grp.profileId) {
+        grp.parentId = null
+        continue
+      }
+      const visited = new Set<string>([grp.id])
+      let cur: TabGroup | undefined = parent
+      let hasCycle = false
+      while (cur) {
+        if (visited.has(cur.id)) {
+          hasCycle = true
+          break
+        }
+        visited.add(cur.id)
+        cur = cur.parentId ? byId.get(cur.parentId) : undefined
+      }
+      if (hasCycle) {
+        grp.parentId = null
+      }
+    }
+  }
+
+  private getGroupFullPathSegments(groupId: string): string[] {
+    const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+    const segments: string[] = []
+    const visited = new Set<string>()
+    let curId: string | null | undefined = groupId
+    while (curId && !visited.has(curId)) {
+      visited.add(curId)
+      const grp = byId.get(curId)
+      if (!grp) break
+      segments.unshift(grp.title)
+      curId = grp.parentId
+    }
+    return segments
+  }
+
+  private getGroupFullPathTitle(groupId: string): string {
+    return this.getGroupFullPathSegments(groupId).join(' / ')
+  }
+
+  private resolveGroupZone(grp: TabGroup): 'pinned' | 'unpinned' {
+    const childrenByParent = new Map<string, TabGroup[]>()
+    const byId = new Map<string, TabGroup>()
+    for (const g of this.tabGroups) {
+      byId.set(g.id, g)
+      if (g.parentId) {
+        const list = childrenByParent.get(g.parentId) || []
+        list.push(g)
+        childrenByParent.set(g.parentId, list)
+      }
+    }
+
+    const visited = new Set<string>()
+    const queue: TabGroup[] = [grp]
+    while (queue.length > 0) {
+      const cur = queue.shift()!
+      if (visited.has(cur.id)) continue
+      visited.add(cur.id)
+      const tab = this.tabs.find((t) => t.profileId === cur.profileId && t.groupId === cur.id)
+      if (tab) {
+        return tab.isPinned ? 'pinned' : 'unpinned'
+      }
+      if (cur.zone) return cur.zone
+      for (const child of childrenByParent.get(cur.id) || []) {
+        queue.push(child)
+      }
+    }
+
+    let ancestorId = grp.parentId
+    const seenAnc = new Set<string>()
+    while (ancestorId && !seenAnc.has(ancestorId)) {
+      seenAnc.add(ancestorId)
+      const anc = byId.get(ancestorId)
+      if (!anc) break
+      if (anc.zone) return anc.zone
+      const ancTab = this.tabs.find((t) => t.profileId === anc.profileId && t.groupId === anc.id)
+      if (ancTab) return ancTab.isPinned ? 'pinned' : 'unpinned'
+      ancestorId = anc.parentId
+    }
+
+    return grp.zone || 'pinned'
+  }
+
+  /**
+   * Automatically upgrades previously imported single-level `'A / B / C'` TabGroups into true
+   * nested `parentId` folder trees on startup without requiring users to re-import.
+   */
+  private migrateLegacyFlattenedGroups(): boolean {
+    this.sanitizeTabGroupHierarchy()
+    const hasFlattened = this.tabGroups.some((g) => !g.parentId && g.title.includes(' / '))
+    if (!hasFlattened) return false
+
+    let changed = false
+    const inferredZoneById = new Map<string, 'pinned' | 'unpinned'>()
+    for (const g of this.tabGroups) {
+      const z = this.resolveGroupZone(g)
+      g.zone = z
+      inferredZoneById.set(g.id, z)
+    }
+
+    const bucketKeys = new Set<string>()
+    for (const g of this.tabGroups) {
+      bucketKeys.add(`${g.profileId}::${inferredZoneById.get(g.id) || 'pinned'}`)
+    }
+
+    const redundantGroupIds = new Set<string>()
+    const nextGroupsOrder: TabGroup[] = []
+    const emittedIds = new Set<string>()
+    const emitGroup = (g: TabGroup): void => {
+      if (!emittedIds.has(g.id) && !redundantGroupIds.has(g.id)) {
+        emittedIds.add(g.id)
+        nextGroupsOrder.push(g)
+      }
+    }
+
+    for (const key of bucketKeys) {
+      const [profileId, zoneRaw] = key.split('::')
+      const zone = (zoneRaw === 'unpinned' ? 'unpinned' : 'pinned') as 'pinned' | 'unpinned'
+      const bucketGroups = this.tabGroups.filter(
+        (g) => g.profileId === profileId && (inferredZoneById.get(g.id) || 'pinned') === zone
+      )
+      if (!bucketGroups.some((g) => !g.parentId && g.title.includes(' / '))) {
+        for (const g of bucketGroups) emitGroup(g)
+        continue
+      }
+
+      // Pre-index existing unnested groups by normalized path so e.g. `BAK / Meitou` keeps its own group ID
+      // when `BAK / Meitou / Dev` also exists in the same Space.
+      const exactCandidatesByNormPath = new Map<string, TabGroup[]>()
+      for (const g of bucketGroups) {
+        if (g.parentId) continue
+        const segs = g.title
+          .split(' / ')
+          .map((s) => s.trim())
+          .filter(Boolean)
+        if (segs.length === 0) continue
+        const normPath = segs.map((s) => s.toLowerCase()).join(' / ')
+        const arr = exactCandidatesByNormPath.get(normPath) || []
+        arr.push(g)
+        exactCandidatesByNormPath.set(normPath, arr)
+      }
+
+      const resolvedByNormPath = new Map<string, TabGroup>()
+
+      for (const g of bucketGroups) {
+        if (g.parentId) {
+          emitGroup(g)
+          continue
+        }
+        const segs = g.title
+          .split(' / ')
+          .map((s) => s.trim())
+          .filter(Boolean)
+        if (segs.length <= 1) {
+          const singleNorm = (segs[0] || g.title).trim().toLowerCase()
+          if (!resolvedByNormPath.has(singleNorm)) {
+            resolvedByNormPath.set(singleNorm, g)
+          }
+          emitGroup(g)
+          continue
+        }
+
+        changed = true
+        let parentGrp: TabGroup | null = null
+        for (let depth = 0; depth < segs.length; depth++) {
+          const prefixSegs = segs.slice(0, depth + 1)
+          const normPrefix = prefixSegs.map((s) => s.toLowerCase()).join(' / ')
+          let node = resolvedByNormPath.get(normPrefix)
+
+          if (!node) {
+            const candidates = exactCandidatesByNormPath.get(normPrefix)
+            const chosen = candidates && candidates.length > 0 ? candidates.shift()! : null
+            if (chosen) {
+              chosen.title = segs[depth]
+              chosen.parentId = parentGrp ? parentGrp.id : null
+              chosen.zone = zone
+              node = chosen
+              // Reassign any duplicate group with the exact same normalized path
+              if (candidates && candidates.length > 0) {
+                for (const dup of candidates) {
+                  for (const t of this.tabs) {
+                    if (t.groupId === dup.id) t.groupId = chosen.id
+                  }
+                  redundantGroupIds.add(dup.id)
+                }
+                candidates.length = 0
+              }
+            } else {
+              node = {
+                id: `grp-mig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+                profileId,
+                parentId: parentGrp ? parentGrp.id : null,
+                zone,
+                title: segs[depth],
+                color: parentGrp ? parentGrp.color : g.color,
+                collapsed: false
+              }
+            }
+            resolvedByNormPath.set(normPrefix, node)
+            emitGroup(node)
+          } else if (depth === segs.length - 1 && node.id !== g.id) {
+            for (const t of this.tabs) {
+              if (t.groupId === g.id) t.groupId = node.id
+            }
+            redundantGroupIds.add(g.id)
+          }
+
+          parentGrp = node
+        }
+      }
+    }
+
+    if (changed) {
+      this.tabGroups = nextGroupsOrder.filter((g) => !redundantGroupIds.has(g.id))
+      // If a parent folder contains expanded child folders, keep the parent expanded so visible subfolders stay open
+      const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+      let expandedParent = true
+      while (expandedParent) {
+        expandedParent = false
+        for (const g of this.tabGroups) {
+          if (!g.collapsed && g.parentId) {
+            const p = byId.get(g.parentId)
+            if (p && p.collapsed) {
+              p.collapsed = false
+              expandedParent = true
+            }
+          }
+        }
+      }
+      this.sanitizeTabGroupHierarchy()
+    }
+
+    return changed
+  }
+
   private cleanupEmptyGroups(): void {
-    const usedGroupIds = new Set(this.tabs.map((t) => t.groupId).filter(Boolean))
-    this.tabGroups = this.tabGroups.filter((g) => usedGroupIds.has(g.id))
+    this.sanitizeTabGroupHierarchy()
+    const usedGroupIds = new Set(this.tabs.map((t) => t.groupId).filter(Boolean) as string[])
+    const keptIds = new Set<string>()
+    for (const g of this.tabGroups) {
+      if (usedGroupIds.has(g.id) || g.keepEmpty) {
+        keptIds.add(g.id)
+      }
+    }
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const g of this.tabGroups) {
+        if (keptIds.has(g.id) && g.parentId && !keptIds.has(g.parentId)) {
+          keptIds.add(g.parentId)
+          grew = true
+        }
+      }
+    }
+    this.tabGroups = this.tabGroups.filter((g) => keptIds.has(g.id))
   }
 
   private clusterTierTabsByGroup(tierTabs: TabState[]): TabState[] {
-    const validGroupIds = new Set(this.tabGroups.map((g) => g.id))
-    const seenGroups = new Set<string>()
+    const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+    const getRootGroupId = (gid: string): string => {
+      let cur = gid
+      const visited = new Set<string>()
+      while (cur && !visited.has(cur)) {
+        visited.add(cur)
+        const g = byId.get(cur)
+        if (!g?.parentId || !byId.has(g.parentId)) return cur
+        cur = g.parentId
+      }
+      return gid
+    }
+
+    const seenRoots = new Set<string>()
     const result: TabState[] = []
 
     for (const tab of tierTabs) {
-      const gid = tab.groupId && validGroupIds.has(tab.groupId) ? tab.groupId : null
+      const gid = tab.groupId && byId.has(tab.groupId) ? tab.groupId : null
       if (!gid) {
         if (tab.groupId) tab.groupId = null
         result.push(tab)
         continue
       }
-      if (seenGroups.has(gid)) continue
-      seenGroups.add(gid)
-      for (const member of tierTabs) {
-        if (member.groupId === gid) {
-          result.push(member)
+      const rootId = getRootGroupId(gid)
+      if (seenRoots.has(rootId)) continue
+      seenRoots.add(rootId)
+
+      // Within this root folder tree, preserve relative subfolder order while clustering tabs of each leaf folder
+      const treeTabs = tierTabs.filter((t) => {
+        const tGid = t.groupId && byId.has(t.groupId) ? t.groupId : null
+        return tGid !== null && getRootGroupId(tGid) === rootId
+      })
+      const seenLeafGroups = new Set<string>()
+      for (const treeTab of treeTabs) {
+        const leafId = treeTab.groupId!
+        if (seenLeafGroups.has(leafId)) continue
+        seenLeafGroups.add(leafId)
+        for (const member of treeTabs) {
+          if (member.groupId === leafId) {
+            result.push(member)
+          }
         }
       }
     }
     return result
   }
 
+  private faviconDataUrlCache = new Map<string, string>()
+
+  private hydrateCachedFaviconsSync(): boolean {
+    let changedTabs = false
+    let changedBookmarks = false
+    for (const t of this.tabs) {
+      if (t.favicon && t.favicon.startsWith('data:image/')) {
+        this.store.setCachedFavicon(t.url, t.favicon)
+        if (t.pinnedUrl) this.store.setCachedFavicon(t.pinnedUrl, t.favicon)
+      }
+    }
+    for (const b of this.store.bookmarks) {
+      if (b.favicon && b.favicon.startsWith('data:image/')) {
+        this.store.setCachedFavicon(b.url, b.favicon)
+      }
+    }
+    for (const h of this.store.history) {
+      if (h.favicon && h.favicon.startsWith('data:image/')) {
+        this.store.setCachedFavicon(h.url, h.favicon)
+      }
+    }
+
+    for (const t of this.tabs) {
+      if (isInternalDiaUrl(t.url)) continue
+      if (t.favicon && t.favicon.startsWith('data:image/')) continue
+      const cached =
+        this.store.getCachedFavicon(t.url) ||
+        (t.pinnedUrl ? this.store.getCachedFavicon(t.pinnedUrl) : undefined)
+      if (cached && cached !== t.favicon) {
+        t.favicon = cached
+        changedTabs = true
+      }
+    }
+    for (const b of this.store.bookmarks) {
+      if (b.favicon && b.favicon.startsWith('data:image/')) continue
+      const cached = this.store.getCachedFavicon(b.url)
+      if (cached && cached !== b.favicon) {
+        b.favicon = cached
+        changedBookmarks = true
+      }
+    }
+    if (changedBookmarks) {
+      this.store.saveBookmarks()
+    }
+    return changedTabs
+  }
+
+  private applyResolvedHostFavicon(host: string, dataUrl: string): void {
+    if (!host || !dataUrl.startsWith('data:image/')) return
+    this.store.setCachedFavicon(host, dataUrl)
+
+    let tabsChanged = false
+    let bookmarksChanged = false
+
+    for (const t of this.tabs) {
+      if (isInternalDiaUrl(t.url)) continue
+      if (t.favicon && t.favicon.startsWith('data:image/')) continue
+      const tHost = PersistenceStore.extractHostKey(t.url)
+      const pHost = t.pinnedUrl ? PersistenceStore.extractHostKey(t.pinnedUrl) : null
+      if (tHost === host || pHost === host) {
+        t.favicon = dataUrl
+        tabsChanged = true
+      }
+    }
+
+    for (const b of this.store.bookmarks) {
+      if (b.favicon && b.favicon.startsWith('data:image/')) continue
+      if (PersistenceStore.extractHostKey(b.url) === host) {
+        b.favicon = dataUrl
+        bookmarksChanged = true
+      }
+    }
+
+    if (tabsChanged || bookmarksChanged) {
+      if (this.faviconPersistTimer) clearTimeout(this.faviconPersistTimer)
+      this.faviconPersistTimer = setTimeout(() => {
+        this.faviconPersistTimer = null
+        if (this.isWindowClosed) return
+        this.persistTabs()
+        this.store.saveBookmarks()
+      }, 260)
+      this.scheduleBroadcast(110)
+    }
+  }
+
+  private async fetchWithTimeout(
+    ses: Electron.Session,
+    url: string,
+    timeoutMs: number,
+    headers?: Record<string, string>
+  ): Promise<Response | null> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      return await ses.fetch(url, {
+        signal: controller.signal,
+        redirect: 'follow',
+        headers: {
+          Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          ...headers
+        }
+      })
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  private async fetchAndNormalizeIconUrl(
+    ses: Electron.Session,
+    iconUrl: string,
+    timeoutMs = 3800
+  ): Promise<string | null> {
+    if (iconUrl.startsWith('data:image/')) {
+      return iconUrl.length <= 131072 ? iconUrl : null
+    }
+    const cached = this.faviconDataUrlCache.get(iconUrl)
+    if (cached) return cached
+
+    const res = await this.fetchWithTimeout(ses, iconUrl, timeoutMs)
+    if (!res || !res.ok) return null
+    const rawMime = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
+    if (rawMime === 'text/html' || rawMime === 'application/json' || rawMime === 'text/plain') {
+      return null
+    }
+    try {
+      const ab = await res.arrayBuffer()
+      if (ab.byteLength === 0 || ab.byteLength > 524288) return null
+      const dataUrl = normalizeIconBufferToDataUrl(Buffer.from(ab), rawMime)
+      if (!dataUrl) return null
+      if (this.faviconDataUrlCache.size > 500) {
+        const firstKey = this.faviconDataUrlCache.keys().next().value
+        if (firstKey) this.faviconDataUrlCache.delete(firstKey)
+      }
+      this.faviconDataUrlCache.set(iconUrl, dataUrl)
+      return dataUrl
+    } catch {
+      return null
+    }
+  }
+
+  private async resolveFaviconForTarget(
+    ses: Electron.Session,
+    sampleUrl: string,
+    host: string
+  ): Promise<string | null> {
+    let parsed: URL
+    try {
+      parsed = new URL(sampleUrl)
+    } catch {
+      return null
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    const origin = parsed.origin
+    const isLocal = isPrivateOrLocalHost(host)
+
+    // Step 1: Inspect page / origin HTML <head> for explicit <link rel="icon" | "apple-touch-icon">
+    const htmlTargets = parsed.pathname && parsed.pathname !== '/' ? [sampleUrl, `${origin}/`] : [sampleUrl]
+    for (const htmlUrl of htmlTargets) {
+      if (this.isWindowClosed) return null
+      const htmlRes = await this.fetchWithTimeout(ses, htmlUrl, isLocal ? 2200 : 5000, {
+        Accept: 'text/html,application/xhtml+xml,*/*;q=0.8'
+      })
+      if (!htmlRes || !htmlRes.ok) continue
+      const finalUrl = htmlRes.url || htmlUrl
+      const finalHost = PersistenceStore.extractHostKey(finalUrl)
+      // Do not adopt SSO provider login page icons (e.g. accounts.google.com) for a different site
+      if (finalHost && finalHost !== host && SSO_REDIRECT_HOST_RE.test(finalHost)) {
+        continue
+      }
+      const ctype = (htmlRes.headers.get('content-type') || '').toLowerCase()
+      if (!ctype.includes('html') && !ctype.includes('xml')) continue
+      try {
+        const ab = await htmlRes.arrayBuffer()
+        const htmlSnippet = Buffer.from(ab.slice(0, 131072)).toString('utf-8')
+        const candidates = extractHtmlIconCandidates(htmlSnippet, finalUrl)
+        for (const cand of candidates) {
+          if (this.isWindowClosed) return null
+          const iconDataUrl = await this.fetchAndNormalizeIconUrl(ses, cand, isLocal ? 2000 : 3800)
+          if (iconDataUrl) return iconDataUrl
+        }
+        if (candidates.length > 0) break
+      } catch {
+        // continue to direct origin paths
+      }
+    }
+
+    // Step 2: Probe standard root icon locations on the origin directly
+    const directCandidates = [
+      `${origin}/favicon.ico`,
+      `${origin}/favicon.png`,
+      `${origin}/favicon.svg`,
+      `${origin}/apple-touch-icon.png`
+    ]
+    for (const directUrl of directCandidates) {
+      if (this.isWindowClosed) return null
+      const iconDataUrl = await this.fetchAndNormalizeIconUrl(
+        ses,
+        directUrl,
+        isLocal ? 1800 : 3200
+      )
+      if (iconDataUrl) return iconDataUrl
+    }
+
+    if (isLocal) return null
+
+    // Step 3: Public Favicon CDN Fallbacks (for Cloudflare-gated, SSO-redirected, or temporarily offline hosts)
+    // Also falls back to registrable root domain for custom SaaS tenant subdomains (e.g. tenant.invoiceocean.com)
+    const domainCandidates = [host]
+    const rootDomain = getRegistrableRootDomain(host)
+    if (rootDomain && rootDomain !== host) {
+      domainCandidates.push(rootDomain)
+    }
+
+    for (const domain of domainCandidates) {
+      if (this.isWindowClosed) return null
+      const serviceUrls = [
+        `https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=${encodeURIComponent(`https://${domain}`)}&size=64`,
+        `https://icons.duckduckgo.com/ip3/${encodeURIComponent(domain)}.ico`
+      ]
+      for (const svcUrl of serviceUrls) {
+        if (this.isWindowClosed) return null
+        const iconDataUrl = await this.fetchAndNormalizeIconUrl(ses, svcUrl, 4200)
+        if (iconDataUrl) return iconDataUrl
+      }
+    }
+
+    return null
+  }
+
+  public scheduleFaviconPreload(delayMs = 160): void {
+    if (this.isWindowClosed) return
+    if (this.faviconPreloadTimer) clearTimeout(this.faviconPreloadTimer)
+    this.faviconPreloadTimer = setTimeout(() => {
+      this.faviconPreloadTimer = null
+      void this.runFaviconPreloadSweep()
+    }, delayMs)
+  }
+
+  private async runFaviconPreloadSweep(): Promise<void> {
+    if (this.isWindowClosed) return
+
+    if (this.hydrateCachedFaviconsSync()) {
+      this.persistTabs()
+      this.scheduleBroadcast(48)
+    }
+
+    const activeProfileId = this.store.activeProfileId
+    const profilePartitionMap = new Map<string, string>()
+    for (const p of this.store.profiles) {
+      profilePartitionMap.set(p.id, p.partition)
+    }
+    const defaultPartition = this.store.profiles[0]?.partition || 'persist:arko-profile-work'
+
+    interface PreloadCandidate {
+      host: string
+      sampleUrl: string
+      partition: string
+      priority: number
+    }
+
+    const now = Date.now()
+    const byHost = new Map<string, PreloadCandidate>()
+
+    const consider = (
+      rawUrl: string | null | undefined,
+      profileId: string,
+      currentFavicon: string | undefined,
+      priority: number
+    ): void => {
+      if (!rawUrl || isInternalDiaUrl(rawUrl)) return
+      if (currentFavicon && currentFavicon.startsWith('data:image/')) return
+      if (!/^https?:\/\//i.test(rawUrl)) return
+      const host = PersistenceStore.extractHostKey(rawUrl)
+      if (!host) return
+      if (this.faviconInFlightHosts.has(host)) return
+      const cooldownUntil = this.faviconFailedHostsUntil.get(host) || 0
+      if (cooldownUntil > now) return
+
+      const cached = this.store.getCachedFavicon(host)
+      if (cached) {
+        this.applyResolvedHostFavicon(host, cached)
+        return
+      }
+
+      const existing = byHost.get(host)
+      if (!existing || priority < existing.priority) {
+        byHost.set(host, {
+          host,
+          sampleUrl: rawUrl,
+          partition: profilePartitionMap.get(profileId) || defaultPartition,
+          priority
+        })
+      }
+    }
+
+    for (const t of this.tabs) {
+      const isActiveSpace = t.profileId === activeProfileId
+      const isPinnedOrFav = Boolean(t.isFavorite || t.isPinned)
+      const priority = isActiveSpace ? (isPinnedOrFav ? 1 : 2) : isPinnedOrFav ? 3 : 4
+      consider(t.pinnedUrl || t.url, t.profileId, t.favicon, priority)
+    }
+
+    for (const b of this.store.bookmarks.slice(0, 240)) {
+      consider(b.url, b.profileId, b.favicon, b.profileId === activeProfileId ? 5 : 6)
+    }
+
+    if (byHost.size === 0) return
+
+    const queue = [...byHost.values()].sort((a, b) => a.priority - b.priority)
+    for (const item of queue) {
+      this.faviconInFlightHosts.add(item.host)
+    }
+
+    let cursor = 0
+    const worker = async (): Promise<void> => {
+      while (!this.isWindowClosed && cursor < queue.length) {
+        const task = queue[cursor++]
+        try {
+          // Re-check cache in case another tab finished it
+          const already = this.store.getCachedFavicon(task.host)
+          if (already) {
+            this.applyResolvedHostFavicon(task.host, already)
+            continue
+          }
+          const ses = this.ensureSessionConfigured(task.partition)
+          const dataUrl = await this.resolveFaviconForTarget(ses, task.sampleUrl, task.host)
+          if (dataUrl) {
+            this.faviconFailedHostsUntil.delete(task.host)
+            this.applyResolvedHostFavicon(task.host, dataUrl)
+          } else {
+            this.faviconFailedHostsUntil.set(task.host, Date.now() + FAVICON_FAIL_COOLDOWN_MS)
+          }
+        } catch {
+          this.faviconFailedHostsUntil.set(task.host, Date.now() + FAVICON_FAIL_COOLDOWN_MS)
+        } finally {
+          this.faviconInFlightHosts.delete(task.host)
+        }
+      }
+    }
+
+    const workerCount = Math.min(FAVICON_PRELOAD_CONCURRENCY, queue.length)
+    await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  }
+
   private sortSingleProfileTabs(list: TabState[]): TabState[] {
+    // Dia-style unified Pin model: ungrouped pinned tabs live in the top Pin icon grid,
+    // while grouped pinned tabs stay inside Pinned Folders right below the grid.
+    for (const t of list) {
+      if (t.isPinned && !t.groupId) {
+        t.isFavorite = true
+      } else if (t.groupId && t.isFavorite) {
+        t.isFavorite = false
+      }
+    }
+
     const favorites = list.filter((t) => t.isFavorite)
     const pinned = list.filter((t) => !t.isFavorite && t.isPinned)
     const unpinned = list.filter((t) => !t.isFavorite && !t.isPinned)
 
-    // Ensure a single TabGroup never straddles both Pinned and Today zones
-    const pinnedGroupIds = new Set(pinned.map((t) => t.groupId).filter(Boolean) as string[])
+    // Ensure a TabGroup (and its ancestor chain) never straddles both Pinned and Today zones
+    const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+    const pinnedTreeGroupIds = new Set<string>()
+    for (const t of pinned) {
+      let cur = t.groupId
+      const seen = new Set<string>()
+      while (cur && !seen.has(cur)) {
+        seen.add(cur)
+        pinnedTreeGroupIds.add(cur)
+        const g = byId.get(cur)
+        if (g) g.zone = 'pinned'
+        cur = g?.parentId ?? null
+      }
+    }
     for (const t of unpinned) {
-      if (t.groupId && pinnedGroupIds.has(t.groupId)) {
+      if (t.groupId && pinnedTreeGroupIds.has(t.groupId)) {
         t.groupId = null
+      } else if (t.groupId) {
+        let cur: string | null = t.groupId
+        const seen = new Set<string>()
+        while (cur && !seen.has(cur)) {
+          seen.add(cur)
+          const g = byId.get(cur)
+          if (!g) break
+          if (g.parentId && pinnedTreeGroupIds.has(g.parentId)) {
+            g.parentId = null
+          }
+          g.zone = 'unpinned'
+          cur = g.parentId ?? null
+        }
       }
     }
 
@@ -729,8 +1715,8 @@ export class BrowserManager {
       if (!wasPinnedTier) {
         tab.groupId = null
       }
-      tab.isFavorite = false
       tab.isPinned = true
+      tab.isFavorite = !tab.groupId
       if (!tab.pinnedUrl && tab.url && tab.url !== NEW_TAB_URL) {
         tab.pinnedUrl = tab.url
       }
@@ -758,7 +1744,8 @@ export class BrowserManager {
         isPinned: Boolean(t.isPinned || t.isFavorite),
         isFavorite: Boolean(t.isFavorite),
         pinnedUrl: t.pinnedUrl || null,
-        groupId: t.isFavorite ? null : t.groupId || null
+        groupId: t.isFavorite ? null : t.groupId || null,
+        pageTone: t.pageTone
       })),
       this.splitByProfile,
       this.tabGroups
@@ -791,6 +1778,14 @@ export class BrowserManager {
       ...t,
       isLoaded: isInternalDiaUrl(t.url) || this.views.has(t.id)
     })
+    const activeProfileObj =
+      this.store.profiles.find((p) => p.id === activeProfileId) || this.store.profiles[0]
+    const activePartition = activeProfileObj?.partition || 'persist:arko-profile-work'
+    const siblingProfileIds = new Set(
+      this.store.profiles.filter((p) => p.partition === activePartition).map((p) => p.id)
+    )
+    siblingProfileIds.add(activeProfileId)
+
     return {
       platform,
       profiles: this.store.profiles,
@@ -804,7 +1799,9 @@ export class BrowserManager {
       activeTabId: this.activeTabByProfile[activeProfileId] || null,
       splitView: { ...this.getSplitView(activeProfileId) },
       bookmarks: this.store.bookmarks.filter((b) => b.profileId === activeProfileId),
-      history: this.store.history.filter((h) => h.profileId === activeProfileId).slice(0, 300),
+      history: this.store.history
+        .filter((h) => siblingProfileIds.has(h.profileId))
+        .slice(0, 400),
       memories: this.store.memories,
       downloads: this.downloads.slice(0, 25),
       recentlyClosedCount: closedStack.length,
@@ -814,6 +1811,7 @@ export class BrowserManager {
       updateState: this.getUpdateState?.(),
       connectedTools:
         this.connectedToolsByProfile[activeProfileId] || this.getFallbackConnectedTools(),
+      extensions: this.extensionManager.getExtensionsSnapshotForPartition(activePartition),
       accountState: this.getAccountState?.()
     }
   }
@@ -990,6 +1988,16 @@ export class BrowserManager {
     if (!BrowserManager.configuredPartitions.has(partition)) {
       BrowserManager.configuredPartitions.add(partition)
       ses.setUserAgent(cleanChromeUserAgent(ses.getUserAgent()))
+
+      // Auto-load enabled user extensions into this persistent session
+      void this.extensionManager
+        .ensureExtensionsLoadedForSession(partition, ses)
+        .then(() => {
+          const mgr = BrowserManager.activeInstance
+          if (mgr && !mgr.mainWindow.isDestroyed()) {
+            mgr.broadcastState()
+          }
+        })
 
       // Live watch browser session cookies to auto-update "Connect your Tools" status
       // Delegate through BrowserManager.activeInstance so persistent partitions never retain closed windows
@@ -1194,28 +2202,63 @@ export class BrowserManager {
       this.broadcastState()
     })
 
+    wc.on('did-change-theme-color', (_event, color) => {
+      if (!color || isInternalDiaUrl(tab.url)) return
+      const hex = color.trim()
+      if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
+        const r = parseInt(hex.slice(1, 3), 16)
+        const g = parseInt(hex.slice(3, 5), 16)
+        const b = parseInt(hex.slice(5, 7), 16)
+        const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+        const nextTone: 'light' | 'dark' = lum >= 0.48 ? 'light' : 'dark'
+        if (!tab.pageTone) {
+          tab.pageTone = nextTone
+          tab.pageTopColor = hex.toUpperCase()
+          this.syncWindowTitleBarOverlay()
+          this.scheduleBroadcast(20)
+        }
+      }
+    })
+
     wc.on('did-finish-load', () => {
       this.syncViewOverlayConfig(tab, wc)
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(tab.id)
+      }, 120)
     })
 
     wc.on('did-stop-loading', () => {
       tab.isLoading = false
       const currentUrl = wc.getURL()
-      if (currentUrl && currentUrl !== 'about:blank' && !currentUrl.startsWith('data:text/html')) {
+      const isErrorDataPage = Boolean(currentUrl && currentUrl.startsWith('data:text/html'))
+      if (currentUrl && currentUrl !== 'about:blank' && !isErrorDataPage) {
         tab.url = currentUrl
         tab.isSensitive = isSensitiveUrl(currentUrl)
         if ((tab.isPinned || tab.isFavorite) && !tab.pinnedUrl && !isInternalDiaUrl(currentUrl)) {
           tab.pinnedUrl = currentUrl
         }
       }
-      const pageTitle = wc.getTitle()
-      if (pageTitle) tab.title = pageTitle
+      if (!isErrorDataPage) {
+        const pageTitle = wc.getTitle()
+        if (pageTitle && !isCalmErrorPageTitle(pageTitle)) {
+          tab.title = pageTitle
+        }
+      }
       tab.zoomFactor = Math.round(wc.getZoomFactor() * 100) / 100
       this.syncNavigationFlags(tab, wc)
       this.syncViewOverlayConfig(tab, wc)
-      this.store.recordHistory(tab.profileId, tab.url, tab.title, tab.favicon)
+      if (!isErrorDataPage) {
+        this.store.recordHistory(tab.profileId, tab.url, tab.title, tab.favicon)
+      }
       this.persistTabs()
       this.broadcastState()
+      if (!tab.favicon || !tab.favicon.startsWith('data:image/')) {
+        this.scheduleFaviconPreload(220)
+      }
+      void this.sampleTabRenderedAppearance(tab.id)
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(tab.id)
+      }, 420)
     })
 
     wc.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
@@ -1223,6 +2266,7 @@ export class BrowserManager {
       if (validatedURL.startsWith('data:')) return
       tab.isLoading = false
       this.broadcastState()
+      this.scheduleFaviconPreload(180)
       const errHtml = buildCalmErrorHtml(
         validatedURL,
         errorDescription || `ERR_${errorCode}`,
@@ -1271,6 +2315,8 @@ export class BrowserManager {
     })
 
     wc.on('page-title-updated', (_event, title) => {
+      const curUrl = !wc.isDestroyed() ? wc.getURL() : ''
+      if (curUrl.startsWith('data:text/html') || isCalmErrorPageTitle(title)) return
       if (title && title !== tab.title) {
         tab.title = title
         this.store.recordHistory(tab.profileId, tab.url, tab.title, tab.favicon)
@@ -1280,10 +2326,41 @@ export class BrowserManager {
     })
 
     wc.on('page-favicon-updated', (_event, favicons) => {
-      if (Array.isArray(favicons) && favicons.length > 0 && favicons[0] !== tab.favicon) {
-        tab.favicon = favicons[0]
+      const candidates = Array.isArray(favicons) ? favicons.filter(Boolean) : []
+      if (candidates.length === 0) return
+
+      const primaryUrl = candidates[0]
+      const cachedDataUrl =
+        candidates.map((u) => this.faviconDataUrlCache.get(u)).find(Boolean) ||
+        this.store.getCachedFavicon(tab.url)
+      const nextInitial = cachedDataUrl || primaryUrl
+      if (nextInitial !== tab.favicon) {
+        tab.favicon = nextInitial
         this.persistTabs()
         this.scheduleBroadcast(32)
+      }
+
+      if (!wc.isDestroyed()) {
+        const ses = wc.session
+        const tabHost = PersistenceStore.extractHostKey(tab.url)
+        void (async () => {
+          for (const iconUrl of candidates.slice(0, 4)) {
+            const dataUrl = await this.fetchAndNormalizeIconUrl(ses, iconUrl, 4500)
+            if (!dataUrl) continue
+            tab.favicon = dataUrl
+            if (tabHost) {
+              const curUrlHost = !wc.isDestroyed()
+                ? PersistenceStore.extractHostKey(wc.getURL())
+                : tabHost
+              if (!curUrlHost || !SSO_REDIRECT_HOST_RE.test(curUrlHost) || curUrlHost === tabHost) {
+                this.applyResolvedHostFavicon(tabHost, dataUrl)
+              }
+            }
+            this.persistTabs()
+            this.scheduleBroadcast(48)
+            break
+          }
+        })()
       }
     })
 
@@ -1914,7 +2991,15 @@ export class BrowserManager {
 
     this.persistTabs()
     this.syncViewsLayout()
+    this.syncWindowTitleBarOverlay()
     this.broadcastState()
+    const curActive = this.getActiveTab()
+    if (curActive && !isInternalDiaUrl(curActive.url) && !curActive.isLoading) {
+      const targetId = curActive.id
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(targetId)
+      }, 90)
+    }
   }
 
   public closeSplitView(keepSide?: SplitPaneSide): void {
@@ -1955,7 +3040,15 @@ export class BrowserManager {
 
     this.persistTabs()
     this.syncViewsLayout()
+    this.syncWindowTitleBarOverlay()
     this.broadcastState()
+    const curActive = this.getActiveTab()
+    if (curActive && !isInternalDiaUrl(curActive.url) && !curActive.isLoading) {
+      const targetId = curActive.id
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(targetId)
+      }, 90)
+    }
   }
 
   public swapSplitPanes(): void {
@@ -1972,7 +3065,15 @@ export class BrowserManager {
 
     this.persistTabs()
     this.syncViewsLayout()
+    this.syncWindowTitleBarOverlay()
     this.broadcastState()
+    const curActive = this.getActiveTab()
+    if (curActive && !isInternalDiaUrl(curActive.url) && !curActive.isLoading) {
+      const targetId = curActive.id
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(targetId)
+      }, 90)
+    }
   }
 
   public setSplitActivePane(side: SplitPaneSide): void {
@@ -2082,6 +3183,7 @@ export class BrowserManager {
           : resolved === NEW_TAB_URL
             ? tr(this.store.settings.language, 'New Tab', '新标签页')
             : resolved,
+      favicon: !isInternalDiaUrl(resolved) ? this.store.getCachedFavicon(resolved) : undefined,
       isLoading: !isInternalDiaUrl(resolved),
       canGoBack: false,
       canGoForward: false,
@@ -2142,6 +3244,9 @@ export class BrowserManager {
     this.persistTabs()
     this.syncViewsLayout()
     this.broadcastState()
+    if (!isInternalDiaUrl(resolved) && !tab.favicon) {
+      this.scheduleFaviconPreload(120)
+    }
     return id
   }
 
@@ -2181,7 +3286,15 @@ export class BrowserManager {
     }
     this.persistTabs()
     this.syncViewsLayout()
+    this.syncWindowTitleBarOverlay()
     this.broadcastState()
+    const curActive = this.getActiveTab()
+    if (curActive && !isInternalDiaUrl(curActive.url) && !curActive.isLoading) {
+      const targetId = curActive.id
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(targetId)
+      }, 90)
+    }
   }
 
   public closeTab(tabId: string, options?: { silent?: boolean }): void {
@@ -2484,8 +3597,13 @@ export class BrowserManager {
     const url = isChatTabUrl(input)
       ? input
       : resolveNavigationUrl(input, this.store.settings.searchEngine)
+    const prevHost = PersistenceStore.extractHostKey(tab.url)
+    const nextHost = PersistenceStore.extractHostKey(url)
     tab.url = url
     tab.isSensitive = isSensitiveUrl(url)
+    if (prevHost !== nextHost) {
+      tab.favicon = !isInternalDiaUrl(url) ? this.store.getCachedFavicon(url) : undefined
+    }
 
     if (isInternalDiaUrl(url)) {
       this.destroyTabView(tab.id)
@@ -2519,7 +3637,15 @@ export class BrowserManager {
 
     this.persistTabs()
     this.syncViewsLayout()
+    this.syncWindowTitleBarOverlay()
     this.broadcastState()
+    const curActive = this.getActiveTab()
+    if (curActive && !isInternalDiaUrl(curActive.url) && !curActive.isLoading) {
+      const targetId = curActive.id
+      setTimeout(() => {
+        void this.sampleTabRenderedAppearance(targetId)
+      }, 90)
+    }
   }
 
   public goBack(tabId?: string): boolean {
@@ -2627,24 +3753,52 @@ export class BrowserManager {
   public createTabGroup(
     title: string,
     color: TabGroupColor = 'indigo',
-    tabIds: string[] = []
+    tabIds: string[] = [],
+    options?: {
+      parentId?: string | null
+      profileId?: string
+      zone?: 'pinned' | 'unpinned'
+      keepEmpty?: boolean
+    }
   ): TabGroup {
     const firstTab = tabIds.length > 0 ? this.tabs.find((t) => t.id === tabIds[0]) : undefined
-    const profileId = firstTab?.profileId || this.store.activeProfileId
-    const targetIsPinned = Boolean(firstTab && !firstTab.isFavorite && firstTab.isPinned)
+    const parentGrp = options?.parentId
+      ? this.tabGroups.find((g) => g.id === options.parentId)
+      : undefined
+    const profileId =
+      options?.profileId ||
+      parentGrp?.profileId ||
+      firstTab?.profileId ||
+      this.store.activeProfileId
+    const validParent = parentGrp && parentGrp.profileId === profileId ? parentGrp : undefined
+    const targetZone: 'pinned' | 'unpinned' =
+      options?.zone ||
+      (validParent
+        ? this.resolveGroupZone(validParent)
+        : firstTab && (firstTab.isPinned || firstTab.isFavorite)
+          ? 'pinned'
+          : 'unpinned')
+    const targetIsPinned = targetZone === 'pinned'
+
+    if (validParent && validParent.collapsed) {
+      validParent.collapsed = false
+    }
+
     const group: TabGroup = {
       id: `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       profileId,
-      title: title.trim() || '新分组',
-      color,
+      parentId: validParent ? validParent.id : null,
+      zone: targetZone,
+      keepEmpty: Boolean(options?.keepEmpty && tabIds.length === 0),
+      title: title.trim() || '新文件夹',
+      color: validParent ? validParent.color : color,
       collapsed: false
     }
     this.tabGroups.push(group)
     for (const tid of tabIds) {
-      const tab = this.tabs.find(
-        (t) => t.id === tid && t.profileId === profileId && !t.isFavorite
-      )
+      const tab = this.tabs.find((t) => t.id === tid && t.profileId === profileId)
       if (tab) {
+        tab.groupId = group.id
         this.applyPinModeToTab(tab, targetIsPinned ? 'pinned' : 'unpinned')
         tab.groupId = group.id
       }
@@ -2657,7 +3811,7 @@ export class BrowserManager {
 
   public updateTabGroup(
     groupId: string,
-    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed'>>
+    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed' | 'parentId'>>
   ): TabGroup | null {
     const grp = this.tabGroups.find((g) => g.id === groupId)
     if (!grp) return null
@@ -2670,6 +3824,41 @@ export class BrowserManager {
     if (typeof partial.collapsed === 'boolean') {
       grp.collapsed = partial.collapsed
     }
+    if (partial.parentId !== undefined) {
+      if (partial.parentId === null) {
+        grp.parentId = null
+      } else if (partial.parentId !== grp.id) {
+        const candidateParent = this.tabGroups.find(
+          (g) => g.id === partial.parentId && g.profileId === grp.profileId
+        )
+        if (
+          candidateParent &&
+          this.resolveGroupZone(candidateParent) === this.resolveGroupZone(grp)
+        ) {
+          // Ensure candidateParent is not a descendant of grp
+          const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+          let cur: TabGroup | undefined = candidateParent
+          let isDescendant = false
+          const seen = new Set<string>()
+          while (cur && !seen.has(cur.id)) {
+            seen.add(cur.id)
+            if (cur.id === grp.id) {
+              isDescendant = true
+              break
+            }
+            cur = cur.parentId ? byId.get(cur.parentId) : undefined
+          }
+          if (!isDescendant) {
+            grp.parentId = candidateParent.id
+            if (candidateParent.collapsed) {
+              candidateParent.collapsed = false
+            }
+          }
+        }
+      }
+    }
+    this.sanitizeTabGroupHierarchy()
+    this.sortProfileTabsByTier(grp.profileId)
     this.persistTabs()
     this.broadcastState()
     return { ...grp }
@@ -2712,12 +3901,16 @@ export class BrowserManager {
 
     const grp = this.tabGroups.find((g) => g.id === groupId && g.profileId === tab.profileId)
     if (!grp) return
+    if (grp.keepEmpty) {
+      grp.keepEmpty = false
+    }
 
     const siblings = this.tabs.filter(
       (t) => t.profileId === tab.profileId && t.groupId === groupId && t.id !== tab.id
     )
     if (siblings.length > 0) {
       const targetZone: TabPinMode = siblings[0].isPinned ? 'pinned' : 'unpinned'
+      tab.groupId = groupId
       this.applyPinModeToTab(tab, targetZone)
       tab.groupId = groupId
       const curIdx = this.tabs.findIndex((t) => t.id === tab.id)
@@ -2732,9 +3925,9 @@ export class BrowserManager {
         }
       }
     } else {
-      if (tab.isFavorite) {
-        this.applyPinModeToTab(tab, 'pinned')
-      }
+      const targetZone = this.resolveGroupZone(grp)
+      tab.groupId = groupId
+      this.applyPinModeToTab(tab, targetZone)
       tab.groupId = groupId
     }
 
@@ -2752,10 +3945,19 @@ export class BrowserManager {
   }
 
   public deleteTabGroup(groupId: string): void {
+    const grp = this.tabGroups.find((g) => g.id === groupId)
+    const fallbackParentId = grp?.parentId ?? null
+    for (const childGrp of this.tabGroups) {
+      if (childGrp.parentId === groupId) {
+        childGrp.parentId = fallbackParentId
+      }
+    }
     for (const t of this.tabs) {
-      if (t.groupId === groupId) t.groupId = null
+      if (t.groupId === groupId) t.groupId = fallbackParentId
     }
     this.tabGroups = this.tabGroups.filter((g) => g.id !== groupId)
+    this.sanitizeTabGroupHierarchy()
+    this.sortProfileTabsByTier(grp?.profileId)
     this.persistTabs()
     this.broadcastState()
   }
@@ -2789,8 +3991,23 @@ export class BrowserManager {
       return { ok: false, groupCount: 0, error: res.error || '未能生成有效的分组建议' }
     }
 
-    // Replace active profile's groups with freshly organized groups and cluster tabs neatly
-    this.tabGroups = this.tabGroups.filter((g) => g.profileId !== profileId)
+    // Replace active profile's unpinned groups with freshly organized groups (keep Pinned folders intact!)
+    const pinnedGroupIds = new Set<string>()
+    const byId = new Map(this.tabGroups.map((g) => [g.id, g]))
+    for (const t of this.tabs) {
+      if (t.profileId === profileId && t.isPinned && !t.isFavorite && t.groupId) {
+        let cur: string | null = t.groupId
+        const seen = new Set<string>()
+        while (cur && !seen.has(cur)) {
+          seen.add(cur)
+          pinnedGroupIds.add(cur)
+          cur = byId.get(cur)?.parentId ?? null
+        }
+      }
+    }
+    this.tabGroups = this.tabGroups.filter(
+      (g) => g.profileId !== profileId || pinnedGroupIds.has(g.id) || g.zone === 'pinned'
+    )
     for (const t of candidateTabs) {
       t.groupId = null
     }
@@ -2801,6 +4018,8 @@ export class BrowserManager {
       this.tabGroups.push({
         id: grpId,
         profileId,
+        parentId: null,
+        zone: 'unpinned',
         title: g.title,
         color: g.color,
         collapsed: false
@@ -2855,6 +4074,7 @@ export class BrowserManager {
     this.persistTabs()
     this.syncViewsLayout()
     this.broadcastState()
+    this.scheduleFaviconPreload(120)
     void this.refreshConnectedTools(profile.id, true)
   }
 
@@ -3110,6 +4330,79 @@ export class BrowserManager {
     return next
   }
 
+  private async sampleTabRenderedAppearance(tabId: string): Promise<void> {
+    const tab = this.tabs.find((t) => t.id === tabId)
+    if (!tab || isInternalDiaUrl(tab.url)) return
+    const view = this.views.get(tabId)
+    const layout = this.appliedViewLayout.get(tabId)
+    if (!view || view.webContents.isDestroyed() || !layout?.visible) return
+    if (layout.width < 60 || layout.height < 60) return
+
+    try {
+      const image = await view.webContents.capturePage()
+      if (image.isEmpty()) return
+      const gridW = 24
+      const gridH = 24
+      const small = image.resize({ width: gridW, height: gridH, quality: 'good' })
+      const sz = small.getSize()
+      const buf = small.toBitmap()
+      if (sz.width < 4 || sz.height < 4 || buf.length < sz.width * sz.height * 4) return
+
+      let lightPixels = 0
+      let totalPixels = 0
+      let topR = 0
+      let topG = 0
+      let topB = 0
+      let topCount = 0
+
+      for (let y = 0; y < sz.height; y++) {
+        for (let x = 0; x < sz.width; x++) {
+          const idx = (y * sz.width + x) * 4
+          // Chromium Skia kN32_SkColorType on little-endian desktop platforms is BGRA
+          const b = buf[idx]
+          const g = buf[idx + 1]
+          const r = buf[idx + 2]
+          const a = buf[idx + 3]
+          if (a < 16) continue
+          const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+          totalPixels++
+          if (lum >= 0.48) {
+            lightPixels++
+          }
+          if (y === 0) {
+            topR += r
+            topG += g
+            topB += b
+            topCount++
+          }
+        }
+      }
+
+      if (totalPixels < 8) return
+      const nextTone: 'light' | 'dark' = lightPixels >= totalPixels * 0.5 ? 'light' : 'dark'
+      let nextTopHex = tab.pageTopColor || null
+      if (topCount > 0) {
+        const toHex = (n: number): string =>
+          Math.max(0, Math.min(255, Math.round(n)))
+            .toString(16)
+            .padStart(2, '0')
+        nextTopHex = `#${toHex(topR / topCount)}${toHex(topG / topCount)}${toHex(
+          topB / topCount
+        )}`.toUpperCase()
+      }
+
+      if (tab.pageTone !== nextTone || tab.pageTopColor !== nextTopHex) {
+        tab.pageTone = nextTone
+        tab.pageTopColor = nextTopHex
+        this.persistTabs()
+        this.syncWindowTitleBarOverlay()
+        this.scheduleBroadcast(20)
+      }
+    } catch {
+      // ignore transient capture errors
+    }
+  }
+
   public syncWindowTitleBarOverlay(): void {
     const desiredSource = this.store.settings.theme || 'system'
     if (nativeTheme.themeSource !== desiredSource) {
@@ -3117,12 +4410,17 @@ export class BrowserManager {
     }
     if (process.platform === 'darwin' || this.mainWindow.isDestroyed()) return
     if (typeof this.mainWindow.setTitleBarOverlay === 'function') {
-      const dark = this.isEffectiveDark()
+      const active = this.getActiveTab()
+      const isVert = this.store.settings.layoutMode === 'vertical'
+      const barDark =
+        isVert && active && !isInternalDiaUrl(active.url) && active.pageTone
+          ? active.pageTone === 'dark'
+          : this.isEffectiveDark()
       try {
         this.mainWindow.setTitleBarOverlay({
-          color: dark ? '#19191B' : '#F4F4F5',
-          symbolColor: dark ? '#E4E4E7' : '#27272A',
-          height: 42
+          color: barDark ? (isVert ? '#111113' : '#19191B') : isVert ? '#FFFFFF' : '#F4F4F5',
+          symbolColor: barDark ? '#E4E4E7' : '#27272A',
+          height: 38
         })
       } catch {
         // ignore if unsupported on older WM
@@ -3162,7 +4460,7 @@ export class BrowserManager {
   // ==================== First-Launch Onboarding & Browser Data Import ====================
 
   public detectImportBrowsers(): DetectedBrowserSource[] {
-    return detectAllBrowsers()
+    return detectAllBrowsers(this.store.settings.language)
   }
 
   public async pickCustomBrowserImportPath(
@@ -3184,17 +4482,165 @@ export class BrowserManager {
       properties:
         process.platform === 'darwin'
           ? ['openDirectory', 'openFile', 'showHiddenFiles']
-          : ['openDirectory'],
+          : ['openDirectory', 'showHiddenFiles'],
       filters: [
         {
           name: 'Browser Data / Bookmarks',
-          extensions: ['json', 'html', 'htm']
-        }
+          extensions: ['json', 'html', 'htm', 'ini', 'sqlite', 'plist', 'db']
+        },
+        { name: 'All Files', extensions: ['*'] }
       ]
     })
 
     if (canceled || !filePaths || filePaths.length === 0) return null
-    return inspectBrowserAtPath(browserId, filePaths[0], true)
+    return inspectBrowserAtPath(browserId, filePaths[0], true, lang)
+  }
+
+  private emitImportProgress(
+    stage: ImportProgressStage,
+    percent: number,
+    detail: string,
+    detailZh: string
+  ): void {
+    if (this.mainWindow.isDestroyed()) return
+    const payload: BrowserImportProgressPayload = {
+      stage,
+      percent: Math.max(0, Math.min(100, Math.round(percent))),
+      detail,
+      detailZh
+    }
+    try {
+      this.mainWindow.webContents.send('arko:import-progress', payload)
+    } catch {
+      // ignore
+    }
+  }
+
+  private getActiveConfiguredSessions(): Array<[string, Electron.Session]> {
+    const partitions = new Set<string>()
+    for (const p of this.store.profiles) {
+      if (p.partition) partitions.add(p.partition)
+    }
+    return [...partitions].map((part) => [part, this.ensureSessionConfigured(part)])
+  }
+
+  // ==================== Browser Extensions Public Operations ====================
+
+  public getExtensions(): InstalledExtensionItem[] {
+    const activeProf =
+      this.store.profiles.find((p) => p.id === this.store.activeProfileId) ||
+      this.store.profiles[0]
+    const part = activeProf?.partition || 'persist:arko-profile-work'
+    return this.extensionManager.getExtensionsSnapshotForPartition(part)
+  }
+
+  public async installUnpackedExtension(): Promise<{
+    ok: boolean
+    extension?: InstalledExtensionItem
+    error?: string
+  }> {
+    const res = await this.extensionManager.pickAndInstallUnpackedExtension(
+      this.mainWindow,
+      this.getActiveConfiguredSessions(),
+      this.store.settings.language
+    )
+    if (res.ok) {
+      this.broadcastState()
+    }
+    return res
+  }
+
+  public async installWebStoreExtension(urlOrId: string): Promise<{
+    ok: boolean
+    extension?: InstalledExtensionItem
+    error?: string
+  }> {
+    const res = await this.extensionManager.installFromChromeWebStore(
+      urlOrId,
+      this.getActiveConfiguredSessions(),
+      this.store.settings.language
+    )
+    if (res.ok) {
+      this.broadcastState()
+    }
+    return res
+  }
+
+  public async toggleExtension(
+    extensionId: string,
+    enabled: boolean
+  ): Promise<InstalledExtensionItem[]> {
+    await this.extensionManager.toggleExtension(
+      extensionId,
+      enabled,
+      this.getActiveConfiguredSessions()
+    )
+    this.broadcastState()
+    return this.getExtensions()
+  }
+
+  public async removeExtension(extensionId: string): Promise<InstalledExtensionItem[]> {
+    await this.extensionManager.removeExtension(extensionId, this.getActiveConfiguredSessions())
+    this.broadcastState()
+    return this.getExtensions()
+  }
+
+  public async openExtensionPopup(
+    extensionId: string,
+    anchor?: { x: number; y: number }
+  ): Promise<{ ok: boolean; openedTab?: boolean; error?: string }> {
+    const activeProf =
+      this.store.profiles.find((p) => p.id === this.store.activeProfileId) ||
+      this.store.profiles[0]
+    if (!activeProf) {
+      return { ok: false, error: 'No active profile' }
+    }
+    const ses = this.ensureSessionConfigured(activeProf.partition)
+    await this.extensionManager.ensureExtensionsLoadedForSession(activeProf.partition, ses)
+    const item = this.store.extensions.find((e) => e.id === extensionId)
+    if (!item) {
+      return { ok: false, error: 'Extension not found' }
+    }
+
+    return this.extensionManager.openPopupWindow({
+      parentWindow: this.mainWindow,
+      partition: activeProf.partition,
+      ses,
+      item,
+      anchor,
+      onOpenUrlInTab: (url) => {
+        void this.createTab(url, { background: false })
+      }
+    })
+  }
+
+  public async openExtensionOptions(extensionId: string): Promise<boolean> {
+    const activeProf =
+      this.store.profiles.find((p) => p.id === this.store.activeProfileId) ||
+      this.store.profiles[0]
+    if (!activeProf) return false
+    const ses = this.ensureSessionConfigured(activeProf.partition)
+    await this.extensionManager.ensureExtensionsLoadedForSession(activeProf.partition, ses)
+    const item = this.store.extensions.find((e) => e.id === extensionId)
+    if (!item) return false
+    const runtimeId = this.extensionManager.resolveRuntimeExtensionId(activeProf.partition, item)
+    if (runtimeId && item.optionsPath) {
+      await this.createTab(`chrome-extension://${runtimeId}/${item.optionsPath}`, {
+        background: false
+      })
+      return true
+    }
+    if (runtimeId && item.popupPath) {
+      await this.createTab(`chrome-extension://${runtimeId}/${item.popupPath}`, {
+        background: false
+      })
+      return true
+    }
+    if (item.homepageUrl) {
+      await this.createTab(item.homepageUrl, { background: false })
+      return true
+    }
+    return false
   }
 
   public completeOnboarding(): AppSettings {
@@ -3280,8 +4726,15 @@ export class BrowserManager {
     return this.getSnapshot()
   }
 
-  public executeBrowserImport(request: BrowserImportRequest): BrowserImportResult {
-    const parsed = parseBrowserDataForImport(request)
+  public async executeBrowserImport(request: BrowserImportRequest): Promise<BrowserImportResult> {
+    this.emitImportProgress(
+      'parsing',
+      12,
+      `Scanning ${request.browserId.toUpperCase()} Spaces, Profiles, and Sidebar tree…`,
+      `正在深度解析原浏览器空间结构、Profile 拓扑与侧边栏目录…`
+    )
+
+    const parsed = parseBrowserDataForImport(request, this.store.settings.language)
     if (!parsed.ok) {
       return {
         ok: false,
@@ -3289,7 +4742,11 @@ export class BrowserManager {
         spacesCreated: 0,
         favoritesImported: 0,
         pinnedTabsImported: 0,
+        openTabsImported: 0,
         tabGroupsCreated: 0,
+        cookiesImported: 0,
+        storageProfilesMigrated: 0,
+        extensionsImported: 0,
         bookmarksImported: 0,
         historyImported: 0,
         warnings: parsed.warnings,
@@ -3297,27 +4754,123 @@ export class BrowserManager {
       }
     }
 
+    const warnings = [...parsed.warnings]
     const groupColors: TabGroupColor[] = ['indigo', 'emerald', 'amber', 'rose', 'sky', 'violet']
     let groupColorCursor = this.tabGroups.length
     let spacesCreated = 0
     let favoritesImported = 0
     let pinnedTabsImported = 0
+    let openTabsImported = 0
     let tabGroupsCreated = 0
+    let cookiesImported = 0
+    let storageProfilesMigrated = 0
+    let extensionsImported = 0
     let bookmarksImported = 0
     let historyImported = 0
-    let firstTargetProfileId: string | null = null
     const importedProfileOrder: string[] = []
-    // Preserve Arc's M-Spaces-to-N-Profiles cookie/session sharing:
-    // Spaces bound to the same source Chromium Profile share one Electron session partition.
+
+    const wantOpenTabs = request.scopes.openTabs !== false
+    const wantSessions = Boolean(request.scopes.sessions)
+    const wantExtensions = Boolean(request.scopes.extensions)
+    const shouldReplaceStarterSpaces = request.replaceStarterSpaces !== false
+
+    // Preserve Arc's M-Spaces-to-N-Profiles cookie/session/extension sharing:
+    // Spaces bound to the same source Chromium Profile share one deterministic Electron session partition.
     const partitionBySourceProfile = new Map<string, string>()
 
+    // Pre-assign clean partitions for each source Chromium Profile BEFORE touching `session.fromPartition`
+    // so LocalStorage / IndexedDB / Extension Settings can be copied onto disk lock-free!
+    if (request.createSpacesFromProfiles) {
+      for (const res of parsed.profileResources) {
+        const sourceProfileKey = `${request.browserId}:${res.profileDir}`
+        const safeSlug =
+          res.profileDir
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'default'
+        let chosenPartition = `persist:arko-${request.browserId}-${safeSlug}`
+
+        // Check if any existing profile already uses this sourceProfileKey
+        const existingBound = this.store.profiles.find(
+          (p) => p.sourceProfileKey === sourceProfileKey
+        )
+        if (existingBound) {
+          chosenPartition = existingBound.partition
+        }
+
+        // If user explicitly requested session/storage migration and this partition was already opened in memory,
+        // rotate to a fresh partition generation after closing views so LevelDB loads the newly copied storage immediately!
+        if (wantSessions && BrowserManager.configuredPartitions.has(chosenPartition)) {
+          for (const t of this.tabs) {
+            const prof = this.store.profiles.find((p) => p.id === t.profileId)
+            if (prof?.partition === chosenPartition) {
+              this.destroyTabView(t.id)
+            }
+          }
+          chosenPartition = `persist:arko-${request.browserId}-${safeSlug}-${Date.now().toString(36)}`
+        }
+
+        partitionBySourceProfile.set(sourceProfileKey, chosenPartition)
+      }
+    } else if (parsed.profileResources.length > 0) {
+      // Merging into active profile
+      const activeProf =
+        this.store.profiles.find((p) => p.id === this.store.activeProfileId) ||
+        this.store.profiles[0]
+      if (activeProf) {
+        for (const res of parsed.profileResources) {
+          partitionBySourceProfile.set(`${request.browserId}:${res.profileDir}`, activeProf.partition)
+        }
+      }
+    }
+
+    this.emitImportProgress(
+      'spaces',
+      28,
+      `Aligning ${parsed.spaces.length} Spaces in exact sidebar order…`,
+      `正在按原浏览器顺序对齐 ${parsed.spaces.length} 个空间与独立配置环境…`
+    )
+
     const isFreshOnboarding = !this.store.settings.onboardingCompleted
-    const hadNoPriorWebTabs = this.tabs.every((t) => isInternalDiaUrl(t.url))
     const totalIncomingBookmarks = parsed.spaces.reduce((s, sp) => s + sp.bookmarks.length, 0)
-    if (isFreshOnboarding && request.scopes.bookmarks && totalIncomingBookmarks > 0) {
+    if (request.scopes.bookmarks && totalIncomingBookmarks > 0) {
       const demoIds = new Set(['bm-arko-github', 'bm-github', 'bm-hn'])
-      if (this.store.bookmarks.every((b) => demoIds.has(b.id))) {
+      if (this.store.bookmarks.length > 0 && this.store.bookmarks.every((b) => demoIds.has(b.id))) {
         this.store.bookmarks = []
+      }
+    }
+
+    // Phase A: Copy disk-level Site Storage (Local Storage, IndexedDB, Extension Settings) BEFORE opening sessions
+    if (wantSessions || wantExtensions) {
+      this.emitImportProgress(
+        'sessions',
+        42,
+        `Migrating Profile LocalStorage, IndexedDB & Extension data…`,
+        `正在迁移 Profile 本地站点存储 (LocalStorage / IndexedDB) 与插件数据…`
+      )
+      const copiedPartitions = new Set<string>()
+      for (const res of parsed.profileResources) {
+        const sourceKey = `${request.browserId}:${res.profileDir}`
+        const targetPartition = partitionBySourceProfile.get(sourceKey)
+        if (!targetPartition || copiedPartitions.has(targetPartition)) continue
+        copiedPartitions.add(targetPartition)
+
+        // Only write LevelDB files directly if Electron hasn't locked the partition yet
+        if (!BrowserManager.configuredPartitions.has(targetPartition)) {
+          if (wantSessions) {
+            const copied = copyChromiumSiteStorageToPartition(
+              res.profileDirPath,
+              targetPartition,
+              wantExtensions
+            )
+            if (copied.filesCopied > 0) {
+              storageProfilesMigrated++
+            }
+          } else if (wantExtensions) {
+            // Only copy extension storage settings
+            copyChromiumSiteStorageToPartition(res.profileDirPath, targetPartition, true)
+          }
+        }
       }
     }
 
@@ -3326,54 +4879,39 @@ export class BrowserManager {
       historyMap.set(`${h.profileId}::${h.url}`, h)
     }
 
+    const usedProfileIds = new Set<string>()
+
+    // Phase B: Create / Update Spaces in exact parsed order & import Tabs / Folders / Bookmarks / History
     parsed.spaces.forEach((spacePayload, spaceIdx) => {
       let targetProfileId = this.store.activeProfileId
       const sourceProfileKey = spacePayload.profileDir
         ? `${request.browserId}:${spacePayload.profileDir}`
-        : null
+        : undefined
+      const profileLabel = spacePayload.profileName || spacePayload.profileDir
 
       if (request.createSpacesFromProfiles) {
         const normalizedIncoming = spacePayload.name.trim().toLowerCase()
+        // Match existing space that wasn't already claimed by an earlier space in this import
         const matchedExisting = this.store.profiles.find(
-          (p) => p.name.trim().toLowerCase() === normalizedIncoming
+          (p) =>
+            !usedProfileIds.has(p.id) &&
+            p.name.trim().toLowerCase() === normalizedIncoming &&
+            (!p.sourceProfileKey || !sourceProfileKey || p.sourceProfileKey === sourceProfileKey)
         )
+
         if (matchedExisting) {
           targetProfileId = matchedExisting.id
-          if (request.browserId === 'arc') {
-            if (spacePayload.emoji) matchedExisting.emoji = spacePayload.emoji
-            if (spacePayload.accentColor) matchedExisting.accentColor = spacePayload.accentColor
-          }
+          usedProfileIds.add(targetProfileId)
+          if (spacePayload.emoji) matchedExisting.emoji = spacePayload.emoji
+          if (spacePayload.accentColor) matchedExisting.accentColor = spacePayload.accentColor
+          if (profileLabel) matchedExisting.profileLabel = profileLabel
           if (sourceProfileKey) {
+            matchedExisting.sourceProfileKey = sourceProfileKey
             const sharedPartition = partitionBySourceProfile.get(sourceProfileKey)
             if (sharedPartition) {
               matchedExisting.partition = sharedPartition
             } else {
               partitionBySourceProfile.set(sourceProfileKey, matchedExisting.partition)
-            }
-          }
-          if (!this.tabs.some((t) => t.profileId === targetProfileId)) {
-            const initTabId = `tab-${targetProfileId}-${Date.now()}-${spaceIdx}`
-            this.tabs.push({
-              id: initTabId,
-              profileId: targetProfileId,
-              url: NEW_TAB_URL,
-              title: tr(this.store.settings.language, 'New Tab', '新标签页'),
-              isLoading: false,
-              canGoBack: false,
-              canGoForward: false,
-              isPinned: false,
-              isFavorite: false,
-              pinnedUrl: null,
-              isAudioPlaying: false,
-              isMuted: false,
-              isSensitive: false,
-              lastAccessedAt: Date.now(),
-              groupId: null,
-              zoomFactor: 1
-            })
-            this.activeTabByProfile[targetProfileId] = initTabId
-            if (!this.splitByProfile[targetProfileId]) {
-              this.splitByProfile[targetProfileId] = createDefaultSplitState()
             }
           }
         } else {
@@ -3392,32 +4930,14 @@ export class BrowserManager {
             name: spacePayload.name.trim() || `Space ${spaceIdx + 1}`,
             emoji: spacePayload.emoji || '✨',
             accentColor: spacePayload.accentColor || '#4F46E5',
-            partition
+            partition,
+            profileLabel,
+            sourceProfileKey
           }
           this.store.profiles.push(createdProfile)
           targetProfileId = slug
+          usedProfileIds.add(slug)
           spacesCreated++
-
-          const initTabId = `tab-${slug}-${Date.now()}-${spaceIdx}`
-          this.tabs.push({
-            id: initTabId,
-            profileId: slug,
-            url: NEW_TAB_URL,
-            title: tr(this.store.settings.language, 'New Tab', '新标签页'),
-            isLoading: false,
-            canGoBack: false,
-            canGoForward: false,
-            isPinned: false,
-            isFavorite: false,
-            pinnedUrl: null,
-            isAudioPlaying: false,
-            isMuted: false,
-            isSensitive: false,
-            lastAccessedAt: Date.now(),
-            groupId: null,
-            zoomFactor: 1
-          })
-          this.activeTabByProfile[slug] = initTabId
           this.splitByProfile[slug] = createDefaultSplitState()
         }
       }
@@ -3426,24 +4946,18 @@ export class BrowserManager {
         importedProfileOrder.push(targetProfileId)
       }
 
-      if (!firstTargetProfileId) {
-        firstTargetProfileId = targetProfileId
-      }
-
-      // 1. Merge Favorites & Pinned Tabs + Folder TabGroups (lazy WebContentsView: 0 RAM until clicked)
+      // 1. Merge Favorites & Pinned Tabs + Nested Folder TabGroups (lazy WebContentsView: 0 RAM until clicked)
       if (request.scopes.spacesAndPinned) {
         const existingProfileTabs = this.tabs.filter((t) => t.profileId === targetProfileId)
-        const existingPinnedUrls = new Set(
-          existingProfileTabs
-            .filter((t) => t.isPinned || t.isFavorite)
-            .map((t) => t.pinnedUrl || t.url)
+        const existingFavUrls = new Set(
+          existingProfileTabs.filter((t) => t.isFavorite).map((t) => t.pinnedUrl || t.url)
         )
-        let currentFavCount = existingProfileTabs.filter((t) => t.isFavorite).length
+        let currentFavCount = existingFavUrls.size
 
         for (const fav of spacePayload.favorites) {
           if (currentFavCount >= 12) break
-          if (existingPinnedUrls.has(fav.url)) continue
-          existingPinnedUrls.add(fav.url)
+          if (existingFavUrls.has(fav.url)) continue
+          existingFavUrls.add(fav.url)
           currentFavCount++
           favoritesImported++
           this.tabs.push({
@@ -3467,45 +4981,107 @@ export class BrowserManager {
           })
         }
 
-        // Count items per folder so large imported folders start neatly collapsed
-        const folderSizes = new Map<string, number>()
+        const extractFolderSegments = (item: {
+          folderPath?: string[] | null
+          folderTitle?: string | null
+        }): string[] => {
+          if (Array.isArray(item.folderPath) && item.folderPath.length > 0) {
+            return item.folderPath.map((s) => s.trim()).filter(Boolean)
+          }
+          if (item.folderTitle && item.folderTitle.trim()) {
+            return item.folderTitle
+              .split(' / ')
+              .map((s) => s.trim())
+              .filter(Boolean)
+          }
+          return []
+        }
+
+        // Count direct items per folder path so large leaf folders (>6 items) start neatly collapsed,
+        // while parent folders that hold subfolders start expanded so hierarchy is visible immediately
+        const directFolderSizes = new Map<string, number>()
+        const parentPathSet = new Set<string>()
         for (const pt of spacePayload.pinnedTabs) {
-          if (pt.folderTitle) {
-            folderSizes.set(pt.folderTitle, (folderSizes.get(pt.folderTitle) || 0) + 1)
+          const segs = extractFolderSegments(pt)
+          if (segs.length > 0) {
+            const normKey = segs.map((s) => s.toLowerCase()).join(' / ')
+            directFolderSizes.set(normKey, (directFolderSizes.get(normKey) || 0) + 1)
+            for (let d = 1; d < segs.length; d++) {
+              parentPathSet.add(
+                segs
+                  .slice(0, d)
+                  .map((s) => s.toLowerCase())
+                  .join(' / ')
+              )
+            }
           }
         }
 
-        const groupByTitle = new Map<string, TabGroup>()
-        for (const g of this.tabGroups) {
-          if (g.profileId === targetProfileId) {
-            groupByTitle.set(g.title.trim().toLowerCase(), g)
+        const ensureFolderHierarchy = (
+          zone: 'pinned' | 'unpinned',
+          segments: string[],
+          collapseLeaf: boolean
+        ): TabGroup => {
+          let parentGrp: TabGroup | null = null
+          for (let d = 0; d < segments.length; d++) {
+            const segTitle = segments[d]
+            const parentId: string | null = parentGrp ? parentGrp.id : null
+            let existing: TabGroup | undefined = this.tabGroups.find(
+              (g) =>
+                g.profileId === targetProfileId &&
+                (g.parentId || null) === parentId &&
+                (g.zone || 'pinned') === zone &&
+                g.title.trim().toLowerCase() === segTitle.toLowerCase()
+            )
+            const isLeaf = d === segments.length - 1
+            if (!existing) {
+              existing = {
+                id: `grp-imp-${zone === 'unpinned' ? 'open-' : ''}${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+                profileId: targetProfileId,
+                parentId,
+                zone,
+                title: segTitle,
+                color: parentGrp
+                  ? parentGrp.color
+                  : groupColors[groupColorCursor++ % groupColors.length],
+                collapsed: isLeaf ? collapseLeaf : false
+              }
+              this.tabGroups.push(existing)
+              tabGroupsCreated++
+            } else if (!isLeaf && existing.collapsed) {
+              existing.collapsed = false
+            }
+            parentGrp = existing
           }
+          return parentGrp!
         }
+
+        // Deduplicate within the same full folder path (`normPath::url`) so links in different folders are never lost
+        const existingPinnedKeys = new Set(
+          existingProfileTabs
+            .filter((t) => t.isPinned && !t.isFavorite)
+            .map((t) => {
+              const gPath = t.groupId ? this.getGroupFullPathTitle(t.groupId).toLowerCase() : ''
+              return `${gPath}::${t.pinnedUrl || t.url}`
+            })
+        )
 
         let addedPinnedInSpace = 0
         for (const pt of spacePayload.pinnedTabs) {
-          if (addedPinnedInSpace >= 500) break
-          if (existingPinnedUrls.has(pt.url)) continue
-          existingPinnedUrls.add(pt.url)
+          if (addedPinnedInSpace >= 800) break
+          const segs = extractFolderSegments(pt)
+          const normFolder = segs.map((s) => s.toLowerCase()).join(' / ')
+          const dedupKey = `${normFolder}::${pt.url}`
+          if (existingPinnedKeys.has(dedupKey)) continue
+          existingPinnedKeys.add(dedupKey)
           addedPinnedInSpace++
           pinnedTabsImported++
 
           let groupId: string | null = null
-          if (pt.folderTitle && pt.folderTitle.trim()) {
-            const normFolder = pt.folderTitle.trim().toLowerCase()
-            let grp = groupByTitle.get(normFolder)
-            if (!grp) {
-              grp = {
-                id: `grp-imp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-                profileId: targetProfileId,
-                title: pt.folderTitle.trim(),
-                color: groupColors[groupColorCursor++ % groupColors.length],
-                collapsed: (folderSizes.get(pt.folderTitle) || 0) > 5
-              }
-              this.tabGroups.push(grp)
-              groupByTitle.set(normFolder, grp)
-              tabGroupsCreated++
-            }
+          if (segs.length > 0) {
+            const hasSubfolders = parentPathSet.has(normFolder)
+            const collapseLeaf = !hasSubfolders && (directFolderSizes.get(normFolder) || 0) > 6
+            const grp = ensureFolderHierarchy('pinned', segs, collapseLeaf)
             groupId = grp.id
           }
 
@@ -3519,7 +5095,7 @@ export class BrowserManager {
             canGoBack: false,
             canGoForward: false,
             isPinned: true,
-            isFavorite: false,
+            isFavorite: !groupId,
             pinnedUrl: pt.url,
             isAudioPlaying: false,
             isMuted: false,
@@ -3529,6 +5105,155 @@ export class BrowserManager {
             zoomFactor: 1
           })
         }
+      }
+
+      // 1b. Merge Today / Unpinned Open Tabs (also hibernated with 0 RAM until clicked)
+      if (wantOpenTabs && spacePayload.openTabs.length > 0) {
+        const existingUnpinnedUrls = new Set(
+          this.tabs
+            .filter((t) => t.profileId === targetProfileId && !t.isPinned && !t.isFavorite)
+            .map((t) => t.url)
+        )
+
+        let addedOpenInSpace = 0
+        for (const ot of spacePayload.openTabs) {
+          if (addedOpenInSpace >= 200) break
+          if (existingUnpinnedUrls.has(ot.url)) continue
+          existingUnpinnedUrls.add(ot.url)
+          addedOpenInSpace++
+          openTabsImported++
+
+          let groupId: string | null = null
+          const segs =
+            Array.isArray(ot.folderPath) && ot.folderPath.length > 0
+              ? ot.folderPath.map((s) => s.trim()).filter(Boolean)
+              : ot.folderTitle?.trim()
+                ? ot.folderTitle
+                    .split(' / ')
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                : []
+          if (segs.length > 0) {
+            let parentGrp: TabGroup | null = null
+            for (let d = 0; d < segs.length; d++) {
+              const segTitle = segs[d]
+              const parentId: string | null = parentGrp ? parentGrp.id : null
+              let existing: TabGroup | undefined = this.tabGroups.find(
+                (g) =>
+                  g.profileId === targetProfileId &&
+                  (g.parentId || null) === parentId &&
+                  g.zone === 'unpinned' &&
+                  g.title.trim().toLowerCase() === segTitle.toLowerCase()
+              )
+              if (!existing) {
+                existing = {
+                  id: `grp-imp-open-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+                  profileId: targetProfileId,
+                  parentId,
+                  zone: 'unpinned',
+                  title: segTitle,
+                  color: parentGrp
+                    ? parentGrp.color
+                    : groupColors[groupColorCursor++ % groupColors.length],
+                  collapsed: false
+                }
+                this.tabGroups.push(existing)
+                tabGroupsCreated++
+              }
+              parentGrp = existing
+            }
+            groupId = parentGrp!.id
+          }
+
+          this.tabs.push({
+            id: `tab-imp-open-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+            profileId: targetProfileId,
+            url: ot.url,
+            title: ot.title || ot.url,
+            favicon: ot.favicon,
+            isLoading: false,
+            canGoBack: false,
+            canGoForward: false,
+            isPinned: false,
+            isFavorite: false,
+            pinnedUrl: null,
+            isAudioPlaying: false,
+            isMuted: false,
+            isSensitive: isSensitiveUrl(ot.url),
+            lastAccessedAt: Date.now() - 1000 - openTabsImported,
+            groupId,
+            zoomFactor: 1
+          })
+        }
+      }
+
+      // Ensure each target Space has a valid active tab and prune redundant blank New Tab placeholders
+      let spaceTabs = this.tabs.filter((t) => t.profileId === targetProfileId)
+      const hasWebTabs = spaceTabs.some(
+        (t) => t.url !== NEW_TAB_URL || t.isPinned || t.isFavorite
+      )
+      if (hasWebTabs) {
+        this.tabs = this.tabs.filter(
+          (t) => t.profileId !== targetProfileId || t.url !== NEW_TAB_URL || t.isPinned || t.isFavorite
+        )
+        spaceTabs = this.tabs.filter((t) => t.profileId === targetProfileId)
+      }
+      if (spaceTabs.length === 0) {
+        const initTabId = `tab-${targetProfileId}-${Date.now()}-${spaceIdx}`
+        this.tabs.push({
+          id: initTabId,
+          profileId: targetProfileId,
+          url: NEW_TAB_URL,
+          title: tr(this.store.settings.language, 'New Tab', '新标签页'),
+          isLoading: false,
+          canGoBack: false,
+          canGoForward: false,
+          isPinned: false,
+          isFavorite: false,
+          pinnedUrl: null,
+          isAudioPlaying: false,
+          isMuted: false,
+          isSensitive: false,
+          lastAccessedAt: Date.now(),
+          groupId: null,
+          zoomFactor: 1
+        })
+        this.activeTabByProfile[targetProfileId] = initTabId
+      } else if (
+        !this.activeTabByProfile[targetProfileId] ||
+        !spaceTabs.some((t) => t.id === this.activeTabByProfile[targetProfileId])
+      ) {
+        // Prefer selecting an unpinned Today tab or clean New Tab so pinned URLs stay untouched until clicked
+        const firstUnpinned = spaceTabs.find((t) => !t.isPinned && !t.isFavorite)
+        if (firstUnpinned) {
+          this.activeTabByProfile[targetProfileId] = firstUnpinned.id
+        } else {
+          // Add a lightweight New Tab as initial landing canvas so no web tab auto-loads unprompted
+          const landingId = `tab-landing-${targetProfileId}-${Date.now().toString(36)}`
+          this.tabs.push({
+            id: landingId,
+            profileId: targetProfileId,
+            url: NEW_TAB_URL,
+            title: tr(this.store.settings.language, 'New Tab', '新标签页'),
+            isLoading: false,
+            canGoBack: false,
+            canGoForward: false,
+            isPinned: false,
+            isFavorite: false,
+            pinnedUrl: null,
+            isAudioPlaying: false,
+            isMuted: false,
+            isSensitive: false,
+            lastAccessedAt: Date.now(),
+            groupId: null,
+            zoomFactor: 1
+          })
+          this.activeTabByProfile[targetProfileId] = landingId
+        }
+      }
+
+      if (!this.splitByProfile[targetProfileId]) {
+        this.splitByProfile[targetProfileId] = createDefaultSplitState()
       }
 
       // 2. Merge Bookmarks
@@ -3584,10 +5309,94 @@ export class BrowserManager {
       }
     })
 
+    this.emitImportProgress(
+      'tabs',
+      66,
+      `Synced ${favoritesImported + pinnedTabsImported + openTabsImported} tabs & ${tabGroupsCreated} folders…`,
+      `已还原 ${favoritesImported + pinnedTabsImported + openTabsImported} 个标签与 ${tabGroupsCreated} 个折叠目录…`
+    )
+
+    // Phase C: Decrypt & Inject Chromium Cookies into each target Electron Session
+    if (wantSessions && parsed.profileResources.length > 0) {
+      this.emitImportProgress(
+        'sessions',
+        76,
+        `Decrypting & injecting account login Cookies…`,
+        `正在注入各 Profile 账号登录态 Cookie…`
+      )
+      let cachedKeyResult: CookieKeyDerivationResult | undefined
+      const processedCookiePartitions = new Set<string>()
+
+      for (const res of parsed.profileResources) {
+        const sourceKey = `${request.browserId}:${res.profileDir}`
+        const targetPartition = partitionBySourceProfile.get(sourceKey)
+        if (!targetPartition || processedCookiePartitions.has(targetPartition)) continue
+        processedCookiePartitions.add(targetPartition)
+
+        const targetSes = this.ensureSessionConfigured(targetPartition)
+        const cookieRes = await migrateChromiumCookiesToSession({
+          profileDirPath: res.profileDirPath,
+          browserId: request.browserId,
+          targetSession: targetSes,
+          querySqlite: querySqliteSafely,
+          cachedKeyResult
+        })
+        cachedKeyResult = cookieRes.keyResult
+        cookiesImported += cookieRes.cookiesImported
+        for (const w of cookieRes.warnings) {
+          if (!warnings.includes(w)) warnings.push(w)
+        }
+      }
+    }
+
+    // Phase D: Stage & Activate Browser Extensions in target Electron Sessions
+    if (wantExtensions && parsed.profileResources.length > 0) {
+      this.emitImportProgress(
+        'extensions',
+        88,
+        `Installing & activating browser extensions…`,
+        `正在装载浏览器扩展插件生态与本地配置…`
+      )
+      const stagedIds = new Set<string>()
+      const partitionsToLoad = new Set<string>()
+
+      for (const res of parsed.profileResources) {
+        const sourceKey = `${request.browserId}:${res.profileDir}`
+        const targetPartition = partitionBySourceProfile.get(sourceKey)
+        const partList = targetPartition ? [targetPartition] : ['*']
+        if (targetPartition) partitionsToLoad.add(targetPartition)
+
+        for (const ext of res.extensions) {
+          const staged = this.extensionManager.stageImportedExtension(
+            ext,
+            partList,
+            request.browserId
+          )
+          if (staged && !stagedIds.has(staged.id)) {
+            stagedIds.add(staged.id)
+            extensionsImported++
+          }
+        }
+      }
+
+      this.store.saveExtensions()
+      for (const part of partitionsToLoad) {
+        const ses = this.ensureSessionConfigured(part)
+        await this.extensionManager.ensureExtensionsLoadedForSession(part, ses)
+      }
+    }
+
+    this.emitImportProgress(
+      'library',
+      95,
+      `Indexing ${bookmarksImported} bookmarks & ${historyImported} history items…`,
+      `正在构建书签与 @History 历史检索索引…`
+    )
+
     if (request.scopes.history && historyImported > 0) {
       this.store.history = [...historyMap.values()]
         .sort((a, b) => b.visitedAt - a.visitedAt)
-        .slice(0, 2000)
+        .slice(0, 2500)
       this.store.saveHistory()
     }
 
@@ -3595,43 +5404,57 @@ export class BrowserManager {
       this.store.saveBookmarks()
     }
 
-    if (
-      isFreshOnboarding &&
-      hadNoPriorWebTabs &&
-      request.createSpacesFromProfiles &&
-      importedProfileOrder.length > 0
-    ) {
+    // Phase E: Guarantee 1:1 Space Order Alignment with Arc & Clean Up Empty Starter Spaces
+    if (request.createSpacesFromProfiles && importedProfileOrder.length > 0) {
       const importedSet = new Set(importedProfileOrder)
-      const removedIds = this.store.profiles
-        .filter((p) => !importedSet.has(p.id))
-        .map((p) => p.id)
-      if (removedIds.length > 0) {
-        const removedSet = new Set(removedIds)
-        for (const t of this.tabs) {
-          if (!removedSet.has(t.profileId)) continue
-          this.destroyTabView(t.id)
-        }
-        this.tabs = this.tabs.filter((t) => !removedSet.has(t.profileId))
-        for (const rid of removedIds) {
-          delete this.activeTabByProfile[rid]
-          delete this.splitByProfile[rid]
-          delete this.closedTabsByProfile[rid]
-          delete this.connectedToolsByProfile[rid]
+
+      if (shouldReplaceStarterSpaces) {
+        const removableStarterIds = this.store.profiles
+          .filter((p) => {
+            if (importedSet.has(p.id)) return false
+            const isDefaultStarter = p.id === 'personal' || p.id === 'work'
+            if (!isDefaultStarter && !isFreshOnboarding) return false
+            // Only remove if this starter space has zero real user web tabs
+            const pTabs = this.tabs.filter((t) => t.profileId === p.id)
+            return pTabs.every((t) => isInternalDiaUrl(t.url) && !t.isPinned && !t.isFavorite)
+          })
+          .map((p) => p.id)
+
+        if (removableStarterIds.length > 0) {
+          const removedSet = new Set(removableStarterIds)
+          for (const t of this.tabs) {
+            if (removedSet.has(t.profileId)) {
+              this.destroyTabView(t.id)
+            }
+          }
+          this.tabs = this.tabs.filter((t) => !removedSet.has(t.profileId))
+          this.tabGroups = this.tabGroups.filter((g) => !removedSet.has(g.profileId))
+          for (const rid of removableStarterIds) {
+            delete this.activeTabByProfile[rid]
+            delete this.splitByProfile[rid]
+            delete this.closedTabsByProfile[rid]
+            delete this.connectedToolsByProfile[rid]
+          }
+          this.store.profiles = this.store.profiles.filter((p) => !removedSet.has(p.id))
         }
       }
-      const orderedProfiles: BrowserProfile[] = []
+
+      // Place imported Spaces FIRST in exact Arc order, followed by any kept custom profiles
+      const orderedImported: BrowserProfile[] = []
       for (const pid of importedProfileOrder) {
         const found = this.store.profiles.find((p) => p.id === pid)
-        if (found) orderedProfiles.push(found)
+        if (found) orderedImported.push(found)
       }
-      if (orderedProfiles.length > 0) {
-        this.store.profiles = orderedProfiles
+      const remainingCustom = this.store.profiles.filter((p) => !importedSet.has(p.id))
+      if (orderedImported.length > 0) {
+        this.store.profiles = [...orderedImported, ...remainingCustom]
       }
     }
 
     this.store.saveProfiles()
     this.sortProfileTabsByTier()
 
+    const firstTargetProfileId = importedProfileOrder[0] || null
     if (firstTargetProfileId && this.store.profiles.some((p) => p.id === firstTargetProfileId)) {
       this.store.activeProfileId = firstTargetProfileId
     }
@@ -3641,7 +5464,7 @@ export class BrowserManager {
       lastImportedBrowser: request.browserId,
       lastImportedAt: Date.now()
     }
-    if (isFreshOnboarding && (favoritesImported > 0 || pinnedTabsImported > 0 || spacesCreated > 0)) {
+    if (favoritesImported > 0 || pinnedTabsImported > 0 || spacesCreated > 0) {
       nextSettings.layoutMode = 'vertical'
       nextSettings.sidebarCollapsed = false
     }
@@ -3650,20 +5473,49 @@ export class BrowserManager {
       ...nextSettings
     })
 
+    this.hydrateCachedFaviconsSync()
     this.persistTabs()
     this.syncViewsLayout()
+    this.scheduleFaviconPreload(250)
+    void this.refreshConnectedTools(this.store.activeProfileId, false).then(() => {
+      this.broadcastState()
+    })
     this.broadcastState()
+
+    this.emitImportProgress(
+      'done',
+      100,
+      `Migration complete — your digital workspace is ready!`,
+      `数据与生态迁移已全部就绪！`
+    )
+
+    const importedSpacesSummary = importedProfileOrder
+      .map((pid) => this.store.profiles.find((p) => p.id === pid))
+      .filter((p): p is BrowserProfile => Boolean(p))
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        emoji: p.emoji,
+        accentColor: p.accentColor,
+        profileLabel: p.profileLabel
+      }))
 
     return {
       ok: true,
       browserId: request.browserId,
       spacesCreated,
+      profilesShared: partitionBySourceProfile.size,
       favoritesImported,
       pinnedTabsImported,
+      openTabsImported,
       tabGroupsCreated,
+      cookiesImported,
+      storageProfilesMigrated,
+      extensionsImported,
       bookmarksImported,
       historyImported,
-      warnings: parsed.warnings
+      importedSpaces: importedSpacesSummary,
+      warnings
     }
   }
 
@@ -4326,7 +6178,6 @@ export class BrowserManager {
       const protectedChatUrl = currentThreadId ? makeChatTabUrl(currentThreadId) : null
 
       if (toolName === 'list_open_tabs') {
-        const groupMap = new Map(this.tabGroups.map((g) => [g.id, g.title]))
         const list = this.tabs
           .filter((t) => t.profileId === profileId)
           .map((t, i) => ({
@@ -4341,7 +6192,7 @@ export class BrowserManager {
             isAudioPlaying: Boolean(t.isAudioPlaying),
             canGoBack: Boolean(t.canGoBack),
             canGoForward: Boolean(t.canGoForward),
-            groupTitle: t.groupId ? groupMap.get(t.groupId) || null : null,
+            groupTitle: t.groupId ? this.getGroupFullPathTitle(t.groupId) || null : null,
             splitRole:
               sp.enabled && t.id === sp.leftTabId
                 ? 'left'

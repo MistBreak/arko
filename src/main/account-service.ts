@@ -452,20 +452,46 @@ export class AccountService {
   }
 
   public async sendEmailVerificationCode(
-    rawEmail: string
+    input:
+      | string
+      | {
+          email: string
+          captchaId?: string
+          captchaCode?: string
+        }
   ): Promise<{ ok: boolean; error?: string }> {
+    const rawEmail = typeof input === 'string' ? input : input?.email || ''
+    const captchaId = typeof input === 'object' ? input?.captchaId?.trim() : undefined
+    const captchaCode = typeof input === 'object' ? input?.captchaCode?.trim() : undefined
+
     const email = normalizeEmail(rawEmail)
     if (!isValidEmail(email)) {
       return { ok: false, error: 'Please enter a valid email address.' }
     }
+
+    const caps = await this.getCapabilities()
+    if (!caps.registerEnabled || !caps.passwordRegisterEnabled) {
+      return { ok: false, error: 'New account registration is currently closed.' }
+    }
+    if (caps.registerCaptchaEnabled && (!captchaId || !captchaCode)) {
+      return { ok: false, error: 'Please enter the security verification code.' }
+    }
+
     try {
       const url = new URL(`${DEFAULT_CLOUD_GATEWAY_ORIGIN}/api/verification`)
       url.searchParams.set('email', email)
       url.searchParams.set('turnstile', '')
+      if (captchaId) {
+        url.searchParams.set('captcha_id', captchaId)
+      }
+      if (captchaCode) {
+        url.searchParams.set('captcha_code', captchaCode)
+      }
       const resp = await fetch(url.toString(), {
         method: 'GET',
         headers: {
           Accept: 'application/json',
+          'Cache-Control': 'no-cache',
           'User-Agent': 'arko-browser/0.1'
         },
         signal: AbortSignal.timeout(12000)
@@ -586,14 +612,10 @@ export class AccountService {
     if (!caps.registerEnabled || !caps.passwordRegisterEnabled) {
       return { ok: false, error: 'New account registration is currently closed.' }
     }
-    if (caps.emailVerificationRequired && !params.verificationCode?.trim()) {
+
+    const emailCode = params.verificationCode?.trim() || ''
+    if (!emailCode) {
       return { ok: false, error: 'Please enter the email verification code.' }
-    }
-    if (
-      caps.registerCaptchaEnabled &&
-      (!params.captchaId?.trim() || !params.captchaCode?.trim())
-    ) {
-      return { ok: false, error: 'Please enter the security verification code.' }
     }
 
     const username = deriveSafeUsernameFromEmail(email, params.username)
@@ -614,9 +636,9 @@ export class AccountService {
           username,
           password: params.password,
           email,
-          verification_code: params.verificationCode?.trim() || undefined,
-          captcha_id: caps.registerCaptchaEnabled ? params.captchaId?.trim() : undefined,
-          captcha_code: caps.registerCaptchaEnabled ? params.captchaCode?.trim() : undefined
+          verification_code: emailCode,
+          captcha_id: params.captchaId?.trim() || undefined,
+          captcha_code: params.captchaCode?.trim() || undefined
         }),
         signal: AbortSignal.timeout(15000)
       })
@@ -628,22 +650,18 @@ export class AccountService {
         }
       }
 
-      // 本地记录邮箱与短标识双向映射，兼容未开启强制邮箱验证时的本机邮箱快捷登录
+      // 本地同步记录邮箱与短标识映射
       this.emailToUsernameMap[email] = username
       this.usernameToEmailMap[username.toLowerCase()] = email
       this.saveToDisk()
 
-      // 优先直接消费服务端注册接口同步签发的会话与初始密钥，减少二次登录往返；旧服务端回退显式登录
+      // 优先直接消费服务端注册接口同步签发的会话与初始密钥，减少二次登录往返；旧服务端回退显式邮箱登录
       if (json?.data?.access_token) {
         return await this.completeAuthenticatedSession(resp, json.data, email)
       }
 
-      const loginTarget =
-        caps.emailVerificationRequired || Boolean(params.verificationCode?.trim())
-          ? email
-          : username
       return await this.loginAccount(
-        { identifier: loginTarget, password: params.password },
+        { identifier: email, password: params.password },
         email
       )
     } catch (err: any) {

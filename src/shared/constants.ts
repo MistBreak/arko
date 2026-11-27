@@ -650,7 +650,7 @@ export function classifyInputIntent(raw: string): InputIntentType {
   }
 
   // Explicit protocol URLs
-  if (/^(https?:\/\/|file:\/\/|arko:\/\/|dia:\/\/|about:|data:)/i.test(text)) {
+  if (/^(https?:\/\/|file:\/\/|chrome-extension:\/\/|arko:\/\/|dia:\/\/|about:|data:)/i.test(text)) {
     return 'url'
   }
 
@@ -686,7 +686,7 @@ export function classifyInputIntent(raw: string): InputIntentType {
 export function resolveNavigationUrl(raw: string, searchEngine: SearchEngineId): string {
   const text = normalizeLegacyInternalUrl(raw.trim())
   if (!text || text === NEW_TAB_URL) return NEW_TAB_URL
-  if (/^(https?:\/\/|file:\/\/|arko:\/\/|about:|data:)/i.test(text)) return text
+  if (/^(https?:\/\/|file:\/\/|chrome-extension:\/\/|arko:\/\/|about:|data:)/i.test(text)) return text
   if (/^(localhost|\d{1,3}(\.\d{1,3}){3})(:\d+)?(\/.*)?$/i.test(text)) {
     return `http://${text}`
   }

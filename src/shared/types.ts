@@ -82,6 +82,9 @@ export interface TabGroup {
   title: string
   color: TabGroupColor
   collapsed: boolean
+  parentId?: string | null
+  zone?: 'pinned' | 'unpinned'
+  keepEmpty?: boolean
 }
 
 export type TabPinMode = 'favorite' | 'pinned' | 'unpinned'
@@ -105,6 +108,8 @@ export interface TabState {
   groupId?: string | null
   zoomFactor?: number
   isLoaded?: boolean
+  pageTone?: 'light' | 'dark'
+  pageTopColor?: string | null
 }
 
 export interface ViewportBounds {
@@ -426,7 +431,17 @@ export interface AppSettings {
   toolsOnboardingSeen?: boolean
 }
 
-export type ImportBrowserId = 'arc' | 'dia' | 'chrome'
+export type ImportBrowserId =
+  | 'arc'
+  | 'dia'
+  | 'chrome'
+  | 'edge'
+  | 'safari'
+  | 'firefox'
+  | 'brave'
+  | 'opera'
+  | 'vivaldi'
+  | 'chromium'
 
 export interface ImportDataScopes {
   spacesAndPinned: boolean
@@ -880,11 +895,17 @@ export interface ArkoAPI {
   createTabGroup: (
     title: string,
     color: TabGroupColor,
-    tabIds?: string[]
+    tabIds?: string[],
+    options?: {
+      parentId?: string | null
+      profileId?: string
+      zone?: 'pinned' | 'unpinned'
+      keepEmpty?: boolean
+    }
   ) => Promise<TabGroup>
   updateTabGroup: (
     groupId: string,
-    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed'>>
+    partial: Partial<Pick<TabGroup, 'title' | 'color' | 'collapsed' | 'parentId'>>
   ) => Promise<TabGroup | null>
   assignTabToGroup: (tabId: string, groupId: string | null) => Promise<void>
   toggleTabGroupCollapsed: (groupId: string) => Promise<void>
@@ -921,7 +942,15 @@ export interface ArkoAPI {
   getAccountState: () => Promise<ArkoAccountState>
   getAuthCapabilities: () => Promise<ArkoAuthServerCapabilities>
   getRegisterCaptcha: () => Promise<ArkoCaptchaChallenge>
-  sendEmailVerificationCode: (email: string) => Promise<{ ok: boolean; error?: string }>
+  sendEmailVerificationCode: (
+    params:
+      | string
+      | {
+          email: string
+          captchaId?: string
+          captchaCode?: string
+        }
+  ) => Promise<{ ok: boolean; error?: string }>
   registerAccount: (params: {
     email: string
     username?: string

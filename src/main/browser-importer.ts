@@ -4,13 +4,15 @@ import { createRequire } from 'module'
 import os from 'os'
 import path from 'path'
 import { PROFILE_ACCENT_PRESETS } from '@shared/constants'
+import { IMPORT_BROWSER_IDS, importBrowserTitle } from '@shared/import-browsers'
 import type {
   AppLanguage,
   BrowserImportRequest,
   DetectedBrowserProfileInfo,
   DetectedBrowserSource,
   DetectedExtensionPreview,
-  ImportBrowserId
+  ImportBrowserId,
+  ImportDataScopes
 } from '@shared/types'
 import {
   scanChromiumProfileExtensions,
@@ -42,6 +44,7 @@ export interface ImportedTabItem {
   title: string
   favicon?: string
   folderTitle?: string | null
+  folderPath?: string[] | null
 }
 
 export interface ImportedProfileResource {
@@ -200,8 +203,8 @@ export function querySqliteSafely<T = Record<string, any>>(dbPath: string, sql: 
 }
 
 /**
- * Extracts cached PNG/WebP/ICO favicons as data URLs from Chromium's local Favicons SQLite DB
- * for a large set of candidate URLs (100% offline, zero network calls).
+ * Extracts cached PNG/WebP/ICO/SVG favicons as data URLs from Chromium's local Favicons SQLite DB
+ * using indexed page_url lookups + host prefix range scans so large profiles never miss icons.
  */
 function readChromiumFaviconsForUrls(
   faviconsDbPath: string,
@@ -221,39 +224,96 @@ function readChromiumFaviconsForUrls(
       arr.push(u)
       targetHosts.set(h, arr)
     }
-    if (targetUrls.size >= 1200) break
+    if (targetUrls.size >= 2400) break
   }
   if (targetUrls.size === 0) return result
 
-  const rows = querySqliteSafely<{ page_url: string; hex_png: string; width: number }>(
-    faviconsDbPath,
-    `SELECT m.page_url AS page_url, HEX(b.image_data) AS hex_png, b.width AS width
-     FROM icon_mapping m
-     JOIN favicon_bitmaps b ON m.icon_id = b.icon_id
-     WHERE OCTET_LENGTH(b.image_data) > 0 AND OCTET_LENGTH(b.image_data) <= 24576
-     ORDER BY b.width DESC
-     LIMIT 15000`
-  )
+  const hexToDataUrl = (hexStr: string): string => {
+    const upper = hexStr.slice(0, 24).toUpperCase()
+    const isPng = upper.startsWith('89504E47')
+    const isWebp = upper.startsWith('52494646')
+    const isGif = upper.startsWith('47494638')
+    const isJpeg = upper.startsWith('FFD8FF')
+    const isSvg = upper.startsWith('3C737667') || upper.startsWith('3C3F786D')
+    const mime = isPng
+      ? 'image/png'
+      : isWebp
+        ? 'image/webp'
+        : isGif
+          ? 'image/gif'
+          : isJpeg
+            ? 'image/jpeg'
+            : isSvg
+              ? 'image/svg+xml'
+              : 'image/x-icon'
+    return `data:${mime};base64,${Buffer.from(hexStr, 'hex').toString('base64')}`
+  }
 
   const hostFallbackIcon = new Map<string, string>()
-  for (const row of rows) {
-    if (!row?.page_url || !row?.hex_png) continue
-    const host = getHostSafely(row.page_url)
-    if (!targetUrls.has(row.page_url) && (!host || !targetHosts.has(host))) {
-      continue
+  const ingestRows = (rows: Array<{ page_url: string; hex_png: string; width: number }>): void => {
+    for (const row of rows) {
+      if (!row?.page_url || !row?.hex_png) continue
+      const host = getHostSafely(row.page_url)
+      if (!targetUrls.has(row.page_url) && (!host || !targetHosts.has(host))) {
+        continue
+      }
+      const dataUrl = hexToDataUrl(row.hex_png)
+      if (targetUrls.has(row.page_url) && !result.has(row.page_url)) {
+        result.set(row.page_url, dataUrl)
+      }
+      if (host && targetHosts.has(host) && !hostFallbackIcon.has(host)) {
+        hostFallbackIcon.set(host, dataUrl)
+      }
     }
-    const isPng = row.hex_png.startsWith('89504E47')
-    const isWebp = row.hex_png.startsWith('52494646')
-    const mime = isPng ? 'image/png' : isWebp ? 'image/webp' : 'image/x-icon'
-    const dataUrl = `data:${mime};base64,${Buffer.from(row.hex_png, 'hex').toString('base64')}`
+  }
 
-    if (targetUrls.has(row.page_url) && !result.has(row.page_url)) {
-      result.set(row.page_url, dataUrl)
+  // Pass 1: Exact indexed page_url lookup in batches so 100k+ row Favicons DBs never truncate matches
+  const allUrls = [...targetUrls]
+  const urlChunkSize = 180
+  for (let i = 0; i < allUrls.length; i += urlChunkSize) {
+    const chunk = allUrls
+      .slice(i, i + urlChunkSize)
+      .filter((u) => !/[\0\r\n]/.test(u))
+      .map((u) => `'${u.replace(/'/g, "''")}'`)
+    if (chunk.length === 0) continue
+    const exactRows = querySqliteSafely<{ page_url: string; hex_png: string; width: number }>(
+      faviconsDbPath,
+      `SELECT m.page_url AS page_url, HEX(b.image_data) AS hex_png, b.width AS width
+       FROM icon_mapping m
+       JOIN favicon_bitmaps b ON m.icon_id = b.icon_id
+       WHERE m.page_url IN (${chunk.join(',')})
+         AND OCTET_LENGTH(b.image_data) > 0 AND OCTET_LENGTH(b.image_data) <= 131072
+       ORDER BY b.width DESC`
+    )
+    ingestRows(exactRows)
+  }
+
+  // Pass 2: Indexed host-prefix range scan for URLs whose exact sub-path wasn't cached
+  const missingHosts = [...targetHosts.keys()].filter(
+    (h) => !hostFallbackIcon.has(h) && /^[a-z0-9.-]+$/i.test(h)
+  )
+  const hostChunkSize = 35
+  for (let i = 0; i < missingHosts.length; i += hostChunkSize) {
+    const hostChunk = missingHosts.slice(i, i + hostChunkSize)
+    const rangeClauses: string[] = []
+    for (const h of hostChunk) {
+      const safe = h.replace(/'/g, "''")
+      rangeClauses.push(
+        `(m.page_url >= 'https://${safe}/' AND m.page_url < 'https://${safe}0')`,
+        `(m.page_url >= 'http://${safe}/' AND m.page_url < 'http://${safe}0')`
+      )
     }
-    if (host && targetHosts.has(host) && !hostFallbackIcon.has(host)) {
-      hostFallbackIcon.set(host, dataUrl)
-    }
-    if (result.size >= targetUrls.size) break
+    const hostRows = querySqliteSafely<{ page_url: string; hex_png: string; width: number }>(
+      faviconsDbPath,
+      `SELECT m.page_url AS page_url, HEX(b.image_data) AS hex_png, b.width AS width
+       FROM icon_mapping m
+       JOIN favicon_bitmaps b ON m.icon_id = b.icon_id
+       WHERE (${rangeClauses.join(' OR ')})
+         AND OCTET_LENGTH(b.image_data) > 0 AND OCTET_LENGTH(b.image_data) <= 131072
+       ORDER BY b.width DESC
+       LIMIT 800`
+    )
+    ingestRows(hostRows)
   }
 
   for (const u of targetUrls) {
@@ -307,7 +367,10 @@ function readChromiumHistory(
 interface ParsedChromiumBookmarks {
   allBookmarks: Array<{ url: string; title: string; createdAt: number }>
   barDirectLinks: Array<{ url: string; title: string }>
-  barFolders: Array<{ folderTitle: string; links: Array<{ url: string; title: string }> }>
+  barFolders: Array<{
+    folderTitle: string
+    links: Array<{ url: string; title: string; folderPath: string[] }>
+  }>
 }
 
 function parseChromiumBookmarksFile(bookmarksPath: string): ParsedChromiumBookmarks {
@@ -345,7 +408,10 @@ function parseChromiumBookmarksFile(bookmarksPath: string): ParsedChromiumBookma
 
   const barNode = raw.roots.bookmark_bar
   const barDirectLinks: Array<{ url: string; title: string }> = []
-  const barFolders: Array<{ folderTitle: string; links: Array<{ url: string; title: string }> }> = []
+  const barFolders: Array<{
+    folderTitle: string
+    links: Array<{ url: string; title: string; folderPath: string[] }>
+  }> = []
 
   if (barNode && Array.isArray(barNode.children)) {
     for (const child of barNode.children) {
@@ -356,21 +422,24 @@ function parseChromiumBookmarksFile(bookmarksPath: string): ParsedChromiumBookma
         })
       } else if (child?.type === 'folder' && Array.isArray(child.children)) {
         const folderTitle = String(child.name || '').trim() || 'Bookmarks'
-        const folderLinks: Array<{ url: string; title: string }> = []
-        const walkFolder = (n: any, prefix: string): void => {
-          if (!n || typeof n !== 'object') return
-          if (n.type === 'url' && isImportableWebUrl(n.url)) {
-            folderLinks.push({
-              url: n.url.trim(),
-              title: String(n.name || '').trim() || n.url.trim()
-            })
-          } else if (Array.isArray(n.children)) {
-            const subName = String(n.name || '').trim()
-            const nextPrefix = subName && subName !== prefix ? `${prefix} / ${subName}` : prefix
-            for (const sub of n.children) walkFolder(sub, nextPrefix)
+        const folderLinks: Array<{ url: string; title: string; folderPath: string[] }> = []
+        const walkChildren = (children: any[], pathSegments: string[]): void => {
+          for (const n of children) {
+            if (!n || typeof n !== 'object') continue
+            if (n.type === 'url' && isImportableWebUrl(n.url)) {
+              folderLinks.push({
+                url: n.url.trim(),
+                title: String(n.name || '').trim() || n.url.trim(),
+                folderPath: pathSegments
+              })
+            } else if (Array.isArray(n.children)) {
+              const subName = String(n.name || '').trim()
+              const nextPath = subName ? [...pathSegments, subName] : pathSegments
+              walkChildren(n.children, nextPath)
+            }
           }
         }
-        walkFolder(child, folderTitle)
+        walkChildren(child.children, [folderTitle])
         if (folderLinks.length > 0) {
           barFolders.push({ folderTitle, links: folderLinks })
         }
@@ -421,13 +490,8 @@ function parseNetscapeBookmarksHtml(htmlPath: string): ParsedChromiumBookmarks {
   }
   try {
     const html = fs.readFileSync(htmlPath, 'utf-8')
-    const allBookmarks: Array<{ url: string; title: string; createdAt: number }> = []
-    const seen = new Set<string>()
-    const linkRe = /<A\b([^>]*)>([\s\S]*?)<\/A>/gi
-    let match: RegExpExecArray | null
-    while ((match = linkRe.exec(html)) !== null) {
-      const attrs = match[1] || ''
-      const rawTitle = (match[2] || '')
+    const decodeEntities = (raw: string): string =>
+      raw
         .replace(/<[^>]+>/g, '')
         .replace(/&amp;/g, '&')
         .replace(/&lt;/g, '<')
@@ -435,21 +499,85 @@ function parseNetscapeBookmarksHtml(htmlPath: string): ParsedChromiumBookmarks {
         .replace(/&quot;/g, '"')
         .replace(/&#39;/g, "'")
         .trim()
-      const hrefMatch = /\bHREF=["']([^"']+)["']/i.exec(attrs)
-      const dateMatch = /\bADD_DATE=["']?(\d+)["']?/i.exec(attrs)
-      const url = hrefMatch?.[1]?.trim()
-      if (!isImportableWebUrl(url) || seen.has(url)) continue
-      seen.add(url)
-      allBookmarks.push({
-        url,
-        title: rawTitle || url,
-        createdAt: dateMatch ? webkitMicrosToUnixMs(Number(dateMatch[1])) : Date.now()
-      })
+
+    const allBookmarks: Array<{ url: string; title: string; createdAt: number }> = []
+    const barDirectLinks: Array<{ url: string; title: string }> = []
+    const folderLinksByRoot = new Map<
+      string,
+      Array<{ url: string; title: string; folderPath: string[] }>
+    >()
+    const seen = new Set<string>()
+
+    const tokenRe =
+      /<H3\b([^>]*)>([\s\S]*?)<\/H3>|<DL\b[^>]*>|<\/DL>|<A\b([^>]*)>([\s\S]*?)<\/A>/gi
+    const folderStack: Array<{ name: string; isToolbarRoot: boolean }> = []
+    let pendingFolder: { name: string; isToolbarRoot: boolean } | null = null
+    let match: RegExpExecArray | null
+
+    while ((match = tokenRe.exec(html)) !== null) {
+      const full = match[0]
+      if (/^<H3\b/i.test(full)) {
+        const h3Attrs = match[1] || ''
+        const name = decodeEntities(match[2] || '') || 'Bookmarks'
+        const isToolbarRoot = /\bPERSONAL_TOOLBAR_FOLDER=["']?true["']?/i.test(h3Attrs)
+        pendingFolder = { name, isToolbarRoot }
+      } else if (/^<DL\b/i.test(full)) {
+        if (pendingFolder) {
+          folderStack.push(pendingFolder)
+          pendingFolder = null
+        } else {
+          folderStack.push({ name: '', isToolbarRoot: false })
+        }
+      } else if (/^<\/DL>/i.test(full)) {
+        pendingFolder = null
+        if (folderStack.length > 0) folderStack.pop()
+      } else if (/^<A\b/i.test(full)) {
+        pendingFolder = null
+        const attrs = match[3] || ''
+        const rawTitle = decodeEntities(match[4] || '')
+        const hrefMatch = /\bHREF=["']([^"']+)["']/i.exec(attrs)
+        const dateMatch = /\bADD_DATE=["']?(\d+)["']?/i.exec(attrs)
+        const url = hrefMatch?.[1]?.trim()
+        if (!isImportableWebUrl(url)) continue
+        const title = rawTitle || url
+
+        if (!seen.has(url)) {
+          seen.add(url)
+          allBookmarks.push({
+            url,
+            title,
+            createdAt: dateMatch ? webkitMicrosToUnixMs(Number(dateMatch[1])) : Date.now()
+          })
+        }
+
+        const effectivePath = folderStack
+          .filter((f) => !f.isToolbarRoot && Boolean(f.name))
+          .map((f) => f.name)
+        if (effectivePath.length === 0) {
+          barDirectLinks.push({ url, title })
+        } else {
+          const rootTitle = effectivePath[0]
+          const list = folderLinksByRoot.get(rootTitle) || []
+          list.push({ url, title, folderPath: effectivePath })
+          folderLinksByRoot.set(rootTitle, list)
+        }
+      }
     }
+
+    const barFolders = [...folderLinksByRoot.entries()].map(([folderTitle, links]) => ({
+      folderTitle,
+      links
+    }))
+
     return {
       allBookmarks,
-      barDirectLinks: allBookmarks.slice(0, 6).map((b) => ({ url: b.url, title: b.title })),
-      barFolders: []
+      barDirectLinks:
+        barDirectLinks.length > 0
+          ? barDirectLinks
+          : barFolders.length === 0
+            ? allBookmarks.slice(0, 6).map((b) => ({ url: b.url, title: b.title }))
+            : [],
+      barFolders
     }
   } catch {
     return empty
@@ -507,24 +635,119 @@ function getCandidatePaths(browserId: ImportBrowserId): string[] {
     return [path.join(home, '.config', 'dia')]
   }
 
-  // Google Chrome
-  if (platform === 'darwin') {
+  const roaming = process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
+
+  if (browserId === 'chrome') {
+    if (platform === 'darwin') {
+      return [
+        path.join(home, 'Library', 'Application Support', 'Google', 'Chrome'),
+        path.join(home, 'Library', 'Application Support', 'Google', 'Chrome Canary')
+      ]
+    }
+    if (platform === 'win32') {
+      return [
+        path.join(localAppData, 'Google', 'Chrome', 'User Data'),
+        path.join(localAppData, 'Google', 'Chrome SxS', 'User Data')
+      ]
+    }
+    return [path.join(home, '.config', 'google-chrome'), path.join(home, '.config', 'google-chrome-unstable')]
+  }
+
+  if (browserId === 'edge') {
+    if (platform === 'darwin') {
+      return [
+        path.join(home, 'Library', 'Application Support', 'Microsoft Edge'),
+        path.join(home, 'Library', 'Application Support', 'Microsoft Edge Beta'),
+        path.join(home, 'Library', 'Application Support', 'Microsoft Edge Dev')
+      ]
+    }
+    if (platform === 'win32') {
+      return [
+        path.join(localAppData, 'Microsoft', 'Edge', 'User Data'),
+        path.join(localAppData, 'Microsoft', 'Edge Beta', 'User Data'),
+        path.join(localAppData, 'Microsoft', 'Edge Dev', 'User Data')
+      ]
+    }
     return [
-      path.join(home, 'Library', 'Application Support', 'Google', 'Chrome'),
-      path.join(home, 'Library', 'Application Support', 'Google', 'Chrome Canary'),
-      path.join(home, 'Library', 'Application Support', 'Chromium')
+      path.join(home, '.config', 'microsoft-edge'),
+      path.join(home, '.config', 'microsoft-edge-beta'),
+      path.join(home, '.config', 'microsoft-edge-dev')
     ]
   }
-  if (platform === 'win32') {
+
+  if (browserId === 'brave') {
+    if (platform === 'darwin') {
+      return [path.join(home, 'Library', 'Application Support', 'BraveSoftware', 'Brave-Browser')]
+    }
+    if (platform === 'win32') {
+      return [path.join(localAppData, 'BraveSoftware', 'Brave-Browser', 'User Data')]
+    }
+    return [path.join(home, '.config', 'BraveSoftware', 'Brave-Browser')]
+  }
+
+  if (browserId === 'opera') {
+    if (platform === 'darwin') {
+      return [
+        path.join(home, 'Library', 'Application Support', 'com.operasoftware.Opera'),
+        path.join(home, 'Library', 'Application Support', 'com.operasoftware.OperaGX')
+      ]
+    }
+    if (platform === 'win32') {
+      return [
+        path.join(roaming, 'Opera Software', 'Opera Stable'),
+        path.join(roaming, 'Opera Software', 'Opera GX Stable')
+      ]
+    }
+    return [path.join(home, '.config', 'opera'), path.join(home, '.config', 'opera-gx')]
+  }
+
+  if (browserId === 'vivaldi') {
+    if (platform === 'darwin') {
+      return [path.join(home, 'Library', 'Application Support', 'Vivaldi')]
+    }
+    if (platform === 'win32') {
+      return [path.join(localAppData, 'Vivaldi', 'User Data')]
+    }
+    return [path.join(home, '.config', 'vivaldi')]
+  }
+
+  if (browserId === 'chromium') {
+    if (platform === 'darwin') {
+      return [path.join(home, 'Library', 'Application Support', 'Chromium')]
+    }
+    if (platform === 'win32') {
+      return [path.join(localAppData, 'Chromium', 'User Data')]
+    }
+    return [path.join(home, '.config', 'chromium')]
+  }
+
+  if (browserId === 'firefox') {
+    if (platform === 'darwin') {
+      return [
+        path.join(home, 'Library', 'Application Support', 'Firefox'),
+        path.join(home, 'Library', 'Application Support', 'Firefox Developer Edition'),
+        path.join(home, 'Library', 'Application Support', 'Firefox Nightly')
+      ]
+    }
+    if (platform === 'win32') {
+      return [
+        path.join(roaming, 'Mozilla', 'Firefox'),
+        path.join(roaming, 'Mozilla', 'Firefox Developer Edition'),
+        path.join(roaming, 'Mozilla', 'Firefox Nightly')
+      ]
+    }
+    return [path.join(home, '.mozilla', 'firefox')]
+  }
+
+  if (browserId === 'safari') {
+    if (platform !== 'darwin') return []
     return [
-      path.join(localAppData, 'Google', 'Chrome', 'User Data'),
-      path.join(localAppData, 'Chromium', 'User Data')
+      path.join(home, 'Library', 'Safari'),
+      path.join(home, 'Library', 'Containers', 'com.apple.Safari', 'Data', 'Library', 'Safari')
     ]
   }
-  return [
-    path.join(home, '.config', 'google-chrome'),
-    path.join(home, '.config', 'chromium')
-  ]
+
+  return []
 }
 
 // ==================== Arc StorableSidebar.json & Space Order Parser ====================
@@ -890,8 +1113,13 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
       return extras.length > 0 ? [...explicit, ...extras] : explicit
     }
 
-    const extractTabFromItem = (item: any, folderTitle: string | null): ImportedTabItem | null => {
+    const extractTabFromItem = (
+      item: any,
+      folderPath: string[]
+    ): ImportedTabItem | null => {
       if (!item || typeof item !== 'object') return null
+      const normalizedPath = folderPath.length > 0 ? folderPath : null
+      const folderTitle = normalizedPath ? normalizedPath.join(' / ') : null
       const tabData = item.data?.tab
       if (tabData && typeof tabData === 'object') {
         const rawUrl =
@@ -902,7 +1130,12 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
             String(
               item.title || tabData.savedTitle || tabData.title || tabData.activeTitle || ''
             ).trim() || cleanUrl
-          return { url: cleanUrl, title: cleanTitle, folderTitle }
+          return {
+            url: cleanUrl,
+            title: cleanTitle,
+            folderTitle,
+            folderPath: normalizedPath
+          }
         }
         return null
       }
@@ -913,14 +1146,19 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
       if (isImportableWebUrl(easelUrl)) {
         const cleanUrl = easelUrl.trim()
         const cleanTitle = String(item.title || 'Arc Easel').trim() || cleanUrl
-        return { url: cleanUrl, title: cleanTitle, folderTitle }
+        return {
+          url: cleanUrl,
+          title: cleanTitle,
+          folderTitle,
+          folderPath: normalizedPath
+        }
       }
       return null
     }
 
     const collectTabsFromNodeOrContainer = (
       nodeId: string,
-      folderTitle: string | null,
+      folderPath: string[],
       visited = new Set<string>(),
       isRootContainer = false
     ): ImportedTabItem[] => {
@@ -929,14 +1167,14 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
 
       const item = itemsMap.get(nodeId)
       if (item && typeof item === 'object' && !isRootContainer) {
-        const directTab = extractTabFromItem(item, folderTitle)
+        const directTab = extractTabFromItem(item, folderPath)
         if (directTab) {
           return [directTab]
         }
       }
 
       // Root container or virtual container ID not stored in itemsMap
-      let nextFolderTitle = folderTitle
+      let nextFolderPath = folderPath
       if (item && typeof item === 'object' && !isRootContainer) {
         const isSplitOrSystemContainer = Boolean(
           item.data?.splitView || item.data?.itemContainer || item.data?.tab
@@ -952,12 +1190,9 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
             item.title || item.data?.list?.title || item.data?.liveFolder?.title || ''
           ).trim()
           if (rawFolder) {
-            nextFolderTitle =
-              folderTitle && folderTitle !== rawFolder
-                ? `${folderTitle} / ${rawFolder}`
-                : rawFolder
-          } else if (!folderTitle) {
-            nextFolderTitle = 'Folder'
+            nextFolderPath = [...folderPath, rawFolder]
+          } else if (folderPath.length === 0) {
+            nextFolderPath = ['Folder']
           }
         }
       }
@@ -965,7 +1200,9 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
       const childIds = getOrderedChildIds(nodeId, item)
       const results: ImportedTabItem[] = []
       for (const childId of childIds) {
-        results.push(...collectTabsFromNodeOrContainer(childId, nextFolderTitle, visited, false))
+        results.push(
+          ...collectTabsFromNodeOrContainer(childId, nextFolderPath, visited, false)
+        )
       }
       return results
     }
@@ -981,7 +1218,7 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
         } else if (typeof elem === 'string' && elem.trim()) {
           const cid = elem.trim()
           if (itemsMap.has(cid) || childrenByParent.has(cid)) {
-            const tabs = collectTabsFromNodeOrContainer(cid, null, new Set(), true)
+            const tabs = collectTabsFromNodeOrContainer(cid, [], new Set(), true)
             if (tabs.length > 0) {
               const existing = favoritesByProfileDir.get(pendingProfileDir) || []
               const seen = new Set(existing.map((x) => x.url))
@@ -1053,10 +1290,10 @@ function parseArcStorableSidebar(sidebarFilePath: string): ArcParsedSidebar | nu
       }
 
       const pinnedTabs = pinnedContainerId
-        ? collectTabsFromNodeOrContainer(pinnedContainerId, null, new Set(), true)
+        ? collectTabsFromNodeOrContainer(pinnedContainerId, [], new Set(), true)
         : []
       const openTabs = unpinnedContainerId
-        ? collectTabsFromNodeOrContainer(unpinnedContainerId, null, new Set(), true)
+        ? collectTabsFromNodeOrContainer(unpinnedContainerId, [], new Set(), true)
         : []
 
       // Skip completely empty unnamed ghost spaces
@@ -1294,7 +1531,687 @@ function hasMeaningfulChromiumHistory(historyDbPath: string | null): boolean {
 const BROWSER_DISPLAY_NAMES: Record<ImportBrowserId, string> = {
   arc: 'Arc',
   dia: 'Dia',
-  chrome: 'Google Chrome'
+  chrome: 'Google Chrome',
+  edge: 'Microsoft Edge',
+  safari: 'Safari',
+  firefox: 'Firefox',
+  brave: 'Brave',
+  opera: 'Opera',
+  vivaldi: 'Vivaldi',
+  chromium: 'Chromium'
+}
+
+function browserLabel(browserId: ImportBrowserId, dataRoot?: string | null): string {
+  return importBrowserTitle(browserId, 'en', dataRoot).replace(/ Browser$/, '')
+}
+
+function emptyDetectedSource(
+  browserId: ImportBrowserId,
+  isCustomPath: boolean
+): DetectedBrowserSource {
+  return {
+    id: browserId,
+    name: browserLabel(browserId),
+    detected: false,
+    dataRootPath: null,
+    isCustomPath,
+    profiles: [],
+    bookmarksEstimate: 0,
+    pinnedEstimate: 0,
+    openTabsEstimate: 0,
+    extensionsEstimate: 0,
+    detectedExtensions: [],
+    hasHistory: false,
+    hasSessionData: false,
+    supportsSpacesAndPinned: true
+  }
+}
+
+function firefoxPrTimeToUnixMs(raw: unknown): number {
+  const num = Number(raw)
+  if (!Number.isFinite(num) || num <= 0) return Date.now()
+  const ms = Math.round(num / 1000)
+  if (ms < MIN_VALID_UNIX_MS || ms > Date.now() + 86_400_000) return Date.now()
+  return ms
+}
+
+function safariVisitToUnixMs(raw: unknown): number {
+  const num = Number(raw)
+  if (!Number.isFinite(num) || num <= 0) return Date.now()
+  if (num < 2_000_000_000) return Math.round((num + 978307200) * 1000)
+  return webkitMicrosToUnixMs(num)
+}
+
+interface LocatedFirefoxProfile {
+  id: string
+  name: string
+  dirPath: string
+  isDefault: boolean
+}
+
+function parseFirefoxProfilesIni(iniPath: string): LocatedFirefoxProfile[] {
+  let text = ''
+  try {
+    text = fs.readFileSync(iniPath, 'utf-8')
+  } catch {
+    return []
+  }
+  const root = path.dirname(iniPath)
+  const installDefaults = new Set<string>()
+  const profiles: LocatedFirefoxProfile[] = []
+  let section: string | null = null
+  let current: { name?: string; relPath?: string; absolute?: boolean; isDefault?: boolean } | null =
+    null
+
+  const flush = (): void => {
+    if (!current?.relPath) return
+    const dirPath = current.absolute ? current.relPath : path.join(root, current.relPath)
+    profiles.push({
+      id: path.basename(dirPath),
+      name: current.name || path.basename(dirPath),
+      dirPath,
+      isDefault: Boolean(current.isDefault) || installDefaults.has(current.relPath.replace(/\\/g, '/'))
+    })
+  }
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    const header = line.match(/^\[(.+)\]$/)
+    if (header) {
+      flush()
+      section = header[1]
+      current = section.startsWith('Profile') ? {} : null
+      continue
+    }
+    const eq = line.indexOf('=')
+    if (eq < 0) continue
+    const key = line.slice(0, eq).trim()
+    const val = line.slice(eq + 1).trim()
+    if (section?.startsWith('Install') && key === 'Default') {
+      installDefaults.add(val.replace(/\\/g, '/'))
+    }
+    if (!current) continue
+    if (key === 'Name') current.name = val
+    else if (key === 'Path') current.relPath = val
+    else if (key === 'IsRelative') current.absolute = val === '0'
+    else if (key === 'Default') current.isDefault = val === '1'
+  }
+  flush()
+
+  const seen = new Set<string>()
+  return profiles.filter((profile) => {
+    if (seen.has(profile.dirPath)) return false
+    seen.add(profile.dirPath)
+    return fs.existsSync(path.join(profile.dirPath, 'places.sqlite'))
+  })
+}
+
+function locateFirefoxProfiles(targetPath: string): LocatedFirefoxProfile[] {
+  if (!fs.existsSync(targetPath)) return []
+  const stat = fs.statSync(targetPath)
+  if (stat.isFile()) {
+    const base = path.basename(targetPath).toLowerCase()
+    if (base === 'profiles.ini') return parseFirefoxProfilesIni(targetPath)
+    if (base === 'places.sqlite') {
+      const dirPath = path.dirname(targetPath)
+      return [{ id: path.basename(dirPath), name: 'Firefox', dirPath, isDefault: true }]
+    }
+    return []
+  }
+
+  const iniPath = path.join(targetPath, 'profiles.ini')
+  if (fs.existsSync(iniPath)) {
+    const parsed = parseFirefoxProfilesIni(iniPath)
+    if (parsed.length > 0) {
+      return parsed.sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.name.localeCompare(b.name))
+    }
+  }
+
+  if (fs.existsSync(path.join(targetPath, 'places.sqlite'))) {
+    return [{ id: path.basename(targetPath), name: 'Firefox', dirPath: targetPath, isDefault: true }]
+  }
+
+  const found: LocatedFirefoxProfile[] = []
+  try {
+    for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const dirPath = path.join(targetPath, entry.name)
+      if (!fs.existsSync(path.join(dirPath, 'places.sqlite'))) continue
+      found.push({ id: entry.name, name: entry.name, dirPath, isDefault: false })
+    }
+  } catch {
+    // ignore unreadable profile roots
+  }
+  return found
+}
+
+interface FirefoxLibrary {
+  bookmarks: Array<{
+    url: string
+    title: string
+    createdAt: number
+    onToolbar: boolean
+    folderPath: string[] | null
+  }>
+  history: Array<{ url: string; title: string; visitedAt: number; visitCount: number }>
+}
+
+function readFirefoxLibrary(placesPath: string): FirefoxLibrary {
+  const empty: FirefoxLibrary = { bookmarks: [], history: [] }
+  if (!fs.existsSync(placesPath)) return empty
+
+  const bookmarkRows = querySqliteSafely<{
+    id: number
+    parent: number
+    type: number
+    guid: string
+    url: string | null
+    title: string | null
+    dateAdded: number
+  }>(
+    placesPath,
+    `SELECT b.id AS id,
+            b.parent AS parent,
+            b.type AS type,
+            b.guid AS guid,
+            p.url AS url,
+            COALESCE(NULLIF(b.title, ''), NULLIF(p.title, ''), p.url) AS title,
+            b.dateAdded AS dateAdded
+     FROM moz_bookmarks b
+     LEFT JOIN moz_places p ON p.id = b.fk
+     WHERE b.type IN (1, 2)
+     LIMIT 8000`
+  )
+
+  const folderById = new Map<number, { id: number; parent: number; guid: string; title: string }>()
+  const toolbarRootIds = new Set<number>()
+  const toolbarIds = new Set<number>()
+  for (const row of bookmarkRows) {
+    if (row.type === 2) {
+      folderById.set(row.id, {
+        id: row.id,
+        parent: row.parent,
+        guid: row.guid,
+        title: String(row.title || '').trim()
+      })
+    }
+    if (row.guid === 'toolbar_____') {
+      toolbarRootIds.add(row.id)
+      toolbarIds.add(row.id)
+    }
+  }
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const row of bookmarkRows) {
+      if (row.type === 2 && toolbarIds.has(row.parent) && !toolbarIds.has(row.id)) {
+        toolbarIds.add(row.id)
+        grew = true
+      }
+    }
+  }
+
+  const resolveToolbarFolderPath = (parentId: number): string[] | null => {
+    if (!toolbarIds.has(parentId) || toolbarRootIds.has(parentId)) return null
+    const segments: string[] = []
+    const visited = new Set<number>()
+    let cur = parentId
+    while (cur && !toolbarRootIds.has(cur) && !visited.has(cur)) {
+      visited.add(cur)
+      const folder = folderById.get(cur)
+      if (!folder) break
+      if (folder.title) segments.unshift(folder.title)
+      cur = folder.parent
+    }
+    return segments.length > 0 ? segments : null
+  }
+
+  const bookmarks = bookmarkRows
+    .filter((row) => row.type === 1 && isImportableWebUrl(row.url))
+    .slice(0, 4500)
+    .map((row) => {
+      const onToolbar = toolbarIds.has(row.parent)
+      return {
+        url: String(row.url),
+        title: String(row.title || row.url),
+        createdAt: firefoxPrTimeToUnixMs(row.dateAdded),
+        onToolbar,
+        folderPath: onToolbar ? resolveToolbarFolderPath(row.parent) : null
+      }
+    })
+
+  const historyRows = querySqliteSafely<{
+    url: string
+    title: string
+    visitedAt: number
+    visitCount: number
+  }>(
+    placesPath,
+    `SELECT url AS url,
+            COALESCE(NULLIF(title, ''), url) AS title,
+            last_visit_date AS visitedAt,
+            COALESCE(visit_count, 1) AS visitCount
+     FROM moz_places
+     WHERE last_visit_date IS NOT NULL
+       AND url IS NOT NULL
+       AND (url LIKE 'https://%' OR url LIKE 'http://%')
+     ORDER BY last_visit_date DESC
+     LIMIT 1500`
+  )
+
+  return {
+    bookmarks,
+    history: historyRows
+      .filter((row) => isImportableWebUrl(row.url))
+      .map((row) => ({
+        url: row.url,
+        title: String(row.title || row.url),
+        visitedAt: firefoxPrTimeToUnixMs(row.visitedAt),
+        visitCount: Math.max(1, Number(row.visitCount) || 1)
+      }))
+  }
+}
+
+function inspectFirefoxSource(
+  targetPath: string | null,
+  isCustomPath: boolean
+): DetectedBrowserSource {
+  const base = emptyDetectedSource('firefox', isCustomPath)
+  if (!targetPath || !fs.existsSync(targetPath)) return base
+  const profiles = locateFirefoxProfiles(targetPath)
+  if (profiles.length === 0) return base
+
+  let bookmarksEstimate = 0
+  let pinnedEstimate = 0
+  let hasHistory = false
+  const infos: DetectedBrowserProfileInfo[] = profiles.map((profile, idx) => {
+    const library = readFirefoxLibrary(path.join(profile.dirPath, 'places.sqlite'))
+    const toolbarCount = library.bookmarks.filter((item) => item.onToolbar).length
+    bookmarksEstimate += library.bookmarks.length
+    pinnedEstimate += toolbarCount
+    if (library.history.length > 0) hasHistory = true
+    return {
+      id: profile.id,
+      name: profile.name,
+      profileDir: profile.id,
+      profileName: profile.name,
+      emoji: SPACE_FALLBACK_EMOJIS[idx % SPACE_FALLBACK_EMOJIS.length],
+      accentColor: PROFILE_ACCENT_PRESETS[idx % PROFILE_ACCENT_PRESETS.length].hex,
+      bookmarkCount: library.bookmarks.length,
+      pinnedCount: toolbarCount,
+      favoriteCount: Math.min(8, toolbarCount),
+      hasHistory: library.history.length > 0,
+      hasSessionData: false
+    }
+  })
+
+  return {
+    ...base,
+    name: browserLabel('firefox', targetPath),
+    detected: true,
+    dataRootPath: targetPath,
+    distinctProfilesCount: infos.length,
+    profiles: infos,
+    bookmarksEstimate,
+    pinnedEstimate,
+    hasHistory,
+    supportsSpacesAndPinned: true
+  }
+}
+
+interface SafariBookmarkItem {
+  url: string
+  title: string
+  onBar: boolean
+  folderPath: string[] | null
+  folderTitle: string | null
+}
+
+function collectSafariBookmarks(plistPath: string): SafariBookmarkItem[] {
+  if (!fs.existsSync(plistPath) || process.platform !== 'darwin') return []
+  let data: any
+  try {
+    const stdout = execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath], {
+      encoding: 'utf-8',
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: 8000
+    })
+    data = JSON.parse(stdout)
+  } catch {
+    return []
+  }
+
+  const out: SafariBookmarkItem[] = []
+  const walk = (node: any, onBar: boolean, folderPath: string[]): void => {
+    if (!node || typeof node !== 'object' || out.length >= 4500) return
+    const title = String(node.Title || node.title || '').trim()
+    if (/reading\s*list/i.test(title)) return
+    const children = node.Children || node.children
+    const type = String(node.WebBookmarkType || '')
+    const url = String(node.URLString || '')
+    if (type === 'WebBookmarkTypeLeaf' || (isImportableWebUrl(url) && !Array.isArray(children))) {
+      if (!isImportableWebUrl(url)) return
+      const leafTitle = String(
+        node.URIDictionary?.title || node.URIDictionary?.Title || title || url
+      )
+      const normalizedPath = onBar && folderPath.length > 0 ? folderPath : null
+      out.push({
+        url,
+        title: leafTitle,
+        onBar,
+        folderPath: normalizedPath,
+        folderTitle: normalizedPath ? normalizedPath.join(' / ') : null
+      })
+      return
+    }
+    if (!Array.isArray(children)) return
+    const isBarRoot = title === 'BookmarksBar' || title === 'Bookmarks Bar'
+    const nextBar = onBar || isBarRoot
+    const nextFolderPath =
+      nextBar && title && !isBarRoot && title !== 'Root' ? [...folderPath, title] : folderPath
+    for (const child of children) walk(child, nextBar, nextFolderPath)
+  }
+  walk(data, false, [])
+  return out
+}
+
+function readSafariHistory(historyPath: string): FirefoxLibrary['history'] {
+  if (!fs.existsSync(historyPath)) return []
+  const joined = querySqliteSafely<{
+    url: string
+    title: string
+    visitTime: number
+    visitCount: number
+  }>(
+    historyPath,
+    `SELECT hi.url AS url,
+            COALESCE(NULLIF(hv.title, ''), hi.url) AS title,
+            MAX(hv.visit_time) AS visitTime,
+            hi.visit_count AS visitCount
+     FROM history_items hi
+     LEFT JOIN history_visits hv ON hv.history_item = hi.id
+     WHERE hi.url LIKE 'http%'
+     GROUP BY hi.id
+     ORDER BY visitTime DESC
+     LIMIT 1500`
+  )
+  const rows =
+    joined.length > 0
+      ? joined
+      : querySqliteSafely<{
+          url: string
+          title: string
+          visitTime: number
+          visitCount: number
+        }>(
+          historyPath,
+          `SELECT url AS url,
+                  url AS title,
+                  0 AS visitTime,
+                  visit_count AS visitCount
+           FROM history_items
+           WHERE url LIKE 'http%'
+           ORDER BY visit_count DESC
+           LIMIT 1500`
+        )
+
+  return rows
+    .filter((row) => isImportableWebUrl(row.url))
+    .map((row) => ({
+      url: row.url,
+      title: String(row.title || row.url),
+      visitedAt: safariVisitToUnixMs(row.visitTime),
+      visitCount: Math.max(1, Number(row.visitCount) || 1)
+    }))
+}
+
+interface LocatedSafariProfile {
+  id: string
+  name: string
+  dirPath: string
+}
+
+function safariDirHasData(dirPath: string): boolean {
+  return (
+    fs.existsSync(path.join(dirPath, 'Bookmarks.plist')) ||
+    fs.existsSync(path.join(dirPath, 'History.db'))
+  )
+}
+
+function locateSafariProfiles(targetPath: string): LocatedSafariProfile[] {
+  if (process.platform !== 'darwin' || !fs.existsSync(targetPath)) return []
+  const stat = fs.statSync(targetPath)
+  if (stat.isFile()) {
+    const base = path.basename(targetPath).toLowerCase()
+    if (base === 'bookmarks.plist' || base === 'history.db') {
+      return [{ id: 'safari', name: 'Safari', dirPath: path.dirname(targetPath) }]
+    }
+    return []
+  }
+
+  const found: LocatedSafariProfile[] = []
+  if (safariDirHasData(targetPath)) {
+    found.push({ id: 'safari-default', name: 'Safari', dirPath: targetPath })
+  }
+  const profilesDir = path.join(targetPath, 'Profiles')
+  if (fs.existsSync(profilesDir)) {
+    try {
+      for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        const dirPath = path.join(profilesDir, entry.name)
+        if (!safariDirHasData(dirPath)) continue
+        found.push({
+          id: entry.name,
+          name: found.length === 0 ? 'Safari' : `Safari ${found.length + 1}`,
+          dirPath
+        })
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return found
+}
+
+function inspectSafariSource(
+  targetPath: string | null,
+  isCustomPath: boolean
+): DetectedBrowserSource {
+  const base = emptyDetectedSource('safari', isCustomPath)
+  if (!targetPath) return base
+  const profiles = locateSafariProfiles(targetPath)
+  if (profiles.length === 0) return base
+
+  let bookmarksEstimate = 0
+  let pinnedEstimate = 0
+  let hasHistory = false
+  const infos: DetectedBrowserProfileInfo[] = profiles.map((profile, idx) => {
+    const bookmarks = collectSafariBookmarks(path.join(profile.dirPath, 'Bookmarks.plist'))
+    const history = readSafariHistory(path.join(profile.dirPath, 'History.db'))
+    const barCount = bookmarks.filter((item) => item.onBar).length
+    bookmarksEstimate += bookmarks.length
+    pinnedEstimate += barCount
+    if (history.length > 0) hasHistory = true
+    return {
+      id: profile.id,
+      name: profile.name,
+      profileDir: profile.id,
+      profileName: profile.name,
+      emoji: '🧭',
+      accentColor: PROFILE_ACCENT_PRESETS[idx % PROFILE_ACCENT_PRESETS.length].hex,
+      bookmarkCount: bookmarks.length,
+      pinnedCount: barCount,
+      favoriteCount: Math.min(8, barCount),
+      hasHistory: history.length > 0,
+      hasSessionData: false
+    }
+  })
+
+  return {
+    ...base,
+    name: 'Safari',
+    detected: true,
+    dataRootPath: targetPath,
+    distinctProfilesCount: infos.length,
+    profiles: infos,
+    bookmarksEstimate,
+    pinnedEstimate,
+    hasHistory,
+    supportsSpacesAndPinned: true
+  }
+}
+
+function libraryRowsToPayload(
+  browserId: ImportBrowserId,
+  profiles: Array<{
+    id: string
+    name: string
+    favorites: Array<{ url: string; title: string }>
+    pinnedTabs: ImportedTabItem[]
+    bookmarks: Array<{ url: string; title: string; createdAt: number }>
+    history: FirefoxLibrary['history']
+  }>,
+  scopes: ImportDataScopes,
+  warnings: string[]
+): ParsedBrowserImportPayload {
+  if (profiles.length === 0) {
+    return {
+      ok: false,
+      browserId,
+      spaces: [],
+      profileResources: [],
+      warnings,
+      error: `No valid browser profiles found for ${BROWSER_DISPLAY_NAMES[browserId]}.`
+    }
+  }
+  const spaces: ImportedSpacePayload[] = profiles.map((profile, idx) => ({
+    sourceId: profile.id,
+    name: profiles.length === 1 ? BROWSER_DISPLAY_NAMES[browserId] : profile.name,
+    profileName: profile.name,
+    emoji: browserId === 'safari' ? '🧭' : SPACE_FALLBACK_EMOJIS[idx % SPACE_FALLBACK_EMOJIS.length],
+    accentColor: PROFILE_ACCENT_PRESETS[idx % PROFILE_ACCENT_PRESETS.length].hex,
+    favorites: scopes.spacesAndPinned ? profile.favorites : [],
+    pinnedTabs: scopes.spacesAndPinned ? profile.pinnedTabs : [],
+    openTabs: [],
+    bookmarks: scopes.bookmarks ? profile.bookmarks : [],
+    history: scopes.history ? profile.history : []
+  }))
+  return { ok: true, browserId, spaces, profileResources: [], warnings }
+}
+
+function favoritesFromBar(
+  items: Array<{
+    url: string
+    title: string
+    folderPath?: string[] | null
+    folderTitle?: string | null
+  }>
+): { favorites: Array<{ url: string; title: string }>; pinnedTabs: ImportedTabItem[] } {
+  const favorites: Array<{ url: string; title: string }> = []
+  const pinnedTabs: ImportedTabItem[] = []
+  const seenFav = new Set<string>()
+  const seenPinned = new Set<string>()
+  for (const item of items) {
+    const normalizedPath =
+      item.folderPath && item.folderPath.length > 0 ? item.folderPath : null
+    const joinedTitle = normalizedPath ? normalizedPath.join(' / ') : item.folderTitle || null
+    if (!joinedTitle && favorites.length < 8 && !seenFav.has(item.url)) {
+      seenFav.add(item.url)
+      favorites.push({ url: item.url, title: item.title })
+      continue
+    }
+    const key = `${joinedTitle || ''}::${item.url}`
+    if (seenPinned.has(key) || pinnedTabs.length >= 400) continue
+    seenPinned.add(key)
+    pinnedTabs.push({
+      url: item.url,
+      title: item.title,
+      folderPath: normalizedPath,
+      folderTitle: joinedTitle
+    })
+  }
+  return { favorites, pinnedTabs }
+}
+
+function buildFirefoxImport(
+  rootPath: string,
+  selectedSet: Set<string> | null,
+  scopes: ImportDataScopes,
+  warnings: string[]
+): ParsedBrowserImportPayload {
+  const profiles = locateFirefoxProfiles(rootPath).filter(
+    (profile) => !selectedSet || selectedSet.has(profile.id)
+  )
+  return libraryRowsToPayload(
+    'firefox',
+    profiles.map((profile) => {
+      const library = readFirefoxLibrary(path.join(profile.dirPath, 'places.sqlite'))
+      const bar = library.bookmarks
+        .filter((item) => item.onToolbar)
+        .map((item) => ({
+          url: item.url,
+          title: item.title,
+          folderPath: item.folderPath,
+          folderTitle: item.folderPath ? item.folderPath.join(' / ') : null
+        }))
+      const { favorites, pinnedTabs } = favoritesFromBar(bar)
+      return {
+        id: profile.id,
+        name: profile.name,
+        favorites,
+        pinnedTabs,
+        bookmarks: library.bookmarks.map((item) => ({
+          url: item.url,
+          title: item.title,
+          createdAt: item.createdAt
+        })),
+        history: library.history
+      }
+    }),
+    scopes,
+    warnings
+  )
+}
+
+function buildSafariImport(
+  rootPath: string,
+  selectedSet: Set<string> | null,
+  scopes: ImportDataScopes,
+  warnings: string[]
+): ParsedBrowserImportPayload {
+  const profiles = locateSafariProfiles(rootPath).filter(
+    (profile) => !selectedSet || selectedSet.has(profile.id)
+  )
+  return libraryRowsToPayload(
+    'safari',
+    profiles.map((profile) => {
+      const bookmarks = collectSafariBookmarks(path.join(profile.dirPath, 'Bookmarks.plist'))
+      const bar = bookmarks
+        .filter((item) => item.onBar)
+        .map((item) => ({
+          url: item.url,
+          title: item.title,
+          folderPath: item.folderPath,
+          folderTitle: item.folderTitle
+        }))
+      const { favorites, pinnedTabs } = favoritesFromBar(bar)
+      return {
+        id: profile.id,
+        name: profile.name,
+        favorites,
+        pinnedTabs,
+        bookmarks: bookmarks.map((item) => ({
+          url: item.url,
+          title: item.title,
+          createdAt: Date.now()
+        })),
+        history: readSafariHistory(path.join(profile.dirPath, 'History.db'))
+      }
+    }),
+    scopes,
+    warnings
+  )
 }
 
 export function inspectBrowserAtPath(
@@ -1303,6 +2220,15 @@ export function inspectBrowserAtPath(
   isCustomPath = false,
   preferredLang?: AppLanguage
 ): DetectedBrowserSource {
+  const baseName = targetPath ? path.basename(targetPath).toLowerCase() : ''
+  const isHtmlBookmarkFile = baseName.endsWith('.html') || baseName.endsWith('.htm')
+  if (!isHtmlBookmarkFile && browserId === 'firefox') {
+    return inspectFirefoxSource(targetPath, isCustomPath)
+  }
+  if (!isHtmlBookmarkFile && browserId === 'safari') {
+    return inspectSafariSource(targetPath, isCustomPath)
+  }
+
   const baseEmpty: DetectedBrowserSource = {
     id: browserId,
     name: BROWSER_DISPLAY_NAMES[browserId],
@@ -1371,6 +2297,9 @@ export function inspectBrowserAtPath(
     if (lower.endsWith('.html') || lower.endsWith('.htm')) {
       const parsedHtml = parseNetscapeBookmarksHtml(targetPath)
       if (parsedHtml.allBookmarks.length > 0) {
+        const htmlFolderPinned = parsedHtml.barFolders
+          .slice(0, 24)
+          .reduce((s, f) => s + Math.min(120, f.links.length), 0)
         return {
           id: browserId,
           name: BROWSER_DISPLAY_NAMES[browserId],
@@ -1383,17 +2312,18 @@ export function inspectBrowserAtPath(
               name: path.basename(targetPath),
               emoji: '📑',
               accentColor: PROFILE_ACCENT_PRESETS[0].hex,
-              bookmarkCount: parsedHtml.allBookmarks.length
+              bookmarkCount: parsedHtml.allBookmarks.length,
+              pinnedCount: Math.min(6, parsedHtml.barDirectLinks.length) + htmlFolderPinned
             }
           ],
           bookmarksEstimate: parsedHtml.allBookmarks.length,
-          pinnedEstimate: Math.min(6, parsedHtml.barDirectLinks.length),
+          pinnedEstimate: Math.min(6, parsedHtml.barDirectLinks.length) + htmlFolderPinned,
           openTabsEstimate: 0,
           extensionsEstimate: 0,
           detectedExtensions: [],
           hasHistory: false,
           hasSessionData: false,
-          supportsSpacesAndPinned: false
+          supportsSpacesAndPinned: parsedHtml.barFolders.length > 0
         }
       }
     }
@@ -1573,7 +2503,7 @@ export function inspectBrowserAtPath(
     const pinnedEst =
       prefsPinned.length +
       Math.min(6, bmParsed.barDirectLinks.length) +
-      bmParsed.barFolders.slice(0, 6).reduce((s, f) => s + Math.min(12, f.links.length), 0)
+      bmParsed.barFolders.slice(0, 24).reduce((s, f) => s + Math.min(120, f.links.length), 0)
 
     totalBookmarks += bmParsed.allBookmarks.length
     totalPinned += pinnedEst
@@ -1621,7 +2551,7 @@ export function inspectBrowserAtPath(
 }
 
 export function detectAllBrowsers(preferredLang?: AppLanguage): DetectedBrowserSource[] {
-  const order: ImportBrowserId[] = ['arc', 'dia', 'chrome']
+  const order: ImportBrowserId[] = IMPORT_BROWSER_IDS
   return order.map((browserId) => {
     const candidates = getCandidatePaths(browserId)
     for (const candidate of candidates) {
@@ -1671,6 +2601,17 @@ export function parseBrowserDataForImport(
       ? new Set(selectedProfileIds)
       : null
 
+  const importBaseName = path.basename(rootPath).toLowerCase()
+  const isHtmlBookmarkExport =
+    fs.statSync(rootPath).isFile() &&
+    (importBaseName.endsWith('.html') || importBaseName.endsWith('.htm'))
+  if (!isHtmlBookmarkExport && browserId === 'firefox') {
+    return buildFirefoxImport(rootPath, selectedSet, scopes, warnings)
+  }
+  if (!isHtmlBookmarkExport && browserId === 'safari') {
+    return buildSafariImport(rootPath, selectedSet, scopes, warnings)
+  }
+
   const stat = fs.statSync(rootPath)
 
   // Case 1: Single file selected manually (.json sidebar or .html bookmarks)
@@ -1678,6 +2619,19 @@ export function parseBrowserDataForImport(
     const lower = path.basename(rootPath).toLowerCase()
     if (lower.endsWith('.html') || lower.endsWith('.htm')) {
       const htmlParsed = parseNetscapeBookmarksHtml(rootPath)
+      const htmlPinnedTabs: ImportedTabItem[] = []
+      if (scopes.spacesAndPinned) {
+        for (const folder of htmlParsed.barFolders.slice(0, 24)) {
+          for (const link of folder.links.slice(0, 120)) {
+            htmlPinnedTabs.push({
+              url: link.url,
+              title: link.title,
+              folderPath: link.folderPath,
+              folderTitle: link.folderPath.join(' / ')
+            })
+          }
+        }
+      }
       return {
         ok: true,
         browserId,
@@ -1689,8 +2643,8 @@ export function parseBrowserDataForImport(
             name: BROWSER_DISPLAY_NAMES[browserId],
             emoji: '📑',
             accentColor: PROFILE_ACCENT_PRESETS[0].hex,
-            favorites: scopes.spacesAndPinned ? htmlParsed.barDirectLinks.slice(0, 4) : [],
-            pinnedTabs: [],
+            favorites: scopes.spacesAndPinned ? htmlParsed.barDirectLinks.slice(0, 6) : [],
+            pinnedTabs: htmlPinnedTabs,
             openTabs: [],
             bookmarks: scopes.bookmarks ? htmlParsed.allBookmarks : [],
             history: []
@@ -1816,6 +2770,7 @@ export function parseBrowserDataForImport(
               url: p.url,
               title: p.title,
               folderTitle: p.folderTitle,
+              folderPath: p.folderPath,
               favicon: iconMap.get(p.url)
             }))
           : []
@@ -1825,6 +2780,7 @@ export function parseBrowserDataForImport(
               url: o.url,
               title: o.title,
               folderTitle: o.folderTitle,
+              folderPath: o.folderPath,
               favicon: iconMap.get(o.url)
             }))
           : []
@@ -1900,9 +2856,32 @@ export function parseBrowserDataForImport(
     const sess = safeReadJson<any>(path.join(rootPath, 'sessions.json'))
     const sessTabs: any[] = Array.isArray(sess?.tabs) ? sess.tabs : []
     const sessGroups: any[] = Array.isArray(sess?.tabGroups) ? sess.tabGroups : []
-    const groupTitleById = new Map<string, string>(
-      sessGroups.map((g: any) => [String(g.id), String(g.title || 'Group')])
+    const groupById = new Map<string, any>(
+      sessGroups.map((g: any) => [String(g.id), g])
     )
+    const resolveLegacyGroupPath = (gid?: string | null): string[] | null => {
+      if (!gid) return null
+      const segments: string[] = []
+      const visited = new Set<string>()
+      let curId: string | null = String(gid)
+      while (curId && !visited.has(curId)) {
+        visited.add(curId)
+        const grp = groupById.get(curId)
+        if (!grp) break
+        const rawTitle = String(grp.title || 'Group').trim()
+        if (!grp.parentId && rawTitle.includes(' / ')) {
+          const parts = rawTitle
+            .split(' / ')
+            .map((s) => s.trim())
+            .filter(Boolean)
+          segments.unshift(...parts)
+        } else if (rawTitle) {
+          segments.unshift(rawTitle)
+        }
+        curId = grp.parentId ? String(grp.parentId) : null
+      }
+      return segments.length > 0 ? segments : null
+    }
 
     const spaces: ImportedSpacePayload[] = rawProfiles
       .filter((p: any) => !selectedSet || selectedSet.has(String(p.id)))
@@ -1924,22 +2903,30 @@ export function parseBrowserDataForImport(
           pinnedTabs: scopes.spacesAndPinned
             ? pTabs
                 .filter((t: any) => t.isPinned && !t.isFavorite)
-                .map((t: any) => ({
-                  url: t.url,
-                  title: t.title || t.url,
-                  favicon: t.favicon,
-                  folderTitle: t.groupId ? groupTitleById.get(String(t.groupId)) || null : null
-                }))
+                .map((t: any) => {
+                  const folderPath = resolveLegacyGroupPath(t.groupId)
+                  return {
+                    url: t.url,
+                    title: t.title || t.url,
+                    favicon: t.favicon,
+                    folderPath,
+                    folderTitle: folderPath ? folderPath.join(' / ') : null
+                  }
+                })
             : [],
           openTabs: wantOpenTabs
             ? pTabs
                 .filter((t: any) => !t.isPinned && !t.isFavorite)
-                .map((t: any) => ({
-                  url: t.url,
-                  title: t.title || t.url,
-                  favicon: t.favicon,
-                  folderTitle: t.groupId ? groupTitleById.get(String(t.groupId)) || null : null
-                }))
+                .map((t: any) => {
+                  const folderPath = resolveLegacyGroupPath(t.groupId)
+                  return {
+                    url: t.url,
+                    title: t.title || t.url,
+                    favicon: t.favicon,
+                    folderPath,
+                    folderTitle: folderPath ? folderPath.join(' / ') : null
+                  }
+                })
             : [],
           bookmarks: scopes.bookmarks
             ? bms
@@ -2026,15 +3013,17 @@ export function parseBrowserDataForImport(
           pinnedTabs.push({ url: link.url, title: link.title, folderTitle: null })
         }
       }
-      for (const folder of bmParsed.barFolders.slice(0, 8)) {
-        for (const link of folder.links.slice(0, 16)) {
-          const key = `${folder.folderTitle}::${link.url}`
+      for (const folder of bmParsed.barFolders.slice(0, 24)) {
+        for (const link of folder.links.slice(0, 120)) {
+          const joinedFolder = link.folderPath.join(' / ')
+          const key = `${joinedFolder}::${link.url}`
           if (!seenPinnedKey.has(key)) {
             seenPinnedKey.add(key)
             pinnedTabs.push({
               url: link.url,
               title: link.title,
-              folderTitle: folder.folderTitle
+              folderPath: link.folderPath,
+              folderTitle: joinedFolder
             })
           }
         }

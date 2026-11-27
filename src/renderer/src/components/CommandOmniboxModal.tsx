@@ -142,6 +142,19 @@ function computeSmartBarPosition(): AnchorPosition {
   if (anchorEl) {
     const rect = anchorEl.getBoundingClientRect()
     if (rect.width > 40) {
+      const isLeftAligned = anchorEl.dataset.arkoUrlbarAlign === 'left'
+      if (isLeftAligned) {
+        const left = Math.max(12, Math.round(rect.left - 4))
+        const maxAvailable = Math.max(360, vw - left - 96)
+        const width = Math.min(720, Math.max(Math.min(480, maxAvailable), Math.round(rect.width)), maxAvailable)
+        const clampedLeft = Math.max(12, Math.min(vw - width - 12, left))
+        return {
+          top: Math.max(5, Math.round(rect.top - 2)),
+          left: Math.round(clampedLeft),
+          width: Math.round(width)
+        }
+      }
+
       const mainEl = anchorEl.closest('main') || anchorEl.closest('header')
       const containerRect = mainEl
         ? mainEl.getBoundingClientRect()

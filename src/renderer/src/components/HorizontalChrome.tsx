@@ -23,6 +23,7 @@ import {
   PenLine,
   Pin,
   Plus,
+  Puzzle,
   RotateCw,
   Search,
   Settings,
@@ -43,6 +44,7 @@ import type {
   BookmarkItem,
   BrowserProfile,
   DownloadItemState,
+  InstalledExtensionItem,
   SplitViewState,
   TabGroup,
   TabPinMode,
@@ -70,6 +72,8 @@ interface Props {
   externalDragLink?: { url: string; title?: string } | null
   updateState?: AppUpdateState
   accountState?: ArkoAccountState
+  extensions?: InstalledExtensionItem[]
+  onOpenExtensions?: (anchor: { x: number; y: number }) => void
   onSwitchLayout: () => void
   onToggleCompactBar: () => void
   onOpenProfileMenu: (anchor: { x: number; y: number }, mode?: 'menu' | 'edit') => void
@@ -191,6 +195,8 @@ const HorizontalChromeInner: React.FC<Props> = ({
   externalDragLink,
   updateState,
   accountState,
+  extensions = [],
+  onOpenExtensions,
   onSwitchLayout,
   onToggleCompactBar,
   onOpenProfileMenu,
@@ -279,23 +285,61 @@ const HorizontalChromeInner: React.FC<Props> = ({
     updateState?.status === 'downloading' ||
     updateState?.status === 'downloaded'
 
+  const groupById = new Map(tabGroups.map((g) => [g.id, g]))
+  const getGroupPathLabel = (grp: TabGroup): string => {
+    const parts: string[] = []
+    let cur: TabGroup | undefined = grp
+    const seen = new Set<string>()
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id)
+      parts.unshift(cur.title)
+      cur = cur.parentId ? groupById.get(cur.parentId) : undefined
+    }
+    return parts.join(' › ')
+  }
+  const getCollapsedControllerGroup = (grp: TabGroup): TabGroup | null => {
+    let cur: TabGroup | undefined = grp
+    let collapsedTop: TabGroup | null = null
+    const seen = new Set<string>()
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id)
+      if (cur.collapsed) collapsedTop = cur
+      cur = cur.parentId ? groupById.get(cur.parentId) : undefined
+    }
+    return collapsedTop
+  }
+
   const renderedGroupIds = new Set<string>()
   const tabStripNodes: React.ReactNode[] = []
 
   for (const tab of normalTabs) {
-    const grp = tab.groupId ? tabGroups.find((g) => g.id === tab.groupId) : undefined
-    if (grp && !renderedGroupIds.has(grp.id)) {
-      renderedGroupIds.add(grp.id)
-      const countInGroup = normalTabs.filter((t) => t.groupId === grp.id).length
+    const grp = tab.groupId ? groupById.get(tab.groupId) : undefined
+    const collapsedController = grp ? getCollapsedControllerGroup(grp) : null
+    const pillGrp = collapsedController || grp
+    if (pillGrp && !renderedGroupIds.has(pillGrp.id)) {
+      renderedGroupIds.add(pillGrp.id)
+      const countInGroup = normalTabs.filter((t) => {
+        if (!t.groupId) return false
+        if (t.groupId === pillGrp.id) return true
+        let cur = groupById.get(t.groupId)?.parentId
+        const seen = new Set<string>()
+        while (cur && !seen.has(cur)) {
+          if (cur === pillGrp.id) return true
+          seen.add(cur)
+          cur = groupById.get(cur)?.parentId
+        }
+        return false
+      }).length
+      const fullPathLabel = getGroupPathLabel(pillGrp)
       tabStripNodes.push(
         <button
-          key={`grp-pill-${grp.id}`}
+          key={`grp-pill-${pillGrp.id}`}
           type="button"
-          onClick={() => onToggleGroupCollapsed(grp.id)}
+          onClick={() => onToggleGroupCollapsed(pillGrp.id)}
           title={tr(
             lang,
-            `${grp.title} (${countInGroup} tabs · Click to collapse/expand)`,
-            `${grp.title} (${countInGroup} 个标签 · 点击折叠/展开)`
+            `${fullPathLabel} (${countInGroup} tabs · Click to collapse/expand)`,
+            `${fullPathLabel} (${countInGroup} 个标签 · 点击折叠/展开)`
           )}
           className={`app-no-drag h-[26px] px-2 rounded-lg border text-[11px] font-medium inline-flex items-center gap-1 shrink-0 transition ${
             isDark
@@ -304,9 +348,9 @@ const HorizontalChromeInner: React.FC<Props> = ({
           }`}
         >
           <Folder size={12} strokeWidth={1.75} className="opacity-60 shrink-0" />
-          <span className="max-w-[96px] truncate">{grp.title}</span>
+          <span className="max-w-[120px] truncate">{fullPathLabel}</span>
           <span className="opacity-65 text-[10px]">{countInGroup}</span>
-          {grp.collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
+          {pillGrp.collapsed ? <ChevronRight size={11} /> : <ChevronDown size={11} />}
         </button>
       )
     }
@@ -315,7 +359,7 @@ const HorizontalChromeInner: React.FC<Props> = ({
       tab.id === activeTab?.id ||
       (splitView.enabled &&
         (tab.id === splitView.leftTabId || tab.id === splitView.rightTabId))
-    if (grp && grp.collapsed && !isKeptInCollapsedGroup) {
+    if (collapsedController && !isKeptInCollapsedGroup) {
       continue
     }
 
@@ -427,15 +471,18 @@ const HorizontalChromeInner: React.FC<Props> = ({
           </span>
         )}
 
-        <span className="truncate flex-1">{tab.title || tr(lang, 'New Tab', '新标签页')}</span>
+        <span className="dia-tab-title flex-1 min-w-0">
+          {tab.title || tr(lang, 'New Tab', '新标签页')}
+        </span>
 
         {tab.isAudioPlaying && (
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation()
               onMuteTab(tab.id)
             }}
-            className="opacity-75 hover:opacity-100 p-0.5 rounded"
+            className="opacity-75 hover:opacity-100 p-0.5 rounded shrink-0"
             title={tab.isMuted ? tr(lang, 'Unmute', '取消静音') : tr(lang, 'Mute tab', '静音此标签页')}
           >
             {tab.isMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
@@ -444,26 +491,30 @@ const HorizontalChromeInner: React.FC<Props> = ({
 
         {!splitRole && tab.id !== activeTab?.id && (
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation()
               onOpenTabInSplit(tab.id)
             }}
             title={tr(lang, 'Open in Right Split View', '在右侧分屏中并排打开')}
-            className="opacity-0 group-hover:opacity-65 hover:!opacity-100 p-0.5 rounded transition"
+            className="hidden group-hover:inline-flex opacity-65 hover:!opacity-100 p-0.5 rounded transition shrink-0"
           >
             <Columns2 size={11} />
           </button>
         )}
 
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             onCloseTab(tab.id)
           }}
           title={tr(lang, 'Close Tab (⌘W)', '关闭标签页 (⌘W)')}
-          className={`opacity-0 group-hover:opacity-75 hover:!opacity-100 p-0.5 rounded transition ${
-            isActive ? 'opacity-55' : ''
-          }`}
+          className={`${
+            isActive
+              ? 'inline-flex opacity-55 hover:opacity-100'
+              : 'hidden group-hover:inline-flex opacity-75 hover:opacity-100'
+          } p-0.5 rounded transition shrink-0`}
         >
           <X size={13} />
         </button>
@@ -877,309 +928,440 @@ const HorizontalChromeInner: React.FC<Props> = ({
         )}
       </div>
 
-      {/* Row 2: Arko Calm Title-First Smart Bar */}
-      {!compactTopBar && (
-        <div className="h-[37px] px-3 pb-1 flex items-center gap-2">
-          <div className="flex items-center gap-0.5">
-            <button
-              onClick={onBack}
-              disabled={!activeTab?.canGoBack}
-              title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
-              className={`p-1.5 rounded-lg transition disabled:opacity-30 ${
-                isDark ? 'hover:bg-white/8' : 'hover:bg-black/6'
-              }`}
-            >
-              <ArrowLeft size={15} />
-            </button>
-            <button
-              onClick={onForward}
-              disabled={!activeTab?.canGoForward}
-              title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
-              className={`p-1.5 rounded-lg transition disabled:opacity-30 ${
-                isDark ? 'hover:bg-white/8' : 'hover:bg-black/6'
-              }`}
-            >
-              <ArrowRight size={15} />
-            </button>
-            <button
-              onClick={onReload}
-              disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
-              title={tr(lang, 'Reload (⌘R)', '重新加载 (⌘R)')}
-              className={`p-1.5 rounded-lg transition disabled:opacity-30 ${
-                isDark ? 'hover:bg-white/8' : 'hover:bg-black/6'
-              }`}
-            >
-              <RotateCw size={14} className={activeTab?.isLoading ? 'animate-spin' : ''} />
-            </button>
-          </div>
-
+      {/* Row 2: Dia-Style Adaptive Address Bar */}
+      {!compactTopBar && (() => {
+        const isBarDark =
+          !activeTab || isInternalArkoUrl(activeTab.url)
+            ? isDark
+            : (activeTab.pageTone ?? (isDark ? 'dark' : 'light')) === 'dark'
+        const enabledExts = extensions.filter((x) => x.enabled)
+        return (
           <div
-            data-arko-urlbar-anchor="true"
-            onClick={onOpenOmnibox}
-            className={`group relative flex-1 max-w-3xl mx-auto h-[30px] px-3 rounded-full flex items-center gap-2 text-xs cursor-text transition-all border overflow-hidden ${
-              omniboxOpen ? 'opacity-0 pointer-events-none' : ''
-            } ${
-              isDark
-                ? 'bg-[#222229] border-white/8 hover:border-white/18 text-zinc-200'
-                : 'bg-white/88 border-black/7 hover:bg-white hover:border-black/15 text-zinc-800 shadow-2xs'
+            style={{
+              backgroundColor: isBarDark ? '#111113' : '#FFFFFF',
+              borderTopColor: isBarDark ? 'rgba(255, 255, 255, 0.07)' : 'rgba(0, 0, 0, 0.06)'
+            }}
+            className={`h-[38px] px-2.5 border-t flex items-center gap-1 transition-colors duration-200 ${
+              isBarDark ? 'text-[#F4F4F5]' : 'text-[#18181B]'
             }`}
           >
-            {activeTab?.isSensitive ? (
-              <span
-                title={tr(
-                  lang,
-                  'Sensitive Site Protection active: AI reading is blocked on this page',
-                  '敏感站点隐私护栏已生效：AI 已自动停止读取此页面'
-                )}
-                className="flex items-center gap-1 text-amber-500 font-medium shrink-0"
-              >
-                <ShieldAlert size={13} />
-              </span>
-            ) : activeTab?.url && !isInternalArkoUrl(activeTab.url) ? (
-              <Lock size={11.5} className="opacity-40 shrink-0" />
-            ) : (
-              <Search size={13} className="opacity-45 shrink-0" />
-            )}
-
-            <div className="flex-1 min-w-0 flex items-center gap-1.5">
-              {splitView.enabled && (
-                <span className="px-1.5 py-0.2 rounded text-[10px] font-medium bg-indigo-500/15 text-indigo-500 shrink-0">
-                  {splitView.activePane === 'left'
-                    ? tr(lang, 'Left', '左屏')
-                    : tr(lang, 'Right', '右屏')}
-                </span>
-              )}
-
-              <div className="flex items-center gap-1.5 truncate group-hover:hidden">
-                {domain && (
-                  <>
-                    <span className="font-semibold text-indigo-600 dark:text-indigo-400 shrink-0">
-                      {domain}
-                    </span>
-                    <span className="opacity-30">·</span>
-                  </>
-                )}
-                <span
-                  className={`truncate ${
-                    !activeTab?.url || activeTab.url === NEW_TAB_URL
-                      ? 'opacity-50'
-                      : 'opacity-85 font-medium'
-                  }`}
-                >
-                  {cleanTitle}
-                </span>
-              </div>
-
-              <div className="hidden group-hover:flex items-center gap-1 truncate font-mono text-[11.5px] opacity-85">
-                <span className="truncate">{cleanUrl || cleanTitle}</span>
-              </div>
-            </div>
-
-            {zoomPct !== 100 && (
+            <div className="flex items-center gap-0.5 shrink-0">
               <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onResetZoom()
-                }}
-                title={tr(lang, 'Reset zoom to 100% (⌘0)', '点击恢复 100% 网页缩放 (⌘0)')}
-                className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-indigo-500/15 text-indigo-500 shrink-0"
+                onClick={onBack}
+                disabled={!activeTab?.canGoBack}
+                title={tr(lang, 'Back (⌘[)', '后退 (⌘[)')}
+                className={`w-7 h-7 flex items-center justify-center rounded-[7px] transition disabled:opacity-25 disabled:pointer-events-none ${
+                  isBarDark ? 'text-zinc-200 hover:bg-white/8' : 'text-zinc-700 hover:bg-black/5'
+                }`}
               >
-                {zoomPct}%
+                <ArrowLeft size={15} />
               </button>
-            )}
+              <button
+                onClick={onForward}
+                disabled={!activeTab?.canGoForward}
+                title={tr(lang, 'Forward (⌘])', '前进 (⌘])')}
+                className={`w-7 h-7 flex items-center justify-center rounded-[7px] transition disabled:opacity-25 disabled:pointer-events-none ${
+                  isBarDark ? 'text-zinc-200 hover:bg-white/8' : 'text-zinc-700 hover:bg-black/5'
+                }`}
+              >
+                <ArrowRight size={15} />
+              </button>
+              <button
+                onClick={onReload}
+                disabled={!activeTab || isInternalArkoUrl(activeTab.url)}
+                title={tr(lang, 'Reload (⌘R)', '重新加载 (⌘R)')}
+                className={`w-7 h-7 flex items-center justify-center rounded-[7px] transition disabled:opacity-25 disabled:pointer-events-none ${
+                  isBarDark ? 'text-zinc-300 hover:bg-white/8' : 'text-zinc-700 hover:bg-black/5'
+                }`}
+              >
+                <RotateCw size={14} className={activeTab?.isLoading ? 'animate-spin' : ''} />
+              </button>
+            </div>
 
             <div
-              className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
-              onClick={(e) => e.stopPropagation()}
+              data-arko-urlbar-anchor="true"
+              data-arko-urlbar-align="left"
+              onClick={onOpenOmnibox}
+              className={`group relative flex-1 min-w-0 h-[28px] px-2 rounded-[7px] flex items-center gap-1.5 text-[13px] tracking-[-0.008em] cursor-text transition-colors overflow-hidden ${
+                omniboxOpen ? 'opacity-0 pointer-events-none' : ''
+              } ${isBarDark ? 'hover:bg-white/[0.065]' : 'hover:bg-black/[0.04]'}`}
             >
-              {activeTab?.url && !isInternalArkoUrl(activeTab.url) && (
-                <>
-                  <button
-                    onClick={onOpenReader}
-                    title={tr(lang, 'Arko Calm Reader (⇧⌘R)', 'Arko 沉浸阅读视图 (⇧⌘R)')}
-                    className="p-1 rounded hover:bg-black/8 dark:hover:bg-white/10 opacity-75 hover:opacity-100"
-                  >
-                    <BookOpen size={12} />
-                  </button>
-                  <button
-                    onClick={onOpenInlineWrite}
-                    title={tr(
-                      lang,
-                      'Inline Write & Form Fill Preview (⌘J)',
-                      '网页输入框内联帮写与表单填充 (⌘J)'
+              {activeTab?.isSensitive ? (
+                <span
+                  title={tr(
+                    lang,
+                    'Sensitive Site Protection active: AI reading is blocked on this page',
+                    '敏感站点隐私护栏已生效：AI 已自动停止读取此页面'
+                  )}
+                  className="flex items-center gap-1 text-amber-500 font-medium shrink-0"
+                >
+                  <ShieldAlert size={13} />
+                </span>
+              ) : !activeTab?.url || activeTab.url === NEW_TAB_URL ? (
+                <Search
+                  size={13}
+                  className={`shrink-0 ${isBarDark ? 'text-zinc-500' : 'text-zinc-400'}`}
+                />
+              ) : null}
+
+              <div className="flex-1 min-w-0 flex items-baseline gap-1 overflow-hidden">
+                {splitView.enabled && (
+                  <span className="px-1.5 py-0.2 rounded text-[10px] font-medium bg-indigo-500/15 text-indigo-500 shrink-0 self-center">
+                    {splitView.activePane === 'left'
+                      ? tr(lang, 'Left', '左屏')
+                      : tr(lang, 'Right', '右屏')}
+                  </span>
+                )}
+
+                {domain ? (
+                  <>
+                    <span
+                      className={`font-medium shrink-0 max-w-[46%] truncate ${
+                        isBarDark ? 'text-[#F4F4F5]' : 'text-[#18181B]'
+                      }`}
+                    >
+                      {domain}
+                    </span>
+                    {cleanTitle && cleanTitle.toLowerCase() !== domain.toLowerCase() && (
+                      <>
+                        <span
+                          className={`select-none shrink-0 ${
+                            isBarDark ? 'text-[#636366]' : 'text-[#B0B0B8]'
+                          }`}
+                        >
+                          /
+                        </span>
+                        <span
+                          className={`truncate min-w-0 font-normal ${
+                            isBarDark ? 'text-[#8E8E98]' : 'text-[#9CA3AF]'
+                          }`}
+                        >
+                          {cleanTitle}
+                        </span>
+                      </>
                     )}
-                    className="p-1 rounded hover:bg-black/8 dark:hover:bg-white/10 text-indigo-500 opacity-85 hover:opacity-100"
-                  >
-                    <PenLine size={12} />
-                  </button>
-                  <button
-                    onClick={() => {
-                      void navigator.clipboard.writeText(activeTab.url)
-                      setCopiedUrl(true)
-                      setTimeout(() => setCopiedUrl(false), 1300)
-                    }}
-                    title={tr(lang, 'Copy URL', '复制网址')}
-                    className="p-1 rounded hover:bg-black/8 dark:hover:bg-white/10 opacity-75 hover:opacity-100"
-                  >
-                    {copiedUrl ? (
-                      <Check size={12} className="text-emerald-500" />
-                    ) : (
-                      <Copy size={12} />
-                    )}
-                  </button>
-                  <button
-                    onClick={onToggleBookmark}
-                    title={
-                      isBookmarked
-                        ? tr(lang, 'Remove Bookmark (⌘D)', '取消收藏 (⌘D)')
-                        : tr(lang, 'Bookmark Page (⌘D)', '收藏此页面 (⌘D)')
-                    }
-                    className={`p-1 rounded hover:bg-black/8 dark:hover:bg-white/10 ${
-                      isBookmarked ? 'text-amber-500 opacity-100' : 'opacity-75 hover:opacity-100'
+                  </>
+                ) : (
+                  <span
+                    className={`truncate ${
+                      !activeTab?.url || activeTab.url === NEW_TAB_URL
+                        ? isBarDark
+                          ? 'text-zinc-500'
+                          : 'text-zinc-400'
+                        : isBarDark
+                          ? 'text-zinc-200 font-medium'
+                          : 'text-zinc-800 font-medium'
                     }`}
                   >
-                    <Bookmark size={12} fill={isBookmarked ? 'currentColor' : 'none'} />
-                  </button>
-                </>
+                    {cleanTitle}
+                  </span>
+                )}
+              </div>
+
+              {zoomPct !== 100 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onResetZoom()
+                  }}
+                  title={tr(lang, 'Reset zoom to 100% (⌘0)', '点击恢复 100% 网页缩放 (⌘0)')}
+                  className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-indigo-500/15 text-indigo-500 shrink-0"
+                >
+                  {zoomPct}%
+                </button>
               )}
-              <kbd
-                onClick={onOpenOmnibox}
-                className={`px-1.5 py-0.5 text-[10px] rounded font-mono opacity-55 ${
-                  isDark ? 'bg-white/8' : 'bg-black/5'
+
+              <div
+                className="hidden group-hover:flex items-center gap-0.5 shrink-0"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {activeTab?.url && !isInternalArkoUrl(activeTab.url) && (
+                  <>
+                    <button
+                      onClick={onOpenReader}
+                      title={tr(lang, 'Arko Calm Reader (⇧⌘R)', 'Arko 沉浸阅读视图 (⇧⌘R)')}
+                      className={`p-1 rounded ${
+                        isBarDark ? 'hover:bg-white/10 text-zinc-400' : 'hover:bg-black/8 text-zinc-500'
+                      }`}
+                    >
+                      <BookOpen size={12} />
+                    </button>
+                    <button
+                      onClick={onOpenInlineWrite}
+                      title={tr(
+                        lang,
+                        'Inline Write & Form Fill Preview (⌘J)',
+                        '网页输入框内联帮写与表单填充 (⌘J)'
+                      )}
+                      className={`p-1 rounded ${
+                        isBarDark ? 'hover:bg-white/10 text-zinc-400' : 'hover:bg-black/8 text-zinc-500'
+                      }`}
+                    >
+                      <PenLine size={12} />
+                    </button>
+                    <button
+                      onClick={() => {
+                        void navigator.clipboard.writeText(activeTab.url)
+                        setCopiedUrl(true)
+                        setTimeout(() => setCopiedUrl(false), 1300)
+                      }}
+                      title={tr(lang, 'Copy URL', '复制网址')}
+                      className={`p-1 rounded ${
+                        isBarDark ? 'hover:bg-white/10 text-zinc-400' : 'hover:bg-black/8 text-zinc-500'
+                      }`}
+                    >
+                      {copiedUrl ? (
+                        <Check size={12} className="text-emerald-500" />
+                      ) : (
+                        <Copy size={12} />
+                      )}
+                    </button>
+                    <button
+                      onClick={onToggleBookmark}
+                      title={
+                        isBookmarked
+                          ? tr(lang, 'Remove Bookmark (⌘D)', '取消收藏 (⌘D)')
+                          : tr(lang, 'Bookmark Page (⌘D)', '收藏此页面 (⌘D)')
+                      }
+                      className={`p-1 rounded ${
+                        isBookmarked
+                          ? 'text-amber-500'
+                          : isBarDark
+                            ? 'hover:bg-white/10 text-zinc-400'
+                            : 'hover:bg-black/8 text-zinc-500'
+                      }`}
+                    >
+                      <Bookmark size={12} fill={isBookmarked ? 'currentColor' : 'none'} />
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0">
+              {hasUpdateBadge && onOpenUpdatePanel && (
+                <button
+                  onClick={onOpenUpdatePanel}
+                  title={tr(
+                    lang,
+                    `New version v${updateState?.latestVersion} available · Click to update`,
+                    `发现新版本 v${updateState?.latestVersion} · 点击一键更新`
+                  )}
+                  className="h-[25px] px-2 rounded-full text-[11px] font-medium bg-emerald-500/15 text-emerald-600 border border-emerald-500/30 inline-flex items-center gap-1 hover:bg-emerald-500 hover:text-white transition"
+                >
+                  <ArrowDownCircle size={12} />
+                  <span>
+                    {updateState?.status === 'downloaded'
+                      ? tr(lang, 'Restart', '重启更新')
+                      : `v${updateState?.latestVersion}`}
+                  </span>
+                </button>
+              )}
+
+              {downloads.length > 0 && (
+                <button
+                  onClick={onOpenDownloads}
+                  title={tr(lang, 'Downloads', '下载管理')}
+                  className={`relative w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                    activeDownloads > 0
+                      ? 'text-indigo-500 bg-indigo-500/12'
+                      : isBarDark
+                        ? 'hover:bg-white/8 text-zinc-400 hover:text-zinc-100'
+                        : 'hover:bg-black/5 text-zinc-500 hover:text-zinc-900'
+                  }`}
+                >
+                  <Download size={14} className={activeDownloads > 0 ? 'animate-bounce' : ''} />
+                </button>
+              )}
+
+              <button
+                onClick={onOpenLibrary}
+                title={tr(lang, 'Bookmarks & History', '收藏夹与浏览历史')}
+                className={`w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                  isBarDark
+                    ? 'hover:bg-white/8 text-zinc-400 hover:text-zinc-100'
+                    : 'hover:bg-black/5 text-zinc-500 hover:text-zinc-900'
                 }`}
               >
-                ⌘L
-              </kbd>
+                <Clock size={14} />
+              </button>
+
+              {enabledExts.slice(0, 4).map((ext) => (
+                <button
+                  key={ext.id}
+                  type="button"
+                  onClick={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    void window.arko
+                      .openExtensionPopup(ext.id, {
+                        x: Math.round(rect.right),
+                        y: Math.round(rect.bottom + 4)
+                      })
+                      .then((res) => {
+                        if (!res.ok) {
+                          onOpenExtensions?.({ x: rect.right, y: rect.bottom })
+                        }
+                      })
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    onOpenExtensions?.({ x: rect.right, y: rect.bottom })
+                  }}
+                  title={ext.name}
+                  className={`w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                    isBarDark ? 'hover:bg-white/8' : 'hover:bg-black/5'
+                  }`}
+                >
+                  {ext.iconDataUrl ? (
+                    <img
+                      src={ext.iconDataUrl}
+                      alt={ext.name}
+                      className="w-[15.5px] h-[15.5px] object-contain rounded-[3px]"
+                    />
+                  ) : (
+                    <Puzzle size={13.5} />
+                  )}
+                </button>
+              ))}
+
+              {onOpenExtensions && (
+                <button
+                  onClick={(e) => {
+                    const rect = e.currentTarget.getBoundingClientRect()
+                    onOpenExtensions({ x: rect.right, y: rect.bottom })
+                  }}
+                  title={tr(
+                    lang,
+                    `Extensions (${enabledExts.length} active)`,
+                    `扩展插件中心（已启用 ${enabledExts.length} 个）`
+                  )}
+                  className={`relative w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                    isBarDark
+                      ? 'hover:bg-white/8 text-zinc-400 hover:text-zinc-100'
+                      : 'hover:bg-black/5 text-zinc-500 hover:text-zinc-900'
+                  }`}
+                >
+                  <Puzzle size={13.5} />
+                </button>
+              )}
+
+              <button
+                onClick={onToggleSplitView}
+                title={tr(lang, 'Split View (⌘⇧\\)', '左右并排分屏视图 (⌘⇧\\)')}
+                className={`w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                  splitView.enabled
+                    ? isBarDark
+                      ? 'bg-white/14 text-white'
+                      : 'bg-black/8 text-zinc-950'
+                    : isBarDark
+                      ? 'hover:bg-white/8 text-zinc-400 hover:text-zinc-100'
+                      : 'hover:bg-black/5 text-zinc-500 hover:text-zinc-900'
+                }`}
+              >
+                <Columns2 size={14} />
+              </button>
+
+              <button
+                onClick={onToggleCompactBar}
+                title={tr(lang, 'Compact Single-Row Bar (⇧⌘S)', '切换单栏极简融合顶栏 (⇧⌘S)')}
+                className={`w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                  isBarDark
+                    ? 'hover:bg-white/8 text-zinc-400 hover:text-zinc-100'
+                    : 'hover:bg-black/5 text-zinc-500 hover:text-zinc-900'
+                }`}
+              >
+                <Minimize2 size={13.5} />
+              </button>
+
+              <button
+                onClick={onOpenSettings}
+                title={tr(lang, 'Settings (⌘,)', '设置 (⌘,)')}
+                className={`w-[26px] h-[26px] rounded-[6px] flex items-center justify-center transition ${
+                  isBarDark
+                    ? 'hover:bg-white/8 text-zinc-400 hover:text-zinc-100'
+                    : 'hover:bg-black/5 text-zinc-500 hover:text-zinc-900'
+                }`}
+              >
+                <Settings size={14} />
+              </button>
+
+              {onOpenAccount && (
+                <button
+                  onClick={onOpenAccount}
+                  title={
+                    accountState?.authenticated && accountState.user
+                      ? `${accountState.user.email || accountState.user.username} · ${
+                          accountState.user.effectiveUnlimited
+                            ? '∞'
+                            : `$${(accountState.user.remainingUsd ?? 0).toFixed(2)}`
+                        }`
+                      : tr(lang, 'Sign in to Arko Account', '登录 / 注册 Arko 账号')
+                  }
+                  className="relative w-[26px] h-[26px] rounded-full flex items-center justify-center shrink-0"
+                >
+                  {accountState?.authenticated && accountState.user ? (
+                    <span
+                      className="w-[20px] h-[20px] rounded-full flex items-center justify-center text-[10.5px] font-semibold text-white"
+                      style={{ backgroundColor: spaceTheme.accentHex }}
+                    >
+                      {(
+                        accountState.user.displayName ||
+                        accountState.user.username ||
+                        accountState.user.email ||
+                        'U'
+                      )
+                        .trim()
+                        .charAt(0)
+                        .toUpperCase()}
+                    </span>
+                  ) : (
+                    <span
+                      className={`w-[20px] h-[20px] rounded-full flex items-center justify-center border ${
+                        isBarDark
+                          ? 'bg-zinc-800 border-white/15 text-zinc-200'
+                          : 'bg-zinc-200/85 border-black/10 text-zinc-700'
+                      }`}
+                    >
+                      <UserRound size={12.5} strokeWidth={2} className="translate-y-[1px]" />
+                    </span>
+                  )}
+                </button>
+              )}
+
+              <button
+                onClick={onToggleAISidebar}
+                title={tr(lang, 'Toggle Chat Sidebar (⌘E)', '切换对话侧边栏 (⌘E)')}
+                className={`ml-0.5 flex items-center gap-1.5 h-[27px] px-2.5 rounded-[8px] text-[12.5px] font-medium tracking-[-0.01em] transition-colors ${
+                  aiSidebarOpen
+                    ? isBarDark
+                      ? 'bg-[#0A84FF]/22 text-[#64D2FF] ring-1 ring-[#0A84FF]/40'
+                      : 'bg-[#0088FF]/12 text-[#0066CC] ring-1 ring-[#0088FF]/25'
+                    : isBarDark
+                      ? 'bg-white/[0.10] hover:bg-white/[0.16] text-[#F4F4F5]'
+                      : 'bg-[#F1F3F5] hover:bg-[#E5E8EC] text-[#18181B]'
+                }`}
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  className="shrink-0"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M8 1.75C4.272 1.75 1.25 4.39 1.25 7.65c0 1.66.786 3.16 2.055 4.23-.14.82-.53 1.66-1.12 2.24a.38.38 0 0 0 .29.65c1.38-.06 2.68-.54 3.59-1.15.61.15 1.26.23 1.935.23 3.728 0 6.75-2.64 6.75-5.9S11.728 1.75 8 1.75Z"
+                    fill={isBarDark ? '#0A84FF' : '#0088FF'}
+                  />
+                </svg>
+                <span>Chat</span>
+              </button>
             </div>
           </div>
-
-          <div className="flex items-center gap-1">
-            {hasUpdateBadge && onOpenUpdatePanel && (
-              <button
-                onClick={onOpenUpdatePanel}
-                title={tr(
-                  lang,
-                  `New version v${updateState?.latestVersion} available · Click to update`,
-                  `发现新版本 v${updateState?.latestVersion} · 点击一键更新`
-                )}
-                className="h-[26px] px-2.5 rounded-full text-[11px] font-medium bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30 inline-flex items-center gap-1 hover:bg-emerald-500 hover:text-white transition"
-              >
-                <ArrowDownCircle size={12} />
-                <span>
-                  {updateState?.status === 'downloaded'
-                    ? tr(lang, 'Restart to Update', '重启完成更新')
-                    : `v${updateState?.latestVersion}`}
-                </span>
-              </button>
-            )}
-
-            <button
-              onClick={onToggleCompactBar}
-              title={tr(lang, 'Compact Single-Row Bar (⇧⌘S)', '切换单栏极简融合顶栏 (⇧⌘S)')}
-              className={`p-1.5 rounded-lg transition ${
-                isDark ? 'hover:bg-white/8 text-zinc-400' : 'hover:bg-black/6 text-zinc-500'
-              }`}
-            >
-              <Minimize2 size={14} />
-            </button>
-
-            <button
-              onClick={onToggleSplitView}
-              title={tr(lang, 'Split View (⌘⇧\\)', '左右并排分屏视图 (⌘⇧\\)')}
-              className={`p-1.5 rounded-lg transition ${
-                splitView.enabled
-                  ? 'bg-indigo-500/18 text-indigo-500 ring-1 ring-indigo-500/35'
-                  : isDark
-                    ? 'hover:bg-white/8 text-zinc-300'
-                    : 'hover:bg-black/6 text-zinc-600'
-              }`}
-            >
-              <Columns2 size={15} />
-            </button>
-
-            {downloads.length > 0 && (
-              <button
-                onClick={onOpenDownloads}
-                title={tr(lang, 'Downloads', '下载管理')}
-                className={`relative p-1.5 rounded-lg transition ${
-                  activeDownloads > 0
-                    ? 'text-indigo-500 bg-indigo-500/12'
-                    : isDark
-                      ? 'hover:bg-white/8 text-zinc-300'
-                      : 'hover:bg-black/6 text-zinc-600'
-                }`}
-              >
-                <Download size={15} className={activeDownloads > 0 ? 'animate-bounce' : ''} />
-              </button>
-            )}
-
-            <button
-              onClick={onOpenLibrary}
-              title={tr(lang, 'Bookmarks & History', '收藏夹与浏览历史')}
-              className={`p-1.5 rounded-lg transition ${
-                isDark ? 'hover:bg-white/8 text-zinc-300' : 'hover:bg-black/6 text-zinc-600'
-              }`}
-            >
-              <Clock size={15} />
-            </button>
-
-            {onOpenAccount && (
-              <button
-                onClick={onOpenAccount}
-                title={
-                  accountState?.authenticated && accountState.user
-                    ? `${accountState.user.email || accountState.user.username} · ${
-                        accountState.user.effectiveUnlimited
-                          ? '∞'
-                          : `$${(accountState.user.remainingUsd ?? 0).toFixed(2)}`
-                      }`
-                    : tr(lang, 'Sign in to Arko Account', '登录 / 注册 Arko 账号')
-                }
-                className={`relative p-1.5 rounded-lg transition ${
-                  accountState?.authenticated
-                    ? 'text-indigo-500 hover:bg-indigo-500/12'
-                    : isDark
-                      ? 'hover:bg-white/8 text-zinc-300'
-                      : 'hover:bg-black/6 text-zinc-600'
-                }`}
-              >
-                <UserRound size={15} />
-                {accountState?.authenticated && (
-                  <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                )}
-              </button>
-            )}
-
-            <button
-              onClick={onOpenSettings}
-              title={tr(lang, 'Models, Memory, /Skills & Updates (⌘,)', '模型、记忆库、/Skills 与更新设置 (⌘,)')}
-              className={`p-1.5 rounded-lg transition ${
-                isDark ? 'hover:bg-white/8 text-zinc-300' : 'hover:bg-black/6 text-zinc-600'
-              }`}
-            >
-              <Settings size={15} />
-            </button>
-
-            <button
-              onClick={onToggleAISidebar}
-              title={tr(lang, 'Toggle Chat Sidebar (⌘E)', '切换对话侧边栏 (⌘E)')}
-              className={`flex items-center gap-1.5 h-[28px] px-2.5 rounded-lg text-xs font-medium transition-all ${
-                aiSidebarOpen
-                  ? isDark
-                    ? 'bg-zinc-100 text-zinc-900'
-                    : 'bg-zinc-900 text-white'
-                  : isDark
-                    ? 'bg-white/7 hover:bg-white/12 text-zinc-200'
-                    : 'bg-white hover:bg-black/5 text-zinc-800 border border-black/8 shadow-2xs'
-              }`}
-            >
-              <Sparkles size={12.5} />
-              <span>Chat</span>
-            </button>
-          </div>
-        </div>
-      )}
+        )
+      })()}
 
       {activeTab?.isLoading && <div className="dia-loading-bar" />}
     </header>

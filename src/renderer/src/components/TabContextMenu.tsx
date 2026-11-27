@@ -7,7 +7,6 @@ import {
   Pin,
   PinOff,
   RotateCcw,
-  Star,
   Trash2,
   Volume2,
   VolumeX,
@@ -107,8 +106,8 @@ export const TabContextMenu: React.FC<Props> = ({
           <span>{tr(lang, 'Open in Right Split View', '在右侧分屏并排打开')}</span>
         </button>
 
-        {/* Arc Top Favorites Option */}
-        {!tab.isFavorite ? (
+        {/* Dia Simple Pin / Unpin Option */}
+        {!tab.isPinned && !tab.isFavorite ? (
           <button
             type="button"
             onClick={() => {
@@ -119,39 +118,8 @@ export const TabContextMenu: React.FC<Props> = ({
               isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-zinc-100'
             }`}
           >
-            <Star size={13} className="opacity-65" />
-            <span>{tr(lang, 'Add to Top Favorites', '固定到顶部常驻图标 (Favorites)')}</span>
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={() => {
-              onSetTabPinState(tab.id, 'pinned')
-              onCloseMenu()
-            }}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg transition ${
-              isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-zinc-100'
-            }`}
-          >
             <Pin size={13} className="opacity-65" />
-            <span>{tr(lang, 'Move to Space Pinned List', '降为空间上方固定列表')}</span>
-          </button>
-        )}
-
-        {/* Arc Space Pinned Option */}
-        {!tab.isPinned && !tab.isFavorite ? (
-          <button
-            type="button"
-            onClick={() => {
-              onSetTabPinState(tab.id, 'pinned')
-              onCloseMenu()
-            }}
-            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg transition ${
-              isDark ? 'hover:bg-white/[0.07]' : 'hover:bg-zinc-100'
-            }`}
-          >
-            <Pin size={13} className="opacity-65" />
-            <span>{tr(lang, 'Pin to Space', '固定到当前空间上方 (Pin Tab)')}</span>
+            <span>{tr(lang, 'Pin Tab', '固定标签页')}</span>
           </button>
         ) : (
           <button
@@ -165,11 +133,7 @@ export const TabContextMenu: React.FC<Props> = ({
             }`}
           >
             <PinOff size={13} />
-            <span>
-              {tab.isFavorite
-                ? tr(lang, 'Remove from Favorites', '移出顶部常驻图标')
-                : tr(lang, 'Unpin Tab', '取消固定标签页')}
-            </span>
+            <span>{tr(lang, 'Unpin Tab', '取消固定标签页')}</span>
           </button>
         )}
 
@@ -221,24 +185,54 @@ export const TabContextMenu: React.FC<Props> = ({
           </span>
         </button>
 
-        {!tab.isFavorite && (
-          <>
-            <div className={`my-1 border-t ${isDark ? 'border-white/8' : 'border-black/6'}`} />
-            <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider opacity-45">
-              {tr(lang, 'Folders / Tab Groups', '标签页文件夹 / 分组')}
-            </div>
+        <div className={`my-1 border-t ${isDark ? 'border-white/8' : 'border-black/6'}`} />
+        <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider opacity-45">
+          {tr(lang, 'Folders / Tab Groups', '标签页文件夹 / 分组')}
+        </div>
 
-            {tabGroups.map((g) => {
+        <div className="max-h-52 overflow-y-auto no-scrollbar space-y-0.5">
+          {(() => {
+            const byId = new Map(tabGroups.map((g) => [g.id, g]))
+            const childrenByParent = new Map<string, TabGroup[]>()
+            const roots: TabGroup[] = []
+            for (const g of tabGroups) {
+              if (g.parentId && g.parentId !== g.id && byId.has(g.parentId)) {
+                const arr = childrenByParent.get(g.parentId) || []
+                arr.push(g)
+                childrenByParent.set(g.parentId, arr)
+              } else {
+                roots.push(g)
+              }
+            }
+            const ordered: Array<{ group: TabGroup; depth: number; pathLabel: string }> = []
+            const visited = new Set<string>()
+            const walk = (g: TabGroup, depth: number, prefix: string[]): void => {
+              if (visited.has(g.id)) return
+              visited.add(g.id)
+              const nextPath = [...prefix, g.title]
+              ordered.push({ group: g, depth, pathLabel: nextPath.join(' / ') })
+              for (const child of childrenByParent.get(g.id) || []) {
+                walk(child, depth + 1, nextPath)
+              }
+            }
+            for (const r of roots) walk(r, 0, [])
+            for (const g of tabGroups) {
+              if (!visited.has(g.id)) walk(g, 0, [])
+            }
+
+            return ordered.map(({ group: g, depth, pathLabel }) => {
               const inThisGroup = tab.groupId === g.id
               return (
                 <button
                   key={g.id}
                   type="button"
+                  title={pathLabel}
                   onClick={() => {
                     onAssignGroup(tab.id, inThisGroup ? null : g.id)
                     onCloseMenu()
                   }}
-                  className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl transition ${
+                  style={{ paddingLeft: 10 + Math.min(depth, 5) * 12 }}
+                  className={`w-full flex items-center justify-between pr-2.5 py-1.5 rounded-xl transition ${
                     inThisGroup
                       ? 'bg-indigo-500/15 text-indigo-500 font-medium'
                       : isDark
@@ -251,53 +245,55 @@ export const TabContextMenu: React.FC<Props> = ({
                     <span className="truncate">{g.title}</span>
                   </span>
                   {inThisGroup && (
-                    <span className="text-[10px]">{tr(lang, 'Remove', '移出')}</span>
+                    <span className="text-[10px] shrink-0 ml-1">
+                      {tr(lang, 'Remove', '移出')}
+                    </span>
                   )}
                 </button>
               )
-            })}
+            })
+          })()}
+        </div>
 
-            {!creatingGroup ? (
+        {!creatingGroup ? (
+          <button
+            type="button"
+            onClick={() => setCreatingGroup(true)}
+            className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-xl text-indigo-500 transition ${
+              isDark ? 'hover:bg-white/8' : 'hover:bg-zinc-100'
+            }`}
+          >
+            <FolderPlus size={13} />
+            <span>{tr(lang, 'New Folder with Tab…', '新建文件夹并移入…')}</span>
+          </button>
+        ) : (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (!groupTitle.trim()) return
+              onCreateGroupWithTab(groupTitle.trim(), 'indigo', tab.id)
+              onCloseMenu()
+            }}
+            className="p-2 space-y-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.04]"
+          >
+            <input
+              autoFocus
+              value={groupTitle}
+              onChange={(e) => setGroupTitle(e.target.value)}
+              placeholder={tr(lang, 'Folder name (e.g. Personal)', '文件夹名称（如：Personal）')}
+              className={`w-full h-7 px-2 rounded-lg border outline-none text-xs ${
+                isDark ? 'bg-[#16161C] border-white/12' : 'bg-white border-black/12'
+              }`}
+            />
+            <div className="flex items-center justify-end">
               <button
-                type="button"
-                onClick={() => setCreatingGroup(true)}
-                className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-xl text-indigo-500 transition ${
-                  isDark ? 'hover:bg-white/8' : 'hover:bg-zinc-100'
-                }`}
+                type="submit"
+                className="px-2 py-0.5 rounded-md bg-indigo-600 text-white text-[11px] font-medium"
               >
-                <FolderPlus size={13} />
-                <span>{tr(lang, 'New Group with Tab…', '新建分组并移入…')}</span>
+                {tr(lang, 'Create', '创建')}
               </button>
-            ) : (
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault()
-                  if (!groupTitle.trim()) return
-                  onCreateGroupWithTab(groupTitle.trim(), 'indigo', tab.id)
-                  onCloseMenu()
-                }}
-                className="p-2 space-y-2 rounded-xl bg-black/[0.03] dark:bg-white/[0.04]"
-              >
-                <input
-                  autoFocus
-                  value={groupTitle}
-                  onChange={(e) => setGroupTitle(e.target.value)}
-                  placeholder={tr(lang, 'Group name (e.g. Research)', '分组名称（如：调研）')}
-                  className={`w-full h-7 px-2 rounded-lg border outline-none text-xs ${
-                    isDark ? 'bg-[#16161C] border-white/12' : 'bg-white border-black/12'
-                  }`}
-                />
-                <div className="flex items-center justify-end">
-                  <button
-                    type="submit"
-                    className="px-2 py-0.5 rounded-md bg-indigo-600 text-white text-[11px] font-medium"
-                  >
-                    {tr(lang, 'Create', '创建')}
-                  </button>
-                </div>
-              </form>
-            )}
-          </>
+            </div>
+          </form>
         )}
 
         <div className={`my-1 border-t ${isDark ? 'border-white/8' : 'border-black/6'}`} />
